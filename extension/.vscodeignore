@@ -1,0 +1,12 @@
+.gradle/**
+.vscode/**
+node_modules/**
+src/**
+gradle/**
+gradlew
+gradlew.bat
+build.gradle
+tsconfig.json
+webpack.config.js
+package-lock.json
+**/*.map

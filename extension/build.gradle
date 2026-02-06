@@ -1,0 +1,52 @@
+plugins {
+  id "com.github.node-gradle.node" version "7.0.2"
+}
+
+task build {
+}
+
+task copyJar(type: Copy) {
+    dependsOn ":shadowJar"
+    from "${rootProject.buildDir}/libs/groovy-language-server-all.jar"
+    into "$buildDir/bin"
+}
+
+task copyLocal(type: Copy) {
+    from "$projectDir/package.json"
+    from "$projectDir/LICENSE"
+    from "$projectDir/README.md"
+    into "$buildDir"
+}
+
+task webpack(type: Exec) {
+  inputs.file("package.json")
+  inputs.file("package-lock.json")
+  inputs.file("webpack.config.js")
+  inputs.file("tsconfig.json")
+  inputs.dir("src")
+  outputs.file("$buildDir/extension.js")
+  outputs.file("$buildDir/extension.js.map")
+  
+  def webpack = "$projectDir/node_modules/.bin/webpack"
+  if (System.getProperty("os.name").toLowerCase(Locale.ROOT).contains("windows")) {
+    webpack += ".cmd"
+  }
+  commandLine "$webpack", "--mode", "production"
+}
+
+task vsce(type: Exec) {
+  outputs.upToDateWhen { false }
+
+  def vsce = "$projectDir/node_modules/.bin/vsce"
+  if (System.getProperty("os.name").toLowerCase(Locale.ROOT).contains("windows")) {
+    vsce += ".cmd"
+  }
+  commandLine "$vsce", "package"
+}
+
+tasks.webpack.dependsOn tasks.npmInstall
+tasks.vsce.dependsOn tasks.copyJar
+tasks.vsce.dependsOn tasks.copyLocal
+tasks.vsce.dependsOn tasks.webpack
+tasks.build.dependsOn tasks.vsce
+

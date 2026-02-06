@@ -1,0 +1,27 @@
+# IDEA
+.idea
+
+# Eclipse
+.classpath
+.project
+.settings/
+
+# VSCode
+.vscode/
+
+# macOS
+.DS_Store
+
+# Java
+*.class
+
+# Gradle
+.gradle/
+bin/
+build/
+
+# Maven
+target/
+
+# Node.js
+node_modules/
