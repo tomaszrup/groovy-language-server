@@ -59,12 +59,21 @@ This fork adds automatic classpath resolution for Gradle-based Groovy projects v
 - Recompiles Java/Gradle sources on change so the Groovy compilation unit picks up updates
 - Per-project scoping — each Gradle subproject gets its own classpath and compilation context
 
+### VS Code Extension
+
+A bundled VS Code extension provides a seamless editor experience:
+
+- **Automatic server lifecycle** — the language server JAR starts automatically when a `.groovy` file is opened
+- **JDK auto-detection** — locates a suitable JDK from `JAVA_HOME`, `JDK_HOME`, `PATH`, or the `groovy.java.home` setting
+- **Restart command** — `Groovy: Restart Groovy language server` command to restart the server without reloading the window
+
 ### Configuration
 
 | Option | Type | Description |
 |---|---|---|
 | `groovy.java.home` | `string` | Path to a custom JDK installation |
 | `groovy.classpath` | `string[]` | Additional `.jar` files to include on the classpath |
+| `groovy.debug.serverPort` | `number` | Connect to an existing Groovy LSP server on this TCP port instead of starting one automatically |
 
 ## Major missing features
 - **Debugger**
