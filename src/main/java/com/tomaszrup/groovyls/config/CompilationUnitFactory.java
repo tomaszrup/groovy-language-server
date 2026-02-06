@@ -237,6 +237,14 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 			if (!openPath.normalize().startsWith(dirPath.normalize())) {
 				return;
 			}
+			if (isInsideExcludedDirectory(openPath, dirPath)) {
+				logger.debug("  Excluded open file (dir): {}", openPath);
+				return;
+			}
+			if (isInsideExcludedSubRoot(openPath)) {
+				logger.info("  Excluded open file (subproject): {}", openPath);
+				return;
+			}
 			if (changedUris != null && !changedUris.contains(uri)) {
 				return;
 			}
