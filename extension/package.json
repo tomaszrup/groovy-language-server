@@ -1,9 +1,9 @@
 {
-  "name": "groovy",
-  "displayName": "Groovy",
-  "description": "Language support for Groovy",
+  "name": "groovy-spock-support",
+  "displayName": "Groovy & Spock Language Support",
+  "description": "Language support for Groovy and Spock",
   "version": "0.0.3",
-  "publisher": "TRup",
+  "publisher": "TomaszRup",
   "homepage": "https://github.com/tomaszrup/groovy-language-server",
   "repository": {
     "type": "git",
