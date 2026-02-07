@@ -13,7 +13,7 @@
     "url": "https://github.com/tomaszrup/groovy-language-server/issues"
   },
   "license": "Apache-2.0",
-  "icon": "images/groovy.png",
+  "icon": "./images/groovy.png",
   "private": true,
   "categories": [
     "Programming Languages"
