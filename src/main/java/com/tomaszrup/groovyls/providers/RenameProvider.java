@@ -33,9 +33,13 @@ import org.codehaus.groovy.ast.ASTNode;
 import org.codehaus.groovy.ast.ClassNode;
 import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.PropertyNode;
+import org.codehaus.groovy.ast.Variable;
 import org.codehaus.groovy.ast.expr.ConstantExpression;
 import org.codehaus.groovy.ast.expr.VariableExpression;
 import org.eclipse.lsp4j.Position;
+import org.eclipse.lsp4j.PrepareRenameDefaultBehavior;
+import org.eclipse.lsp4j.PrepareRenameParams;
+import org.eclipse.lsp4j.PrepareRenameResult;
 import org.eclipse.lsp4j.Range;
 import org.eclipse.lsp4j.RenameFile;
 import org.eclipse.lsp4j.RenameParams;
@@ -46,6 +50,7 @@ import org.eclipse.lsp4j.TextEdit;
 import org.eclipse.lsp4j.VersionedTextDocumentIdentifier;
 import org.eclipse.lsp4j.WorkspaceEdit;
 import org.eclipse.lsp4j.jsonrpc.messages.Either;
+import org.eclipse.lsp4j.jsonrpc.messages.Either3;
 
 import com.tomaszrup.groovyls.compiler.ast.ASTNodeVisitor;
 import com.tomaszrup.groovyls.compiler.util.GroovyASTUtils;
@@ -60,6 +65,139 @@ public class RenameProvider {
 	public RenameProvider(ASTNodeVisitor ast, FileContentsTracker files) {
 		this.ast = ast;
 		this.files = files;
+	}
+
+	public CompletableFuture<Either3<Range, PrepareRenameResult, PrepareRenameDefaultBehavior>> providePrepareRename(
+			PrepareRenameParams params) {
+		TextDocumentIdentifier textDocument = params.getTextDocument();
+		Position position = params.getPosition();
+
+		if (ast == null) {
+			return CompletableFuture.completedFuture(null);
+		}
+
+		URI documentURI = URI.create(textDocument.getUri());
+		ASTNode offsetNode = ast.getNodeAtLineAndColumn(documentURI, position.getLine(), position.getCharacter());
+		if (offsetNode == null) {
+			return CompletableFuture.completedFuture(null);
+		}
+
+		String name = getRenamableNodeName(offsetNode);
+		if (name == null) {
+			return CompletableFuture.completedFuture(null);
+		}
+
+		Range range = getNodeNameRange(offsetNode, documentURI);
+		if (range == null) {
+			return CompletableFuture.completedFuture(null);
+		}
+
+		PrepareRenameResult result = new PrepareRenameResult(range, name);
+		return CompletableFuture.completedFuture(Either3.forSecond(result));
+	}
+
+	private String getRenamableNodeName(ASTNode node) {
+		if (node instanceof ClassNode) {
+			ClassNode classNode = (ClassNode) node;
+			String name = classNode.getNameWithoutPackage();
+			int dollarIndex = name.indexOf('$');
+			if (dollarIndex != -1) {
+				name = name.substring(dollarIndex + 1);
+			}
+			return name;
+		} else if (node instanceof MethodNode) {
+			return ((MethodNode) node).getName();
+		} else if (node instanceof PropertyNode) {
+			return ((PropertyNode) node).getName();
+		} else if (node instanceof ConstantExpression) {
+			return ((ConstantExpression) node).getText();
+		} else if (node instanceof VariableExpression) {
+			return ((VariableExpression) node).getName();
+		} else if (node instanceof Variable) {
+			return ((Variable) node).getName();
+		}
+		return null;
+	}
+
+	private Range getNodeNameRange(ASTNode node, URI documentURI) {
+		Range range = GroovyLanguageServerUtils.astNodeToRange(node);
+		if (range == null) {
+			return null;
+		}
+
+		Position start = range.getStart();
+
+		if (node instanceof ClassNode) {
+			ClassNode classNode = (ClassNode) node;
+			String className = classNode.getNameWithoutPackage();
+			int dollarIndex = className.indexOf('$');
+			if (dollarIndex != -1) {
+				className = className.substring(dollarIndex + 1);
+			}
+			// For ClassNode, get the first line from file contents since the AST range spans multiple lines
+			String firstLine = getFirstLineOfNode(documentURI, start.getLine());
+			if (firstLine == null) {
+				return null;
+			}
+			Pattern classPattern = Pattern.compile("(class\\s+)" + className + "\\b");
+			Matcher classMatcher = classPattern.matcher(firstLine);
+			if (!classMatcher.find()) {
+				return null;
+			}
+			String prefix = classMatcher.group(1);
+			int nameStart = prefix.length() + classMatcher.start();
+			return new Range(
+					new Position(start.getLine(), nameStart),
+					new Position(start.getLine(), classMatcher.end()));
+		} else if (node instanceof MethodNode) {
+			MethodNode methodNode = (MethodNode) node;
+			String firstLine = getFirstLineOfNode(documentURI, start.getLine());
+			if (firstLine == null) {
+				return null;
+			}
+			Pattern methodPattern = Pattern.compile("\\b" + methodNode.getName() + "\\b(?=\\s*\\()");
+			Matcher methodMatcher = methodPattern.matcher(firstLine);
+			if (!methodMatcher.find()) {
+				return null;
+			}
+			return new Range(
+					new Position(start.getLine(), methodMatcher.start()),
+					new Position(start.getLine(), methodMatcher.end()));
+		} else if (node instanceof PropertyNode) {
+			PropertyNode propNode = (PropertyNode) node;
+			String contents = getPartialNodeText(documentURI, node);
+			if (contents == null) {
+				return null;
+			}
+			Pattern propPattern = Pattern.compile("\\b" + propNode.getName() + "\\b");
+			Matcher propMatcher = propPattern.matcher(contents);
+			if (!propMatcher.find()) {
+				return null;
+			}
+			return new Range(
+					new Position(start.getLine(), start.getCharacter() + propMatcher.start()),
+					new Position(start.getLine(), start.getCharacter() + propMatcher.end()));
+		}
+		// For ConstantExpression and VariableExpression, the AST range is the name range
+		Position end = range.getEnd();
+		end.setLine(start.getLine());
+		String contents = getPartialNodeText(documentURI, node);
+		if (contents != null) {
+			end.setCharacter(start.getCharacter() + contents.length());
+		}
+		return range;
+	}
+
+	private String getFirstLineOfNode(URI uri, int line) {
+		String contents = files.getContents(uri);
+		if (contents == null) {
+			return null;
+		}
+		String[] lines = contents.split("\n", -1);
+		if (line < 0 || line >= lines.length) {
+			return null;
+		}
+		return lines[line];
 	}
 
 	public CompletableFuture<WorkspaceEdit> provideRename(RenameParams renameParams) {

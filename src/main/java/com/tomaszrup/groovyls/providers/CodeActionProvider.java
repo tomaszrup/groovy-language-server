@@ -22,11 +22,18 @@ import org.eclipse.lsp4j.jsonrpc.messages.Either;
 import io.github.classgraph.ClassInfo;
 import io.github.classgraph.ScanResult;
 import com.tomaszrup.groovyls.compiler.ast.ASTNodeVisitor;
+import com.tomaszrup.groovyls.providers.codeactions.AddOverrideAction;
+import com.tomaszrup.groovyls.providers.codeactions.GenerateConstructorAction;
+import com.tomaszrup.groovyls.providers.codeactions.GenerateGetterSetterAction;
+import com.tomaszrup.groovyls.providers.codeactions.GenerateMethodsAction;
+import com.tomaszrup.groovyls.providers.codeactions.ImplementInterfaceMethodsAction;
+import com.tomaszrup.groovyls.providers.codeactions.OrganizeImportsAction;
 import com.tomaszrup.groovyls.util.FileContentsTracker;
 
 public class CodeActionProvider {
 	private static final Pattern PATTERN_UNABLE_TO_RESOLVE_CLASS = Pattern
 			.compile("unable to resolve class (\\w+)");
+	private static final String UNUSED_IMPORT_MESSAGE = "Unused import";
 
 	private ASTNodeVisitor ast;
 	private ScanResult classGraphScanResult;
@@ -40,27 +47,82 @@ public class CodeActionProvider {
 	}
 
 	public CompletableFuture<List<Either<Command, CodeAction>>> provideCodeActions(CodeActionParams params) {
-		if (params.getContext() == null || params.getContext().getDiagnostics() == null) {
-			return CompletableFuture.completedFuture(Collections.emptyList());
-		}
-
 		URI uri = URI.create(params.getTextDocument().getUri());
 		List<Either<Command, CodeAction>> codeActions = new ArrayList<>();
 
-		for (Diagnostic diagnostic : params.getContext().getDiagnostics()) {
-			String message = diagnostic.getMessage();
-			if (message == null) {
-				continue;
-			}
+		// Diagnostic-based quick fixes
+		if (params.getContext() != null && params.getContext().getDiagnostics() != null) {
+			List<Diagnostic> unusedImportDiagnostics = new ArrayList<>();
 
-			Matcher matcher = PATTERN_UNABLE_TO_RESOLVE_CLASS.matcher(message);
-			if (matcher.find()) {
-				String unresolvedClassName = matcher.group(1);
-				List<CodeAction> importActions = createImportActions(uri, unresolvedClassName, diagnostic);
-				for (CodeAction action : importActions) {
-					codeActions.add(Either.forRight(action));
+			for (Diagnostic diagnostic : params.getContext().getDiagnostics()) {
+				String message = diagnostic.getMessage();
+				if (message == null) {
+					continue;
+				}
+
+				// Add Import quick fix
+				Matcher matcher = PATTERN_UNABLE_TO_RESOLVE_CLASS.matcher(message);
+				if (matcher.find()) {
+					String unresolvedClassName = matcher.group(1);
+					List<CodeAction> importActions = createImportActions(uri, unresolvedClassName, diagnostic);
+					for (CodeAction action : importActions) {
+						codeActions.add(Either.forRight(action));
+					}
+				}
+
+				// Remove Unused Import quick fix
+				if (UNUSED_IMPORT_MESSAGE.equals(message)) {
+					unusedImportDiagnostics.add(diagnostic);
+					CodeAction removeOne = createRemoveUnusedImportAction(uri, diagnostic);
+					if (removeOne != null) {
+						codeActions.add(Either.forRight(removeOne));
+					}
 				}
 			}
+
+			// "Remove all unused imports" when there are multiple
+			if (unusedImportDiagnostics.size() > 1) {
+				CodeAction removeAll = createRemoveAllUnusedImportsAction(uri, unusedImportDiagnostics);
+				if (removeAll != null) {
+					codeActions.add(Either.forRight(removeAll));
+				}
+			}
+		}
+
+		// Organize / Remove Unused Imports
+		OrganizeImportsAction organizeImportsAction = new OrganizeImportsAction(ast);
+		for (CodeAction action : organizeImportsAction.provideCodeActions(params)) {
+			codeActions.add(Either.forRight(action));
+		}
+
+		// Implement Interface Methods
+		ImplementInterfaceMethodsAction implementMethodsAction = new ImplementInterfaceMethodsAction(ast);
+		for (CodeAction action : implementMethodsAction.provideCodeActions(params)) {
+			codeActions.add(Either.forRight(action));
+		}
+
+		// Generate Constructor
+		GenerateConstructorAction generateConstructorAction = new GenerateConstructorAction(ast);
+		for (CodeAction action : generateConstructorAction.provideCodeActions(params)) {
+			codeActions.add(Either.forRight(action));
+		}
+
+		// Generate Getter/Setter
+		GenerateGetterSetterAction generateGetterSetterAction = new GenerateGetterSetterAction(ast);
+		for (CodeAction action : generateGetterSetterAction.provideCodeActions(params)) {
+			codeActions.add(Either.forRight(action));
+		}
+
+		// Generate toString(), equals(), hashCode()
+		GenerateMethodsAction generateMethodsAction = new GenerateMethodsAction(ast);
+		for (CodeAction action : generateMethodsAction.provideCodeActions(params)) {
+			codeActions.add(Either.forRight(action));
+		}
+
+		// Add @Override
+		AddOverrideAction addOverrideAction = new AddOverrideAction(ast);
+		for (CodeAction action : addOverrideAction.provideCodeActions(params)) {
+			codeActions.add(Either.forRight(action));
 		}
 
 		return CompletableFuture.completedFuture(codeActions);
@@ -123,6 +185,62 @@ public class CodeActionProvider {
 		codeAction.setDiagnostics(Collections.singletonList(diagnostic));
 
 		return codeAction;
+	}
+
+	/**
+	 * Creates a QuickFix to remove a single unused import line.
+	 */
+	private CodeAction createRemoveUnusedImportAction(URI uri, Diagnostic diagnostic) {
+		Range range = diagnostic.getRange();
+		if (range == null) {
+			return null;
+		}
+
+		// Delete the entire import line (from start of line to start of next line)
+		TextEdit textEdit = new TextEdit(
+				new Range(new Position(range.getStart().getLine(), 0),
+						new Position(range.getEnd().getLine() + 1, 0)),
+				"");
+
+		WorkspaceEdit workspaceEdit = new WorkspaceEdit();
+		workspaceEdit.setChanges(Collections.singletonMap(uri.toString(), Collections.singletonList(textEdit)));
+
+		CodeAction action = new CodeAction("Remove unused import");
+		action.setKind(CodeActionKind.QuickFix);
+		action.setEdit(workspaceEdit);
+		action.setDiagnostics(Collections.singletonList(diagnostic));
+		action.setIsPreferred(true);
+		return action;
+	}
+
+	/**
+	 * Creates a QuickFix to remove all unused imports at once.
+	 */
+	private CodeAction createRemoveAllUnusedImportsAction(URI uri, List<Diagnostic> diagnostics) {
+		List<TextEdit> edits = new ArrayList<>();
+		for (Diagnostic diagnostic : diagnostics) {
+			Range range = diagnostic.getRange();
+			if (range == null) {
+				continue;
+			}
+			edits.add(new TextEdit(
+					new Range(new Position(range.getStart().getLine(), 0),
+							new Position(range.getEnd().getLine() + 1, 0)),
+					""));
+		}
+
+		if (edits.isEmpty()) {
+			return null;
+		}
+
+		WorkspaceEdit workspaceEdit = new WorkspaceEdit();
+		workspaceEdit.setChanges(Collections.singletonMap(uri.toString(), edits));
+
+		CodeAction action = new CodeAction("Remove all unused imports");
+		action.setKind(CodeActionKind.QuickFix);
+		action.setEdit(workspaceEdit);
+		action.setDiagnostics(diagnostics);
+		return action;
 	}
 
 	/**

@@ -209,8 +209,15 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         serverCapabilities.setImplementationProvider(true);
         serverCapabilities.setDocumentHighlightProvider(true);
         serverCapabilities.setHoverProvider(true);
-        serverCapabilities.setRenameProvider(true);
-        serverCapabilities.setCodeActionProvider(true);
+        RenameOptions renameOptions = new RenameOptions();
+        renameOptions.setPrepareProvider(true);
+        serverCapabilities.setRenameProvider(renameOptions);
+        CodeActionOptions codeActionOptions = new CodeActionOptions();
+        codeActionOptions.setCodeActionKinds(Arrays.asList(
+                CodeActionKind.QuickFix,
+                CodeActionKind.Refactor,
+                CodeActionKind.SourceOrganizeImports));
+        serverCapabilities.setCodeActionProvider(codeActionOptions);
         SignatureHelpOptions signatureHelpOptions = new SignatureHelpOptions();
         signatureHelpOptions.setTriggerCharacters(Arrays.asList("(", ","));
         serverCapabilities.setSignatureHelpProvider(signatureHelpOptions);

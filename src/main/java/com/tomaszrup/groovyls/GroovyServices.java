@@ -52,6 +52,7 @@ import org.codehaus.groovy.control.messages.SyntaxErrorMessage;
 import org.codehaus.groovy.syntax.SyntaxException;
 import org.eclipse.lsp4j.*;
 import org.eclipse.lsp4j.jsonrpc.messages.Either;
+import org.eclipse.lsp4j.jsonrpc.messages.Either3;
 import org.eclipse.lsp4j.services.LanguageClient;
 import org.eclipse.lsp4j.services.LanguageClientAware;
 import org.eclipse.lsp4j.services.TextDocumentService;
@@ -62,6 +63,7 @@ import io.github.classgraph.ClassGraph;
 import io.github.classgraph.ClassGraphException;
 import io.github.classgraph.ScanResult;
 import com.tomaszrup.groovyls.compiler.ast.ASTNodeVisitor;
+import com.tomaszrup.groovyls.compiler.ast.UnusedImportFinder;
 import com.tomaszrup.groovyls.compiler.control.GroovyLSCompilationUnit;
 import com.tomaszrup.groovyls.config.CompilationUnitFactory;
 import com.tomaszrup.groovyls.config.ICompilationUnitFactory;
@@ -657,6 +659,20 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	}
 
 	@Override
+	public CompletableFuture<Either3<Range, PrepareRenameResult, PrepareRenameDefaultBehavior>> prepareRename(
+			PrepareRenameParams params) {
+		URI uri = URI.create(params.getTextDocument().getUri());
+		ProjectScope scope = findProjectScope(uri);
+		if (scope == null || scope.astVisitor == null) {
+			return CompletableFuture.completedFuture(null);
+		}
+		recompileIfContextChanged(scope, uri);
+
+		RenameProvider provider = new RenameProvider(scope.astVisitor, fileContentsTracker);
+		return provider.providePrepareRename(params);
+	}
+
+	@Override
 	public CompletableFuture<WorkspaceEdit> rename(RenameParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
 		ProjectScope scope = findProjectScope(uri);
@@ -851,6 +867,27 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 
 	private Set<PublishDiagnosticsParams> handleErrorCollector(ProjectScope scope, ErrorCollector collector) {
 		Map<URI, List<Diagnostic>> diagnosticsByFile = new HashMap<>();
+
+		// Find unused imports and add them as diagnostics with the Unnecessary tag
+		UnusedImportFinder unusedImportFinder = new UnusedImportFinder();
+		Map<URI, List<org.codehaus.groovy.ast.ImportNode>> unusedImportsByFile = unusedImportFinder
+				.findUnusedImports(scope.compilationUnit);
+		for (Map.Entry<URI, List<org.codehaus.groovy.ast.ImportNode>> entry : unusedImportsByFile.entrySet()) {
+			URI uri = entry.getKey();
+			for (org.codehaus.groovy.ast.ImportNode importNode : entry.getValue()) {
+				Range range = GroovyLanguageServerUtils.astNodeToRange(importNode);
+				if (range == null) {
+					continue;
+				}
+				Diagnostic diagnostic = new Diagnostic();
+				diagnostic.setRange(range);
+				diagnostic.setSeverity(DiagnosticSeverity.Hint);
+				diagnostic.setMessage("Unused import");
+				diagnostic.setTags(Collections.singletonList(DiagnosticTag.Unnecessary));
+				diagnostic.setSource("groovy");
+				diagnosticsByFile.computeIfAbsent(uri, (key) -> new ArrayList<>()).add(diagnostic);
+			}
+		}
 
 		List<? extends Message> errors = collector.getErrors();
 		if (errors != null && !errors.isEmpty()) {

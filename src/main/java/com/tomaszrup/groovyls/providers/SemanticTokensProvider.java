@@ -395,10 +395,18 @@ public class SemanticTokensProvider {
 			return;
 		}
 		ClassNode type = node.getType();
-		if (type != null && type.getLineNumber() != -1) {
+		if (type != null) {
 			String name = type.getNameWithoutPackage();
-			int tokenType = classNodeToTokenType(type);
-			addToken(tokens, type.getLineNumber(), type.getColumnNumber(), name.length(), tokenType, 0);
+			// Always compute the column from the ImportNode's end position.
+			// The ClassNode's getColumnNumber() points to the start of the
+			// fully qualified name (e.g. "spock" in "spock.lang.Specification"),
+			// but we only want to highlight the short class name at the end.
+			// getLastColumnNumber() is 1-based and exclusive, so subtracting
+			// the name length gives the 1-based start of the class name.
+			int line = node.getLastLineNumber();
+			int column = node.getLastColumnNumber() - name.length();
+			// Use generic "type" for all imports so they have consistent coloring
+			addToken(tokens, line, column, name.length(), TYPE_TYPE, 0);
 		}
 	}
 
@@ -526,7 +534,9 @@ public class SemanticTokensProvider {
 	}
 
 	private int classNodeToTokenType(ClassNode node) {
-		if (node.isInterface()) {
+		if (node.isAnnotationDefinition()) {
+			return TYPE_DECORATOR;
+		} else if (node.isInterface()) {
 			return TYPE_INTERFACE;
 		} else if (node.isEnum()) {
 			return TYPE_ENUM;
