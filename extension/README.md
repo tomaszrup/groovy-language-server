@@ -19,6 +19,20 @@ The following LSP capabilities are supported:
 - **Workspace Symbols** — search for symbols across the entire workspace
 - **Code Actions** — quick-fix suggestions for common issues
 - **Diagnostics** — real-time syntax and compilation error reporting
+- **Inlay Hints** — inline type annotations for `def` variables and parameter name hints for method/constructor calls
+- **Semantic Highlighting** — semantic-aware syntax highlighting for classes, interfaces, enums, traits, methods, properties, variables, parameters, and more, with modifiers for `static`, `readonly`, `abstract`, and `declaration`
+- **Traits** — full support for Groovy traits (see below)
+
+### Trait Support
+
+Groovy [traits](https://groovy-lang.org/objectorientation.html#_traits) are fully supported across all language features:
+
+- **Completion** — trait methods appear in completions on implementing classes, within the trait itself, and on external instances
+- **Definition** — go-to-definition resolves to the original trait method declaration, both within the trait and from implementing classes
+- **Type Definition** — navigate from a trait-typed variable to the trait declaration
+- **Hover** — traits are displayed with the `trait` keyword (not `interface`), including `extends` clauses
+- **Document Symbols** — traits appear with `Interface` symbol kind; trait methods appear as `Method` symbols
+- **Semantic Highlighting** — traits are highlighted as interfaces with appropriate modifiers
 
 ### Spock Framework Support
 
@@ -74,9 +88,8 @@ A bundled VS Code extension provides a seamless editor experience:
 | `groovy.java.home` | `string` | Path to a custom JDK installation |
 | `groovy.classpath` | `string[]` | Additional `.jar` files to include on the classpath |
 | `groovy.debug.serverPort` | `number` | Connect to an existing Groovy LSP server on this TCP port instead of starting one automatically |
-
-## Major missing features
-- **Debugger**
+| `groovy.semanticHighlighting.enabled` | `boolean` | Enable or disable semantic syntax highlighting (default: `true`) |
+| `groovy.formatting.enabled` | `boolean` | Enable or disable document formatting (default: `true`) |
 
 ## Build
 

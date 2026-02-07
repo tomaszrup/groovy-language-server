@@ -23,7 +23,9 @@ package com.tomaszrup.groovyls.compiler.util;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 import org.codehaus.groovy.ast.ASTNode;
@@ -205,6 +207,9 @@ public class GroovyASTUtils {
                     if (superClassNode != null) {
                         classNodes.add(superClassNode);
                     }
+                    for (ClassNode interfaceNode : current.getInterfaces()) {
+                        classNodes.add(interfaceNode);
+                    }
                 }
                 i++;
             }
@@ -245,6 +250,9 @@ public class GroovyASTUtils {
                     if (superClassNode != null) {
                         classNodes.add(superClassNode);
                     }
+                    for (ClassNode interfaceNode : current.getInterfaces()) {
+                        classNodes.add(interfaceNode);
+                    }
                 }
                 i++;
             }
@@ -283,6 +291,9 @@ public class GroovyASTUtils {
                     }
                     if (superClassNode != null) {
                         classNodes.add(superClassNode);
+                    }
+                    for (ClassNode interfaceNode : current.getInterfaces()) {
+                        classNodes.add(interfaceNode);
                     }
                 }
                 i++;
@@ -362,7 +373,19 @@ public class GroovyASTUtils {
             MethodCallExpression methodCallExpr = (MethodCallExpression) node;
             ClassNode leftType = getTypeOfNode(methodCallExpr.getObjectExpression(), astVisitor);
             if (leftType != null) {
-                return leftType.getMethods(methodCallExpr.getMethod().getText());
+                String methodName = methodCallExpr.getMethod().getText();
+                List<MethodNode> methods = leftType.getMethods(methodName);
+                if (!methods.isEmpty()) {
+                    return methods;
+                }
+                // Direct lookup failed — walk the type hierarchy (traits/interfaces/superclasses)
+                // to find the original method declarations. This is needed because at the
+                // CANONICALIZATION phase, trait methods may not yet be mixed into the
+                // implementing class.
+                methods = getMethodsFromTypeHierarchy(leftType, methodName, astVisitor);
+                if (!methods.isEmpty()) {
+                    return methods;
+                }
             }
         } else if (node instanceof ConstructorCallExpression) {
             ConstructorCallExpression constructorCallExpr = (ConstructorCallExpression) node;
@@ -397,6 +420,14 @@ public class GroovyASTUtils {
                     return 0;
                 }
             }).orElse(null);
+            // If the resolved method has no source location (e.g., synthetic trait bridge
+            // method), try to find the original method declaration in a trait or superclass.
+            if (foundMethod != null && foundMethod.getLineNumber() == -1) {
+                MethodNode original = resolveOriginalMethod(foundMethod, astVisitor);
+                if (original != null) {
+                    return original;
+                }
+            }
             return foundMethod;
         }
         return null;
@@ -461,5 +492,140 @@ public class GroovyASTUtils {
         }
         Position position = new Position(nodeRange.getEnd().getLine() + 1, 0);
         return new Range(position, position);
+    }
+
+    /**
+     * Walks the type hierarchy (interfaces/traits and superclasses) of the given class
+     * to find methods with the specified name. Resolves each ancestor to its original
+     * ClassNode in the AST when possible, so that returned MethodNodes have source
+     * locations pointing to the actual trait/class source.
+     */
+    private static List<MethodNode> getMethodsFromTypeHierarchy(ClassNode classNode, String methodName,
+            ASTNodeVisitor astVisitor) {
+        List<MethodNode> result = new ArrayList<>();
+        List<ClassNode> toVisit = new ArrayList<>();
+        Set<String> visited = new HashSet<>();
+        visited.add(classNode.getName());
+
+        // Seed with direct interfaces (which include traits) and superclass
+        for (ClassNode iface : classNode.getInterfaces()) {
+            toVisit.add(iface);
+        }
+        try {
+            ClassNode superClass = classNode.getSuperClass();
+            if (superClass != null && !superClass.getName().equals("java.lang.Object")) {
+                toVisit.add(superClass);
+            }
+        } catch (NoClassDefFoundError e) {
+            // ignore
+        }
+
+        int i = 0;
+        while (i < toVisit.size()) {
+            ClassNode current = toVisit.get(i);
+            i++;
+            if (!visited.add(current.getName())) {
+                continue;
+            }
+
+            // Try to resolve to the original ClassNode in the AST (has source locations)
+            ClassNode resolved = tryToResolveOriginalClassNode(current, false, astVisitor);
+            List<MethodNode> methods = resolved.getDeclaredMethods(methodName);
+            for (MethodNode method : methods) {
+                if (method.getLineNumber() != -1) {
+                    result.add(method);
+                }
+            }
+
+            // Continue walking up
+            for (ClassNode iface : resolved.getInterfaces()) {
+                toVisit.add(iface);
+            }
+            try {
+                ClassNode superClass = resolved.getSuperClass();
+                if (superClass != null && !superClass.getName().equals("java.lang.Object")) {
+                    toVisit.add(superClass);
+                }
+            } catch (NoClassDefFoundError e) {
+                // ignore
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Given a MethodNode that has no source location (e.g., a synthetic trait bridge
+     * method or an inherited method stub), attempts to find the original method
+     * declaration in a trait or superclass within the AST.
+     */
+    public static MethodNode resolveOriginalMethod(MethodNode method, ASTNodeVisitor astVisitor) {
+        if (method == null || method.getLineNumber() != -1) {
+            return method;
+        }
+        String methodName = method.getName();
+        Parameter[] params = method.getParameters();
+        ClassNode declaringClass = method.getDeclaringClass();
+        if (declaringClass == null) {
+            return null;
+        }
+
+        // Search through all class nodes in the AST for a matching method
+        // with a source location, that is in the type hierarchy of the declaring class
+        List<ClassNode> toVisit = new ArrayList<>();
+        Set<String> visited = new HashSet<>();
+        visited.add(declaringClass.getName());
+
+        for (ClassNode iface : declaringClass.getInterfaces()) {
+            toVisit.add(iface);
+        }
+        try {
+            ClassNode superClass = declaringClass.getSuperClass();
+            if (superClass != null && !superClass.getName().equals("java.lang.Object")) {
+                toVisit.add(superClass);
+            }
+        } catch (NoClassDefFoundError e) {
+            // ignore
+        }
+
+        int i = 0;
+        while (i < toVisit.size()) {
+            ClassNode current = toVisit.get(i);
+            i++;
+            if (!visited.add(current.getName())) {
+                continue;
+            }
+
+            ClassNode resolved = tryToResolveOriginalClassNode(current, false, astVisitor);
+            for (MethodNode candidate : resolved.getDeclaredMethods(methodName)) {
+                if (candidate.getLineNumber() != -1 && parametersMatch(candidate.getParameters(), params)) {
+                    return candidate;
+                }
+            }
+
+            for (ClassNode iface : resolved.getInterfaces()) {
+                toVisit.add(iface);
+            }
+            try {
+                ClassNode superClass = resolved.getSuperClass();
+                if (superClass != null && !superClass.getName().equals("java.lang.Object")) {
+                    toVisit.add(superClass);
+                }
+            } catch (NoClassDefFoundError e) {
+                // ignore
+            }
+        }
+        return null;
+    }
+
+    private static boolean parametersMatch(Parameter[] a, Parameter[] b) {
+        if (a.length != b.length) {
+            return false;
+        }
+        for (int i = 0; i < a.length; i++) {
+            if (!a[i].getType().getName().equals(b[i].getType().getName())) {
+                return false;
+            }
+        }
+        return true;
     }
 }

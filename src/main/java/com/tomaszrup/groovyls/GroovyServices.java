@@ -72,8 +72,11 @@ import com.tomaszrup.groovyls.providers.DocumentHighlightProvider;
 import com.tomaszrup.groovyls.providers.DocumentSymbolProvider;
 import com.tomaszrup.groovyls.providers.HoverProvider;
 import com.tomaszrup.groovyls.providers.ImplementationProvider;
+import com.tomaszrup.groovyls.providers.FormattingProvider;
+import com.tomaszrup.groovyls.providers.InlayHintProvider;
 import com.tomaszrup.groovyls.providers.ReferenceProvider;
 import com.tomaszrup.groovyls.providers.RenameProvider;
+import com.tomaszrup.groovyls.providers.SemanticTokensProvider;
 import com.tomaszrup.groovyls.providers.SignatureHelpProvider;
 import com.tomaszrup.groovyls.providers.SpockCodeActionProvider;
 import com.tomaszrup.groovyls.providers.SpockCompletionProvider;
@@ -119,6 +122,8 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	private LanguageClient languageClient;
 	private Path workspaceRoot;
 	private FileContentsTracker fileContentsTracker = new FileContentsTracker();
+	private boolean semanticHighlightingEnabled = true;
+	private boolean formattingEnabled = true;
 
 	// Default scope (used when no Gradle projects are registered, e.g. in tests)
 	private ProjectScope defaultScope;
@@ -353,6 +358,26 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		}
 		JsonObject settings = (JsonObject) params.getSettings();
 		this.updateClasspath(settings);
+		this.updateFeatureToggles(settings);
+	}
+
+	private void updateFeatureToggles(JsonObject settings) {
+		if (!settings.has("groovy") || !settings.get("groovy").isJsonObject()) {
+			return;
+		}
+		JsonObject groovy = settings.get("groovy").getAsJsonObject();
+		if (groovy.has("semanticHighlighting") && groovy.get("semanticHighlighting").isJsonObject()) {
+			JsonObject sh = groovy.get("semanticHighlighting").getAsJsonObject();
+			if (sh.has("enabled")) {
+				this.semanticHighlightingEnabled = sh.get("enabled").getAsBoolean();
+			}
+		}
+		if (groovy.has("formatting") && groovy.get("formatting").isJsonObject()) {
+			JsonObject fmt = groovy.get("formatting").getAsJsonObject();
+			if (fmt.has("enabled")) {
+				this.formattingEnabled = fmt.get("enabled").getAsBoolean();
+			}
+		}
 	}
 
 	void updateClasspath(List<String> classpathList) {
@@ -617,7 +642,6 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	}
 
 	@Override
-	@SuppressWarnings("unchecked")
 	public CompletableFuture<Either<List<? extends SymbolInformation>, List<? extends WorkspaceSymbol>>> symbol(
 			WorkspaceSymbolParams params) {
 		// Workspace symbols aggregate across all project scopes
@@ -670,6 +694,46 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		}
 
 		return result;
+	}
+
+	@Override
+	public CompletableFuture<List<InlayHint>> inlayHint(InlayHintParams params) {
+		URI uri = URI.create(params.getTextDocument().getUri());
+		ProjectScope scope = findProjectScope(uri);
+		if (scope == null || scope.astVisitor == null) {
+			return CompletableFuture.completedFuture(Collections.emptyList());
+		}
+		recompileIfContextChanged(scope, uri);
+
+		InlayHintProvider provider = new InlayHintProvider(scope.astVisitor);
+		return provider.provideInlayHints(params);
+	}
+
+	@Override
+	public CompletableFuture<SemanticTokens> semanticTokensFull(SemanticTokensParams params) {
+		if (!semanticHighlightingEnabled) {
+			return CompletableFuture.completedFuture(new SemanticTokens(Collections.emptyList()));
+		}
+		URI uri = URI.create(params.getTextDocument().getUri());
+		ProjectScope scope = findProjectScope(uri);
+		if (scope == null || scope.astVisitor == null) {
+			return CompletableFuture.completedFuture(new SemanticTokens(Collections.emptyList()));
+		}
+		recompileIfContextChanged(scope, uri);
+
+		SemanticTokensProvider provider = new SemanticTokensProvider(scope.astVisitor);
+		return provider.provideSemanticTokensFull(params.getTextDocument());
+	}
+
+	@Override
+	public CompletableFuture<List<? extends TextEdit>> formatting(DocumentFormattingParams params) {
+		if (!formattingEnabled) {
+			return CompletableFuture.completedFuture(Collections.emptyList());
+		}
+		URI uri = URI.create(params.getTextDocument().getUri());
+		String sourceText = fileContentsTracker.getContents(uri);
+		FormattingProvider provider = new FormattingProvider();
+		return provider.provideFormatting(params, sourceText);
 	}
 
 	// --- INTERNAL
@@ -772,11 +836,13 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		} catch (CompilationFailedException e) {
 			logger.info("Compilation failed (expected for incomplete code) for scope {}: {}", scope.projectRoot, e.getMessage());
 		} catch (GroovyBugError e) {
-			System.err.println("Unexpected exception in language server when compiling Groovy.");
-			e.printStackTrace(System.err);
+			logger.warn("Groovy compiler bug during compilation for scope {} (this is usually harmless for code intelligence): {}",
+					scope.projectRoot, e.getMessage());
+			logger.debug("GroovyBugError details", e);
 		} catch (Exception e) {
-			System.err.println("Unexpected exception in language server when compiling Groovy.");
-			e.printStackTrace(System.err);
+			logger.warn("Unexpected exception during compilation for scope {}: {}",
+					scope.projectRoot, e.getMessage());
+			logger.debug("Compilation exception details", e);
 		}
 		Set<PublishDiagnosticsParams> diagnostics = handleErrorCollector(scope,
 				scope.compilationUnit.getErrorCollector());

@@ -29,6 +29,7 @@ import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.PropertyNode;
 import org.codehaus.groovy.ast.Variable;
 import org.codehaus.groovy.syntax.SyntaxException;
+import org.codehaus.groovy.transform.trait.Traits;
 import org.eclipse.lsp4j.CompletionItemKind;
 import org.eclipse.lsp4j.Location;
 import org.eclipse.lsp4j.Position;
@@ -92,7 +93,9 @@ public class GroovyLanguageServerUtils {
 	public static CompletionItemKind astNodeToCompletionItemKind(ASTNode node) {
 		if (node instanceof ClassNode) {
 			ClassNode classNode = (ClassNode) node;
-			if (classNode.isInterface()) {
+			if (Traits.isTrait(classNode)) {
+				return CompletionItemKind.Interface;
+			} else if (classNode.isInterface()) {
 				return CompletionItemKind.Interface;
 			} else if (classNode.isEnum()) {
 				return CompletionItemKind.Enum;
@@ -112,7 +115,9 @@ public class GroovyLanguageServerUtils {
 	public static SymbolKind astNodeToSymbolKind(ASTNode node) {
 		if (node instanceof ClassNode) {
 			ClassNode classNode = (ClassNode) node;
-			if (classNode.isInterface()) {
+			if (Traits.isTrait(classNode)) {
+				return SymbolKind.Interface;
+			} else if (classNode.isInterface()) {
 				return SymbolKind.Interface;
 			} else if (classNode.isEnum()) {
 				return SymbolKind.Enum;

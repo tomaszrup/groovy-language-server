@@ -27,6 +27,7 @@ import org.codehaus.groovy.ast.FieldNode;
 import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.Parameter;
 import org.codehaus.groovy.ast.Variable;
+import org.codehaus.groovy.transform.trait.Traits;
 
 import com.tomaszrup.groovyls.compiler.ast.ASTNodeVisitor;
 import com.tomaszrup.groovyls.compiler.util.GroovyASTUtils;
@@ -48,7 +49,10 @@ public class GroovyNodeToStringUtils {
 		if (classNode.isAbstract()) {
 			builder.append("abstract ");
 		}
-		if (classNode.isInterface()) {
+		boolean isTrait = Traits.isTrait(classNode);
+		if (isTrait) {
+			builder.append("trait ");
+		} else if (classNode.isInterface()) {
 			builder.append("interface ");
 		} else if (classNode.isEnum()) {
 			builder.append("enum ");
@@ -66,6 +70,16 @@ public class GroovyNodeToStringUtils {
 		if (superClass != null && !superClass.getName().equals(JAVA_OBJECT)) {
 			builder.append(" extends ");
 			builder.append(superClass.getNameWithoutPackage());
+		}
+		ClassNode[] interfaces = classNode.getInterfaces();
+		if (interfaces != null && interfaces.length > 0) {
+			builder.append(isTrait || classNode.isInterface() ? " extends " : " implements ");
+			for (int i = 0; i < interfaces.length; i++) {
+				if (i > 0) {
+					builder.append(", ");
+				}
+				builder.append(interfaces[i].getNameWithoutPackage());
+			}
 		}
 		return builder.toString();
 	}

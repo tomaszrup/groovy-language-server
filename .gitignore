@@ -25,3 +25,5 @@ target/
 
 # Node.js
 node_modules/
+
+*.vsix

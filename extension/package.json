@@ -2,7 +2,7 @@
   "name": "groovy-spock-support",
   "displayName": "Groovy & Spock Language Support",
   "description": "Language support for Groovy and Spock",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "publisher": "TomaszRup",
   "homepage": "https://github.com/tomaszrup/groovy-language-server",
   "repository": {
@@ -86,6 +86,16 @@
           "type": "number",
           "default": 0,
           "description": "If set, connect to an existing Groovy LSP server on this TCP port instead of starting one automatically."
+        },
+        "groovy.semanticHighlighting.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable or disable semantic syntax highlighting for Groovy files."
+        },
+        "groovy.formatting.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable or disable document formatting for Groovy files."
         }
       }
     }

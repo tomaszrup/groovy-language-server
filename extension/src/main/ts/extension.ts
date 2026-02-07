@@ -67,7 +67,9 @@ export function deactivate(): Thenable<void> | undefined {
 function onDidChangeConfiguration(event: vscode.ConfigurationChangeEvent) {
   if (
     event.affectsConfiguration("groovy.java.home") ||
-    event.affectsConfiguration("groovy.debug.serverPort")
+    event.affectsConfiguration("groovy.debug.serverPort") ||
+    event.affectsConfiguration("groovy.semanticHighlighting.enabled") ||
+    event.affectsConfiguration("groovy.formatting.enabled")
   ) {
     javaPath = findJava();
     //we're going to try to kill the language server and then restart
