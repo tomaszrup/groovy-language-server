@@ -1,0 +1,63 @@
+{
+  "comments": {
+    "lineComment": "//",
+    "blockComment": ["/*", "*/"]
+  },
+  "brackets": [
+    ["{", "}"],
+    ["[", "]"],
+    ["(", ")"]
+  ],
+  "autoClosingPairs": [
+    { "open": "{", "close": "}" },
+    { "open": "[", "close": "]" },
+    { "open": "(", "close": ")" },
+    { "open": "\"", "close": "\"", "notIn": ["string"] },
+    { "open": "'", "close": "'", "notIn": ["string"] },
+    { "open": "`", "close": "`", "notIn": ["string", "comment"] },
+    { "open": "/**", "close": " */", "notIn": ["string"] }
+  ],
+  "autoCloseBefore": ";:.,=}])>` \n\t",
+  "surroundingPairs": [
+    { "open": "{", "close": "}" },
+    { "open": "[", "close": "]" },
+    { "open": "(", "close": ")" },
+    { "open": "\"", "close": "\"" },
+    { "open": "'", "close": "'" },
+    { "open": "`", "close": "`" }
+  ],
+  "onEnterRules": [
+    {
+      "beforeText": "^\\s*/\\*\\*(?!/)([^\\*]|\\*(?!/))*$",
+      "afterText": "^\\s*\\*/$",
+      "action": { "indent": "indentOutdent", "appendText": " * " }
+    },
+    {
+      "beforeText": "^\\s*/\\*\\*(?!/)([^\\*]|\\*(?!/))*$",
+      "action": { "indent": "none", "appendText": " * " }
+    },
+    {
+      "beforeText": "^(\\t|[ ])*[ ]\\*([ ]([^\\*]|\\*(?!/))*)?$",
+      "action": { "indent": "none", "appendText": " * " }
+    },
+    {
+      "beforeText": "^(\\t|[ ])*[ ]\\*/\\s*$",
+      "action": { "indent": "none", "removeText": 1 }
+    },
+    {
+      "beforeText": "^(\\t|[ ])*[ ]\\*[^/]*\\*/\\s*$",
+      "action": { "indent": "none", "removeText": 1 }
+    }
+  ],
+  "folding": {
+    "markers": {
+      "start": "^\\s*//\\s*(?:region\\b|<editor-fold\\b)",
+      "end": "^\\s*//\\s*(?:endregion\\b|</editor-fold>)"
+    }
+  },
+  "indentationRules": {
+    "increaseIndentPattern": "^\\s*(?:(?:(?:(?:public|protected|private|static|final|abstract|synchronized)\\s+)*(?:class|interface|enum|trait)\\s+\\w+.*)|(?:.+\\{\\s*(?://.*)?$)|(?:(?:if|else|for|while|do|switch|try|catch|finally)\\b.*))$",
+    "decreaseIndentPattern": "^\\s*[}\\]]"
+  },
+  "wordPattern": "[a-zA-Z_$][a-zA-Z0-9_$]*"
+}

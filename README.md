@@ -100,6 +100,17 @@ A bundled VS Code extension provides a seamless editor experience:
 - **JDK auto-detection** — locates a suitable JDK from `JAVA_HOME`, `JDK_HOME`, `PATH`, or the `groovy.java.home` setting
 - **Restart command** — `Groovy: Restart Groovy language server` command to restart the server without reloading the window
 
+### Language Configuration
+
+The extension ships a `language-configuration.json` that enables rich editing support for Groovy files out of the box:
+
+- **Comment toggling** — `Ctrl+/` toggles `//` line comments; `Shift+Alt+A` wraps selections in `/* */` block comments
+- **Bracket matching & auto-closing** — automatically closes `()`, `[]`, `{}`, `""`, `''`, and backticks; matching brackets are highlighted
+- **Doc-comment continuation** — pressing Enter inside a `/** */` block automatically inserts ` * ` on the next line
+- **Smart indentation** — increases indent after `{`, `class`, `interface`, `enum`, `trait`, `if`, `for`, `while`, etc.; decreases indent on `}` or `]`
+- **Folding markers** — `// region` / `// endregion` (and `<editor-fold>`) markers create foldable regions in the editor
+- **Surrounding pairs** — selecting text and typing a bracket or quote character wraps the selection
+
 ### Configuration
 
 | Option | Type | Description |

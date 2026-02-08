@@ -48,11 +48,26 @@
       {
         "id": "groovy",
         "extensions": [
-          ".groovy"
+          ".groovy",
+          ".gvy",
+          ".gy",
+          ".gsh",
+          ".gradle"
+        ],
+        "filenames": [
+          "Jenkinsfile"
         ],
         "aliases": [
           "Groovy"
-        ]
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "groovy",
+        "scopeName": "source.groovy",
+        "path": "./syntaxes/groovy.tmLanguage.json"
       }
     ],
     "commands": [
