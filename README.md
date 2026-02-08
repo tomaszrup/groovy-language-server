@@ -2,7 +2,7 @@
 
 # Groovy Language Server
 
-A [Language Server Protocol](https://microsoft.github.io/language-server-protocol/) implementation for [Groovy](http://groovy-lang.org/), with first-class support for Gradle-based projects.
+A [Language Server Protocol](https://microsoft.github.io/language-server-protocol/) implementation for [Groovy](http://groovy-lang.org/), with first-class support for Gradle and Maven projects.
 
 ## Features
 
@@ -64,14 +64,33 @@ Built-in support for the [Spock](https://spockframework.org/) testing framework:
 
 Spock support activates automatically when a class extends `spock.lang.Specification` (resolved via the superclass chain or unresolved name).
 
-### Gradle Integration
+### Build Tool Integration
 
-This fork adds automatic classpath resolution for Gradle-based Groovy projects via the [Gradle Tooling API](https://docs.gradle.org/current/userguide/third_party_integration.html):
+Automatic classpath resolution for both **Gradle** and **Maven** projects:
+
+#### Gradle
+
+Gradle projects are imported via the [Gradle Tooling API](https://docs.gradle.org/current/userguide/third_party_integration.html):
 
 - Automatically discovers Gradle projects in the workspace (including multi-project builds)
 - Resolves `runtimeClasspath` dependencies so that autocomplete and navigation work for third-party libraries
 - Recompiles Java/Gradle sources on change so the Groovy compilation unit picks up updates
 - Per-project scoping — each Gradle subproject gets its own classpath and compilation context
+
+#### Maven
+
+Maven projects are imported by invoking `mvn` to resolve dependencies:
+
+- Automatically discovers Maven projects in the workspace (including multi-module builds)
+- Resolves the full dependency classpath via `mvn dependency:build-classpath` (including test-scoped dependencies like Spock)
+- Supports the **Maven Wrapper** (`mvnw` / `mvnw.cmd`) — the wrapper is detected automatically in the project directory or any parent directory
+- Compiles Java sources via `mvn compile test-compile` on import and when `.java` or `pom.xml` files change
+- Discovers `target/classes` and `target/test-classes` output directories
+- Per-project scoping — each Maven module gets its own classpath and compilation context
+
+#### Priority
+
+If a directory contains both `build.gradle` and `pom.xml`, the Gradle importer takes priority.
 
 ### VS Code Extension
 
@@ -90,6 +109,7 @@ A bundled VS Code extension provides a seamless editor experience:
 | `groovy.debug.serverPort` | `number` | Connect to an existing Groovy LSP server on this TCP port instead of starting one automatically |
 | `groovy.semanticHighlighting.enabled` | `boolean` | Enable or disable semantic syntax highlighting (default: `true`) |
 | `groovy.formatting.enabled` | `boolean` | Enable or disable document formatting (default: `true`) |
+| `groovy.maven.home` | `string` | Path to a Maven installation (used when `mvn` is not on `PATH` and no Maven Wrapper is present) |
 
 ## Build
 

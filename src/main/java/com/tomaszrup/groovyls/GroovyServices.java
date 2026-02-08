@@ -97,8 +97,8 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 
 	/**
 	 * Holds all per-project state: compilation unit, AST visitor, classpath, etc.
-	 * Each Gradle project in the workspace gets its own scope so that classpaths
-	 * don't leak between independent projects.
+	 * Each build-tool project (Gradle/Maven) in the workspace gets its own scope
+	 * so that classpaths don't leak between independent projects.
 	 */
 	static class ProjectScope {
 		Path projectRoot;
@@ -127,9 +127,9 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	private boolean semanticHighlightingEnabled = true;
 	private boolean formattingEnabled = true;
 
-	// Default scope (used when no Gradle projects are registered, e.g. in tests)
+	// Default scope (used when no build-tool projects are registered, e.g. in tests)
 	private ProjectScope defaultScope;
-	// Per-Gradle-project scopes, sorted by path length desc for longest-prefix match
+	// Per-project scopes, sorted by path length desc for longest-prefix match
 	private List<ProjectScope> projectScopes = new ArrayList<>();
 
 	public GroovyServices(ICompilationUnitFactory factory) {
@@ -148,7 +148,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	}
 
 	/**
-	 * Register all Gradle projects at once with their resolved classpaths.
+	 * Register all build-tool projects at once with their resolved classpaths.
 	 * This allows computing proper subproject exclusions so that parent projects
 	 * don't scan source files belonging to nested subprojects.
 	 */
@@ -266,8 +266,8 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	}
 
 	/**
-	 * Callback interface for notifying about Java/Gradle file changes
-	 * that require recompilation of a Gradle project.
+	 * Callback interface for notifying about Java or build-tool file changes
+	 * that require recompilation of a project.
 	 */
 	public interface JavaChangeListener {
 		void onJavaFilesChanged(Path projectRoot);
@@ -285,11 +285,13 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 				.map(fileEvent -> URI.create(fileEvent.getUri()))
 				.collect(Collectors.toSet());
 
-		// Detect Java/Gradle file changes that require Gradle recompilation
+		// Detect Java/build-tool file changes that require recompilation
 		Set<Path> projectsNeedingRecompile = new LinkedHashSet<>();
 		for (URI changedUri : allChangedUris) {
 			String path = changedUri.getPath();
-			if (path != null && (path.endsWith(".java") || path.endsWith("build.gradle") || path.endsWith("build.gradle.kts"))) {
+			if (path != null && (path.endsWith(".java")
+					|| path.endsWith("build.gradle") || path.endsWith("build.gradle.kts")
+					|| path.endsWith("pom.xml"))) {
 				Path filePath = Paths.get(changedUri);
 				for (ProjectScope scope : projectScopes) {
 					if (scope.projectRoot != null && filePath.startsWith(scope.projectRoot)) {
@@ -300,10 +302,10 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			}
 		}
 
-		// Trigger Gradle recompile for projects with Java/Gradle changes
+		// Trigger recompile for projects with Java/build-tool file changes
 		if (!projectsNeedingRecompile.isEmpty() && javaChangeListener != null) {
 			for (Path projectRoot : projectsNeedingRecompile) {
-				logger.info("Java/Gradle files changed in {}, triggering recompile", projectRoot);
+				logger.info("Java/build files changed in {}, triggering recompile", projectRoot);
 				javaChangeListener.onJavaFilesChanged(projectRoot);
 			}
 		}
@@ -737,7 +739,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		}
 		recompileIfContextChanged(scope, uri);
 
-		SemanticTokensProvider provider = new SemanticTokensProvider(scope.astVisitor);
+		SemanticTokensProvider provider = new SemanticTokensProvider(scope.astVisitor, fileContentsTracker);
 		return provider.provideSemanticTokensFull(params.getTextDocument());
 	}
 

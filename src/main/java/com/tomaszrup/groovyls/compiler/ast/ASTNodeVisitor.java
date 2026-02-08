@@ -32,6 +32,7 @@ import java.util.stream.Collectors;
 
 import org.codehaus.groovy.ast.ASTNode;
 import org.codehaus.groovy.ast.AnnotatedNode;
+import org.codehaus.groovy.ast.AnnotationNode;
 import org.codehaus.groovy.ast.ClassCodeVisitorSupport;
 import org.codehaus.groovy.ast.ClassNode;
 import org.codehaus.groovy.ast.ConstructorNode;
@@ -348,6 +349,20 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 			super.visitClass(node);
 		} finally {
 			popASTNode();
+		}
+	}
+
+	@Override
+	public void visitAnnotations(AnnotatedNode node) {
+		for (AnnotationNode annotation : node.getAnnotations()) {
+			pushASTNode(annotation);
+			try {
+				for (java.util.Map.Entry<String, org.codehaus.groovy.ast.expr.Expression> entry : annotation.getMembers().entrySet()) {
+					entry.getValue().visit(this);
+				}
+			} finally {
+				popASTNode();
+			}
 		}
 	}
 

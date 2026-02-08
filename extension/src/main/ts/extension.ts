@@ -174,6 +174,7 @@ function startLanguageServer() {
               vscode.workspace.createFileSystemWatcher("**/*.java"),
               vscode.workspace.createFileSystemWatcher("**/build.gradle"),
               vscode.workspace.createFileSystemWatcher("**/build.gradle.kts"),
+              vscode.workspace.createFileSystemWatcher("**/pom.xml"),
             ],
           },
           uriConverters: {

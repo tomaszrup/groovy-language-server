@@ -29,6 +29,7 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
 import org.codehaus.groovy.ast.ASTNode;
+import org.codehaus.groovy.ast.AnnotationNode;
 import org.codehaus.groovy.ast.ClassNode;
 import org.codehaus.groovy.ast.ConstructorNode;
 import org.codehaus.groovy.ast.FieldNode;
@@ -39,6 +40,8 @@ import org.codehaus.groovy.ast.PropertyNode;
 import org.codehaus.groovy.ast.expr.ClassExpression;
 import org.codehaus.groovy.ast.expr.ConstantExpression;
 import org.codehaus.groovy.ast.expr.ConstructorCallExpression;
+import org.codehaus.groovy.ast.expr.DeclarationExpression;
+import org.codehaus.groovy.ast.expr.MapEntryExpression;
 import org.codehaus.groovy.ast.expr.MethodCallExpression;
 import org.codehaus.groovy.ast.expr.PropertyExpression;
 import org.codehaus.groovy.ast.expr.StaticMethodCallExpression;
@@ -49,6 +52,7 @@ import org.eclipse.lsp4j.SemanticTokensLegend;
 import org.eclipse.lsp4j.TextDocumentIdentifier;
 
 import com.tomaszrup.groovyls.compiler.ast.ASTNodeVisitor;
+import com.tomaszrup.groovyls.util.FileContentsTracker;
 
 /**
  * Provides semantic tokens for Groovy source files, enabling semantic-aware
@@ -103,9 +107,12 @@ public class SemanticTokensProvider {
 	private static final int MOD_DEFAULT_LIBRARY = 1 << 5; // bit 5
 
 	private ASTNodeVisitor ast;
+	private FileContentsTracker fileContentsTracker;
+	private String[] sourceLines;
 
-	public SemanticTokensProvider(ASTNodeVisitor ast) {
+	public SemanticTokensProvider(ASTNodeVisitor ast, FileContentsTracker fileContentsTracker) {
 		this.ast = ast;
+		this.fileContentsTracker = fileContentsTracker;
 	}
 
 	public static SemanticTokensLegend getLegend() {
@@ -118,6 +125,11 @@ public class SemanticTokensProvider {
 		}
 
 		URI uri = URI.create(textDocument.getUri());
+
+		// Load source lines for accurate name position lookup
+		String source = fileContentsTracker != null ? fileContentsTracker.getContents(uri) : null;
+		this.sourceLines = source != null ? source.split("\n", -1) : new String[0];
+
 		List<ASTNode> nodes = ast.getNodes(uri);
 		List<SemanticToken> tokens = new ArrayList<>();
 
@@ -142,7 +154,9 @@ public class SemanticTokensProvider {
 			return;
 		}
 
-		if (node instanceof ClassNode) {
+		if (node instanceof AnnotationNode) {
+			addAnnotationToken((AnnotationNode) node, tokens);
+		} else if (node instanceof ClassNode) {
 			addClassNodeToken((ClassNode) node, tokens);
 		} else if (node instanceof MethodNode) {
 			addMethodNodeToken((MethodNode) node, tokens);
@@ -152,6 +166,8 @@ public class SemanticTokensProvider {
 			addPropertyNodeToken((PropertyNode) node, tokens);
 		} else if (node instanceof Parameter) {
 			addParameterToken((Parameter) node, tokens);
+		} else if (node instanceof DeclarationExpression) {
+			addDeclarationTypeToken((DeclarationExpression) node, tokens);
 		} else if (node instanceof VariableExpression) {
 			addVariableExpressionToken((VariableExpression) node, tokens);
 		} else if (node instanceof MethodCallExpression) {
@@ -166,17 +182,37 @@ public class SemanticTokensProvider {
 			addPropertyExpressionToken((PropertyExpression) node, tokens);
 		} else if (node instanceof ImportNode) {
 			addImportNodeToken((ImportNode) node, tokens);
+		} else if (node instanceof MapEntryExpression) {
+			addMapEntryExpressionToken((MapEntryExpression) node, tokens);
 		}
 	}
 
+	private void addAnnotationToken(AnnotationNode node, List<SemanticToken> tokens) {
+		if (node.getLineNumber() == -1) {
+			return;
+		}
+		ClassNode classNode = node.getClassNode();
+		String name = classNode.getNameWithoutPackage();
+		int line = node.getLineNumber();
+		int column = node.getColumnNumber();
+
+		// Include the '@' in the decorator token length so that '@Ignore'
+		// is colored uniformly as a single decorator token.
+		addToken(tokens, line, column, name.length() + 1, TYPE_DECORATOR, 0);
+	}
+
 	private void addClassNodeToken(ClassNode node, List<SemanticToken> tokens) {
-		// Only emit for the declaration itself, not for every resolved reference
 		if (node.getLineNumber() == -1) {
 			return;
 		}
 
 		int tokenType = classNodeToTokenType(node);
-		int modifiers = MOD_DECLARATION;
+		int modifiers = 0;
+		// Only mark as declaration for actual class declarations,
+		// not for superclass/interface type references
+		if (isClassDeclaration(node)) {
+			modifiers |= MOD_DECLARATION;
+		}
 		if (Modifier.isAbstract(node.getModifiers())) {
 			modifiers |= MOD_ABSTRACT;
 		}
@@ -185,7 +221,17 @@ public class SemanticTokensProvider {
 		}
 
 		String name = node.getNameWithoutPackage();
-		addToken(tokens, node.getLineNumber(), node.getColumnNumber(), name.length(), tokenType, modifiers);
+		int line = node.getLineNumber();
+		int column = node.getColumnNumber();
+
+		// In Groovy 4, ClassNode.getColumnNumber() points to the 'class'/'interface'/'enum'
+		// keyword, not the class name. Find the actual name in the source.
+		int nameCol = findNameColumn(line, column, name);
+		if (nameCol > 0) {
+			column = nameCol;
+		}
+
+		addToken(tokens, line, column, name.length(), tokenType, modifiers);
 	}
 
 	private void addMethodNodeToken(MethodNode node, List<SemanticToken> tokens) {
@@ -217,6 +263,20 @@ public class SemanticTokensProvider {
 			return;
 		}
 
+		String name = node.getName();
+		int line = node.getLineNumber();
+		int column = node.getColumnNumber();
+
+		// In Groovy 4, FieldNode.getColumnNumber() may point to the TYPE name,
+		// not the field NAME. Find the actual name in the source.
+		int nameCol = findNameColumn(line, column, name);
+		if (nameCol > 0 && nameCol > column) {
+			column = nameCol;
+		}
+
+		// Add type reference token for explicitly-typed field declarations
+		addDeclaredTypeReferenceToken(node, line, column, tokens);
+
 		int tokenType = TYPE_PROPERTY;
 		int modifiers = MOD_DECLARATION;
 		if (Modifier.isStatic(node.getModifiers())) {
@@ -232,12 +292,28 @@ public class SemanticTokensProvider {
 			tokenType = TYPE_ENUM_MEMBER;
 		}
 
-		addToken(tokens, node.getLineNumber(), node.getColumnNumber(), node.getName().length(), tokenType, modifiers);
+		addToken(tokens, line, column, name.length(), tokenType, modifiers);
 	}
 
 	private void addPropertyNodeToken(PropertyNode node, List<SemanticToken> tokens) {
 		if (node.getLineNumber() == -1) {
 			return;
+		}
+
+		String name = node.getName();
+		int line = node.getLineNumber();
+		int column = node.getColumnNumber();
+
+		// In Groovy 4, PropertyNode.getColumnNumber() may point to the TYPE name,
+		// not the property NAME. Find the actual name in the source.
+		int nameCol = findNameColumn(line, column, name);
+		if (nameCol > 0 && nameCol > column) {
+			column = nameCol;
+		}
+
+		// Add type reference token for explicitly-typed property declarations
+		if (node.getField() != null) {
+			addDeclaredTypeReferenceToken(node.getField(), line, column, tokens);
 		}
 
 		int modifiers = MOD_DECLARATION;
@@ -248,7 +324,7 @@ public class SemanticTokensProvider {
 			modifiers |= MOD_READONLY;
 		}
 
-		addToken(tokens, node.getLineNumber(), node.getColumnNumber(), node.getName().length(), TYPE_PROPERTY, modifiers);
+		addToken(tokens, line, column, name.length(), TYPE_PROPERTY, modifiers);
 	}
 
 	private void addParameterToken(Parameter node, List<SemanticToken> tokens) {
@@ -356,9 +432,18 @@ public class SemanticTokensProvider {
 		// The 'new' keyword is already highlighted by TextMate; highlight the type name
 		int tokenType = classNodeToTokenType(typeNode);
 
-		// The type starts after 'new ', so we use the type node's position
 		if (typeNode.getLineNumber() != -1) {
-			addToken(tokens, typeNode.getLineNumber(), typeNode.getColumnNumber(), name.length(), tokenType, 0);
+			int line = typeNode.getLineNumber();
+			int column = typeNode.getColumnNumber();
+
+			// In Groovy 4, the type node's getColumnNumber() in a constructor call
+			// may point to the 'new' keyword. Find the actual type name in the source.
+			int nameCol = findNameColumn(line, column, name);
+			if (nameCol > 0) {
+				column = nameCol;
+			}
+
+			addToken(tokens, line, column, name.length(), tokenType, 0);
 		}
 	}
 
@@ -407,6 +492,111 @@ public class SemanticTokensProvider {
 			int column = node.getLastColumnNumber() - name.length();
 			// Use generic "type" for all imports so they have consistent coloring
 			addToken(tokens, line, column, name.length(), TYPE_TYPE, 0);
+		}
+	}
+
+	/**
+	 * Adds a semantic token for the type name in a local variable declaration.
+	 * For example, in {@code MathHelper helper = new MathHelper()}, this highlights
+	 * the first {@code MathHelper} as a type reference.
+	 */
+	private void addDeclarationTypeToken(DeclarationExpression node, List<SemanticToken> tokens) {
+		if (!(node.getLeftExpression() instanceof VariableExpression)) {
+			return;
+		}
+		VariableExpression varExpr = (VariableExpression) node.getLeftExpression();
+		if (varExpr.isDynamicTyped()) {
+			return; // 'def' declarations have no explicit type to highlight
+		}
+		ClassNode originType = varExpr.getOriginType();
+		if (originType == null || originType.getLineNumber() == -1) {
+			return;
+		}
+		String typeName = originType.getNameWithoutPackage();
+		if (isPrimitiveType(typeName)) {
+			return; // Primitive types are handled by TextMate grammar
+		}
+		int tokenType = classNodeToTokenType(originType);
+		addToken(tokens, originType.getLineNumber(), originType.getColumnNumber(), typeName.length(), tokenType, 0);
+	}
+
+	/**
+	 * Adds a semantic token for the key in a named argument expression.
+	 * For example, in {@code method(paramName: value)}, this highlights
+	 * {@code paramName} as a parameter.
+	 */
+	private void addMapEntryExpressionToken(MapEntryExpression node, List<SemanticToken> tokens) {
+		if (node.getLineNumber() == -1) {
+			return;
+		}
+		if (!(node.getKeyExpression() instanceof ConstantExpression)) {
+			return;
+		}
+		ConstantExpression keyExpr = (ConstantExpression) node.getKeyExpression();
+		if (keyExpr.getLineNumber() == -1) {
+			return;
+		}
+		String keyName = keyExpr.getText();
+		if (keyName != null && isValidIdentifier(keyName)) {
+			addToken(tokens, keyExpr.getLineNumber(), keyExpr.getColumnNumber(), keyName.length(), TYPE_PARAMETER, 0);
+		}
+	}
+
+	/**
+	 * Adds a semantic token for the declared type of a field or property.
+	 * For example, in {@code MathHelper helper = new MathHelper()}, this highlights
+	 * the type {@code MathHelper} before the field name.
+	 *
+	 * @param field      the backing FieldNode
+	 * @param nameLine   line number of the field/property name
+	 * @param nameColumn column number of the field/property name
+	 */
+	private void addDeclaredTypeReferenceToken(FieldNode field, int nameLine, int nameColumn,
+			List<SemanticToken> tokens) {
+		if (field.isDynamicTyped() || field.isEnum()) {
+			return;
+		}
+		ClassNode originType = field.getOriginType();
+		if (originType == null || originType.getLineNumber() == -1) {
+			return;
+		}
+		String typeName = originType.getNameWithoutPackage();
+		if (isPrimitiveType(typeName)) {
+			return;
+		}
+		// Verify the type position is on the same line and before the field name
+		if (originType.getLineNumber() != nameLine || originType.getColumnNumber() >= nameColumn) {
+			return;
+		}
+		int tokenType = classNodeToTokenType(originType);
+		addToken(tokens, originType.getLineNumber(), originType.getColumnNumber(), typeName.length(), tokenType, 0);
+	}
+
+	/**
+	 * Checks whether a ClassNode represents an actual class/interface/enum
+	 * declaration, as opposed to a type reference (e.g. in extends/implements).
+	 */
+	private boolean isClassDeclaration(ClassNode node) {
+		for (ClassNode cn : ast.getClassNodes()) {
+			if (cn == node) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Returns true if the type name is a primitive type that is already
+	 * handled by the TextMate grammar.
+	 */
+	private static boolean isPrimitiveType(String typeName) {
+		switch (typeName) {
+			case "int": case "long": case "short": case "byte":
+			case "float": case "double": case "boolean": case "char":
+			case "void":
+				return true;
+			default:
+				return false;
 		}
 	}
 
@@ -597,5 +787,46 @@ public class SemanticTokensProvider {
 		int length;
 		int tokenType;
 		int tokenModifiers;
+	}
+
+	/**
+	 * Finds the 1-based column of identifier {@code name} in the source line,
+	 * searching from {@code startColumn} (1-based) onwards. This is necessary
+	 * because Groovy 4's Parrot parser stores the column of the preceding
+	 * keyword/type in many AST nodes, not the identifier itself.
+	 *
+	 * @return the 1-based column of the name, or -1 if not found
+	 */
+	private int findNameColumn(int groovyLine, int startColumn, String name) {
+		if (sourceLines == null || groovyLine <= 0 || groovyLine > sourceLines.length) {
+			return -1;
+		}
+		String line = sourceLines[groovyLine - 1]; // 0-based array index
+		int searchFrom = startColumn > 0 ? startColumn - 1 : 0; // convert to 0-based
+		int idx = line.indexOf(name, searchFrom);
+		if (idx < 0) {
+			return -1;
+		}
+		// Verify it's a whole-word match: the character before must not be an identifier part,
+		// and the character after must not be an identifier part
+		if (idx > 0 && Character.isJavaIdentifierPart(line.charAt(idx - 1))) {
+			// Not a whole word — try searching further
+			while (idx >= 0) {
+				idx = line.indexOf(name, idx + 1);
+				if (idx < 0) {
+					return -1;
+				}
+				boolean startOk = idx == 0 || !Character.isJavaIdentifierPart(line.charAt(idx - 1));
+				boolean endOk = (idx + name.length() >= line.length())
+						|| !Character.isJavaIdentifierPart(line.charAt(idx + name.length()));
+				if (startOk && endOk) {
+					break;
+				}
+			}
+			if (idx < 0) {
+				return -1;
+			}
+		}
+		return idx + 1; // convert back to 1-based
 	}
 }

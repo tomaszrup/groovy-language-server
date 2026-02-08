@@ -2,7 +2,7 @@
   "name": "groovy-spock-support",
   "displayName": "Groovy & Spock Language Support",
   "description": "Language support for Groovy and Spock",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "publisher": "TomaszRup",
   "homepage": "https://github.com/tomaszrup/groovy-language-server",
   "repository": {
@@ -96,6 +96,14 @@
           "type": "boolean",
           "default": true,
           "description": "Enable or disable document formatting for Groovy files."
+        },
+        "groovy.maven.home": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "description": "Specifies the folder path to the Maven installation. Use this if mvn is not on your PATH."
         }
       }
     }
