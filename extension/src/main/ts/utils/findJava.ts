@@ -49,6 +49,14 @@ export default function findJava(): string | null {
     }
   }
 
+  if ("JDK_HOME" in process.env) {
+    let jdkHome = process.env.JDK_HOME as string;
+    let javaPath = path.join(jdkHome, "bin", executableFile);
+    if (validate(javaPath)) {
+      return javaPath;
+    }
+  }
+
   if ("PATH" in process.env) {
     let PATH = process.env.PATH as string;
     let paths = PATH.split(path.delimiter);

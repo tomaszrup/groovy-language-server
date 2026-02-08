@@ -71,20 +71,24 @@ public class FileContentsTracker {
 
 	public void didChange(DidChangeTextDocumentParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
-		String oldText = openFiles.get(uri);
-		TextDocumentContentChangeEvent change = params.getContentChanges().get(0);
-		Range range = change.getRange();
-		if (range == null) {
-			openFiles.put(uri, change.getText());
-		} else {
-			int offsetStart = Positions.getOffset(oldText, change.getRange().getStart());
-			int offsetEnd = Positions.getOffset(oldText, change.getRange().getEnd());
-			StringBuilder builder = new StringBuilder();
-			builder.append(oldText.substring(0, offsetStart));
-			builder.append(change.getText());
-			builder.append(oldText.substring(offsetEnd));
-			openFiles.put(uri, builder.toString());
+		String currentText = openFiles.get(uri);
+		// Apply all content changes in order (incremental sync may send multiple)
+		for (TextDocumentContentChangeEvent change : params.getContentChanges()) {
+			Range range = change.getRange();
+			if (range == null) {
+				// Full content replacement
+				currentText = change.getText();
+			} else {
+				int offsetStart = Positions.getOffset(currentText, range.getStart());
+				int offsetEnd = Positions.getOffset(currentText, range.getEnd());
+				StringBuilder builder = new StringBuilder();
+				builder.append(currentText.substring(0, offsetStart));
+				builder.append(change.getText());
+				builder.append(currentText.substring(offsetEnd));
+				currentText = builder.toString();
+			}
 		}
+		openFiles.put(uri, currentText);
 		changedFiles.add(uri);
 	}
 

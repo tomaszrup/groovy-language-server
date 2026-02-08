@@ -255,7 +255,18 @@ public class SemanticTokensProvider {
 			modifiers |= MOD_ABSTRACT;
 		}
 
-		addToken(tokens, node.getLineNumber(), node.getColumnNumber(), name.length(), tokenType, modifiers);
+		int line = node.getLineNumber();
+		int column = node.getColumnNumber();
+
+		// In Groovy 4, MethodNode.getColumnNumber() points to the first modifier
+		// or return type keyword, not the method name. Find the actual name in
+		// the source.
+		int nameCol = findNameColumn(line, column, name);
+		if (nameCol > 0) {
+			column = nameCol;
+		}
+
+		addToken(tokens, line, column, name.length(), tokenType, modifiers);
 	}
 
 	private void addFieldNodeToken(FieldNode node, List<SemanticToken> tokens) {

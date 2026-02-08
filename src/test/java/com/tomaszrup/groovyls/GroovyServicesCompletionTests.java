@@ -29,9 +29,11 @@ import java.util.stream.Collectors;
 
 import org.eclipse.lsp4j.CompletionItem;
 import org.eclipse.lsp4j.CompletionItemKind;
+import org.eclipse.lsp4j.CompletionItemLabelDetails;
 import org.eclipse.lsp4j.CompletionList;
 import org.eclipse.lsp4j.CompletionParams;
 import org.eclipse.lsp4j.DidOpenTextDocumentParams;
+import org.eclipse.lsp4j.InsertTextFormat;
 import org.eclipse.lsp4j.MessageActionItem;
 import org.eclipse.lsp4j.MessageParams;
 import org.eclipse.lsp4j.Position;
@@ -629,5 +631,183 @@ class GroovyServicesCompletionTests {
 					&& item.getKind().equals(CompletionItemKind.Class);
 		}).collect(Collectors.toList());
 		Assertions.assertEquals(1, filteredItems.size());
+	}
+
+	// --- Snippet support tests ---
+
+	@Test
+	void testMethodCompletionHasSnippetFormatWithParams() throws Exception {
+		Path filePath = srcRoot.resolve("Completion.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("class Completion {\n");
+		contents.append("  String greet(String name, int count) { return '' }\n");
+		contents.append("  public Completion() {\n");
+		contents.append("    this.\n");
+		contents.append("  }\n");
+		contents.append("}");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+		Position position = new Position(3, 9);
+		Either<List<CompletionItem>, CompletionList> result = services
+				.completion(new CompletionParams(textDocument, position)).get();
+		Assertions.assertTrue(result.isLeft());
+		List<CompletionItem> items = result.getLeft();
+		List<CompletionItem> filteredItems = items.stream().filter(item -> {
+			return item.getLabel().equals("greet") && item.getKind().equals(CompletionItemKind.Method);
+		}).collect(Collectors.toList());
+		Assertions.assertEquals(1, filteredItems.size());
+		CompletionItem item = filteredItems.get(0);
+		Assertions.assertEquals(InsertTextFormat.Snippet, item.getInsertTextFormat());
+		Assertions.assertEquals("greet(${1:name}, ${2:count})", item.getInsertText());
+	}
+
+	@Test
+	void testMethodCompletionHasSnippetFormatWithNoParams() throws Exception {
+		Path filePath = srcRoot.resolve("Completion.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("class Completion {\n");
+		contents.append("  void noParams() {}\n");
+		contents.append("  public Completion() {\n");
+		contents.append("    this.\n");
+		contents.append("  }\n");
+		contents.append("}");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+		Position position = new Position(3, 9);
+		Either<List<CompletionItem>, CompletionList> result = services
+				.completion(new CompletionParams(textDocument, position)).get();
+		Assertions.assertTrue(result.isLeft());
+		List<CompletionItem> items = result.getLeft();
+		List<CompletionItem> filteredItems = items.stream().filter(item -> {
+			return item.getLabel().equals("noParams") && item.getKind().equals(CompletionItemKind.Method);
+		}).collect(Collectors.toList());
+		Assertions.assertEquals(1, filteredItems.size());
+		CompletionItem item = filteredItems.get(0);
+		Assertions.assertEquals(InsertTextFormat.Snippet, item.getInsertTextFormat());
+		Assertions.assertEquals("noParams()", item.getInsertText());
+	}
+
+	@Test
+	void testMethodCompletionHasLabelDetails() throws Exception {
+		Path filePath = srcRoot.resolve("Completion.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("class Completion {\n");
+		contents.append("  String greet(String name, int count) { return '' }\n");
+		contents.append("  public Completion() {\n");
+		contents.append("    this.\n");
+		contents.append("  }\n");
+		contents.append("}");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+		Position position = new Position(3, 9);
+		Either<List<CompletionItem>, CompletionList> result = services
+				.completion(new CompletionParams(textDocument, position)).get();
+		Assertions.assertTrue(result.isLeft());
+		List<CompletionItem> items = result.getLeft();
+		List<CompletionItem> filteredItems = items.stream().filter(item -> {
+			return item.getLabel().equals("greet") && item.getKind().equals(CompletionItemKind.Method);
+		}).collect(Collectors.toList());
+		Assertions.assertEquals(1, filteredItems.size());
+		CompletionItem item = filteredItems.get(0);
+		CompletionItemLabelDetails labelDetails = item.getLabelDetails();
+		Assertions.assertNotNull(labelDetails);
+		Assertions.assertEquals("(String name, int count)", labelDetails.getDetail());
+		Assertions.assertEquals("String", labelDetails.getDescription());
+		Assertions.assertEquals("String", item.getDetail());
+	}
+
+	@Test
+	void testMethodCompletionHasDocumentation() throws Exception {
+		Path filePath = srcRoot.resolve("Completion.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("class Completion {\n");
+		contents.append("  String greet(String name, int count) { return '' }\n");
+		contents.append("  public Completion() {\n");
+		contents.append("    this.\n");
+		contents.append("  }\n");
+		contents.append("}");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+		Position position = new Position(3, 9);
+		Either<List<CompletionItem>, CompletionList> result = services
+				.completion(new CompletionParams(textDocument, position)).get();
+		Assertions.assertTrue(result.isLeft());
+		List<CompletionItem> items = result.getLeft();
+		List<CompletionItem> filteredItems = items.stream().filter(item -> {
+			return item.getLabel().equals("greet") && item.getKind().equals(CompletionItemKind.Method);
+		}).collect(Collectors.toList());
+		Assertions.assertEquals(1, filteredItems.size());
+		CompletionItem item = filteredItems.get(0);
+		Assertions.assertNotNull(item.getDocumentation());
+		String docContent = item.getDocumentation().getRight().getValue();
+		Assertions.assertTrue(docContent.contains("greet"));
+		Assertions.assertTrue(docContent.contains("String name"));
+		Assertions.assertTrue(docContent.contains("int count"));
+	}
+
+	@Test
+	void testMethodCompletionOnPropertyExpressionHasSnippet() throws Exception {
+		Path filePath = srcRoot.resolve("Completion.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("class Completion {\n");
+		contents.append("  public Completion() {\n");
+		contents.append("    String localVar\n");
+		contents.append("    localVar.\n");
+		contents.append("  }\n");
+		contents.append("}");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+		Position position = new Position(3, 13);
+		Either<List<CompletionItem>, CompletionList> result = services
+				.completion(new CompletionParams(textDocument, position)).get();
+		Assertions.assertTrue(result.isLeft());
+		List<CompletionItem> items = result.getLeft();
+		List<CompletionItem> filteredItems = items.stream().filter(item -> {
+			return item.getLabel().equals("charAt") && item.getKind().equals(CompletionItemKind.Method);
+		}).collect(Collectors.toList());
+		Assertions.assertEquals(1, filteredItems.size());
+		CompletionItem item = filteredItems.get(0);
+		Assertions.assertEquals(InsertTextFormat.Snippet, item.getInsertTextFormat());
+		Assertions.assertNotNull(item.getInsertText());
+		Assertions.assertTrue(item.getInsertText().startsWith("charAt("));
+		Assertions.assertTrue(item.getInsertText().endsWith(")"));
+		Assertions.assertNotNull(item.getDocumentation());
+	}
+
+	@Test
+	void testMethodCompletionFilterTextMatchesLabel() throws Exception {
+		Path filePath = srcRoot.resolve("Completion.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("class Completion {\n");
+		contents.append("  void doSomething(int value) {}\n");
+		contents.append("  public Completion() {\n");
+		contents.append("    this.\n");
+		contents.append("  }\n");
+		contents.append("}");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+		Position position = new Position(3, 9);
+		Either<List<CompletionItem>, CompletionList> result = services
+				.completion(new CompletionParams(textDocument, position)).get();
+		Assertions.assertTrue(result.isLeft());
+		List<CompletionItem> items = result.getLeft();
+		List<CompletionItem> filteredItems = items.stream().filter(item -> {
+			return item.getLabel().equals("doSomething") && item.getKind().equals(CompletionItemKind.Method);
+		}).collect(Collectors.toList());
+		Assertions.assertEquals(1, filteredItems.size());
+		CompletionItem item = filteredItems.get(0);
+		Assertions.assertEquals("doSomething", item.getFilterText());
 	}
 }

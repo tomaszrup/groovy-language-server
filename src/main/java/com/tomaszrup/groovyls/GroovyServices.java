@@ -35,6 +35,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -132,19 +134,43 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	// Per-project scopes, sorted by path length desc for longest-prefix match
 	private List<ProjectScope> projectScopes = new ArrayList<>();
 
+	/**
+	 * Guards all mutable state: projectScopes, defaultScope, fileContentsTracker,
+	 * astVisitor, compilationUnit, etc.
+	 *
+	 * <p><b>Write-lock</b> is acquired for operations that mutate state
+	 * (didOpen/didChange/didClose, compilation, AST visits, and the
+	 * placeholder-injection paths in {@code completion}/{@code signatureHelp}).</p>
+	 *
+	 * <p><b>Read-lock</b> is acquired for LSP request handlers that only
+	 * query the AST (hover, definition, references, etc.).  These handlers
+	 * call {@link #ensureCompiledForContext(URI)} first, which briefly
+	 * upgrades to a write-lock <em>only</em> when the edit context has
+	 * actually changed and a recompilation is needed.</p>
+	 *
+	 * <p>This design allows multiple read-only requests to execute
+	 * concurrently while still serialising mutations.</p>
+	 */
+	private final ReadWriteLock stateLock = new ReentrantReadWriteLock();
+
 	public GroovyServices(ICompilationUnitFactory factory) {
 		defaultScope = new ProjectScope(null, factory);
 	}
 
 	public void setWorkspaceRoot(Path workspaceRoot) {
-		this.workspaceRoot = workspaceRoot;
-		defaultScope.projectRoot = workspaceRoot;
-		defaultScope.javaSourceLocator = new JavaSourceLocator();
-		if (workspaceRoot != null) {
-			defaultScope.javaSourceLocator.addProjectRoot(workspaceRoot);
+		stateLock.writeLock().lock();
+		try {
+			this.workspaceRoot = workspaceRoot;
+			defaultScope.projectRoot = workspaceRoot;
+			defaultScope.javaSourceLocator = new JavaSourceLocator();
+			if (workspaceRoot != null) {
+				defaultScope.javaSourceLocator.addProjectRoot(workspaceRoot);
+			}
+			createOrUpdateCompilationUnit(defaultScope);
+			fileContentsTracker.resetChangedFiles();
+		} finally {
+			stateLock.writeLock().unlock();
 		}
-		createOrUpdateCompilationUnit(defaultScope);
-		fileContentsTracker.resetChangedFiles();
 	}
 
 	/**
@@ -153,39 +179,44 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	 * don't scan source files belonging to nested subprojects.
 	 */
 	public void addProjects(Map<Path, List<String>> projectClasspaths) {
-		logger.info("addProjects called with {} projects", projectClasspaths.size());
-		List<Path> projectRoots = new ArrayList<>(projectClasspaths.keySet());
-		for (Path p : projectRoots) {
-			logger.info("  project root: {}, classpath entries: {}", p, projectClasspaths.get(p).size());
-		}
-
-		for (Path projectRoot : projectRoots) {
-			CompilationUnitFactory factory = new CompilationUnitFactory();
-			factory.setAdditionalClasspathList(projectClasspaths.get(projectRoot));
-
-			// Compute nested project roots that this project should NOT scan
-			List<Path> excludedRoots = new ArrayList<>();
-			for (Path other : projectRoots) {
-				if (!other.equals(projectRoot) && other.startsWith(projectRoot)) {
-					excludedRoots.add(other);
-				}
+		stateLock.writeLock().lock();
+		try {
+			logger.info("addProjects called with {} projects", projectClasspaths.size());
+			List<Path> projectRoots = new ArrayList<>(projectClasspaths.keySet());
+			for (Path p : projectRoots) {
+				logger.info("  project root: {}, classpath entries: {}", p, projectClasspaths.get(p).size());
 			}
-			logger.info("  Project {}: excluding {} subproject root(s): {}", projectRoot, excludedRoots.size(), excludedRoots);
-			factory.setExcludedSubRoots(excludedRoots);
 
-			ProjectScope scope = new ProjectScope(projectRoot, factory);
-			projectScopes.add(scope);
-		}
+			for (Path projectRoot : projectRoots) {
+				CompilationUnitFactory factory = new CompilationUnitFactory();
+				factory.setAdditionalClasspathList(projectClasspaths.get(projectRoot));
 
-		// Sort scopes by path length descending for longest-prefix-first matching
-		projectScopes.sort((a, b) -> b.projectRoot.toString().length() - a.projectRoot.toString().length());
+				// Compute nested project roots that this project should NOT scan
+				List<Path> excludedRoots = new ArrayList<>();
+				for (Path other : projectRoots) {
+					if (!other.equals(projectRoot) && other.startsWith(projectRoot)) {
+						excludedRoots.add(other);
+					}
+				}
+				logger.info("  Project {}: excluding {} subproject root(s): {}", projectRoot, excludedRoots.size(), excludedRoots);
+				factory.setExcludedSubRoots(excludedRoots);
 
-		// Create compilation units, compile, and visit AST for each scope
-		for (ProjectScope scope : projectScopes) {
-			createOrUpdateCompilationUnit(scope);
-			fileContentsTracker.resetChangedFiles();
-			compile(scope);
-			visitAST(scope);
+				ProjectScope scope = new ProjectScope(projectRoot, factory);
+				projectScopes.add(scope);
+			}
+
+			// Sort scopes by path length descending for longest-prefix-first matching
+			projectScopes.sort((a, b) -> b.projectRoot.toString().length() - a.projectRoot.toString().length());
+
+			// Create compilation units, compile, and visit AST for each scope
+			for (ProjectScope scope : projectScopes) {
+				createOrUpdateCompilationUnit(scope);
+				fileContentsTracker.resetChangedFiles();
+				compile(scope);
+				visitAST(scope);
+			}
+		} finally {
+			stateLock.writeLock().unlock();
 		}
 	}
 
@@ -232,16 +263,21 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 
 	@Override
 	public void didOpen(DidOpenTextDocumentParams params) {
-		fileContentsTracker.didOpen(params);
-		URI uri = URI.create(params.getTextDocument().getUri());
-		ProjectScope scope = findProjectScope(uri);
-		if (scope != null) {
-			compileAndVisitAST(scope, uri);
+		stateLock.writeLock().lock();
+		try {
+			fileContentsTracker.didOpen(params);
+			URI uri = URI.create(params.getTextDocument().getUri());
+			ProjectScope scope = findProjectScope(uri);
+			if (scope != null) {
+				compileAndVisitAST(scope, uri);
+			}
+		} finally {
+			stateLock.writeLock().unlock();
 		}
 	}
 
-	@Override
-	public void didChange(DidChangeTextDocumentParams params) {
+	/** Internal didChange without locking — caller must hold write lock. */
+	private void didChangeInternal(DidChangeTextDocumentParams params) {
 		fileContentsTracker.didChange(params);
 		URI uri = URI.create(params.getTextDocument().getUri());
 		ProjectScope scope = findProjectScope(uri);
@@ -251,12 +287,27 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	}
 
 	@Override
+	public void didChange(DidChangeTextDocumentParams params) {
+		stateLock.writeLock().lock();
+		try {
+			didChangeInternal(params);
+		} finally {
+			stateLock.writeLock().unlock();
+		}
+	}
+
+	@Override
 	public void didClose(DidCloseTextDocumentParams params) {
-		fileContentsTracker.didClose(params);
-		URI uri = URI.create(params.getTextDocument().getUri());
-		ProjectScope scope = findProjectScope(uri);
-		if (scope != null) {
-			compileAndVisitAST(scope, uri);
+		stateLock.writeLock().lock();
+		try {
+			fileContentsTracker.didClose(params);
+			URI uri = URI.create(params.getTextDocument().getUri());
+			ProjectScope scope = findProjectScope(uri);
+			if (scope != null) {
+				compileAndVisitAST(scope, uri);
+			}
+		} finally {
+			stateLock.writeLock().unlock();
 		}
 	}
 
@@ -281,88 +332,98 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 
 	@Override
 	public void didChangeWatchedFiles(DidChangeWatchedFilesParams params) {
-		Set<URI> allChangedUris = params.getChanges().stream()
-				.map(fileEvent -> URI.create(fileEvent.getUri()))
-				.collect(Collectors.toSet());
+		stateLock.writeLock().lock();
+		try {
+			Set<URI> allChangedUris = params.getChanges().stream()
+					.map(fileEvent -> URI.create(fileEvent.getUri()))
+					.collect(Collectors.toSet());
 
-		// Detect Java/build-tool file changes that require recompilation
-		Set<Path> projectsNeedingRecompile = new LinkedHashSet<>();
-		for (URI changedUri : allChangedUris) {
-			String path = changedUri.getPath();
-			if (path != null && (path.endsWith(".java")
-					|| path.endsWith("build.gradle") || path.endsWith("build.gradle.kts")
-					|| path.endsWith("pom.xml"))) {
-				Path filePath = Paths.get(changedUri);
-				for (ProjectScope scope : projectScopes) {
-					if (scope.projectRoot != null && filePath.startsWith(scope.projectRoot)) {
-						projectsNeedingRecompile.add(scope.projectRoot);
-						break;
-					}
-				}
-			}
-		}
-
-		// Trigger recompile for projects with Java/build-tool file changes
-		if (!projectsNeedingRecompile.isEmpty() && javaChangeListener != null) {
-			for (Path projectRoot : projectsNeedingRecompile) {
-				logger.info("Java/build files changed in {}, triggering recompile", projectRoot);
-				javaChangeListener.onJavaFilesChanged(projectRoot);
-			}
-		}
-
-		// Refresh Java source index for projects with Java file changes
-		for (URI changedUri : allChangedUris) {
-			String path = changedUri.getPath();
-			if (path != null && path.endsWith(".java")) {
-				for (ProjectScope scope : getAllScopes()) {
-					if (scope.projectRoot != null && scope.javaSourceLocator != null) {
-						Path filePath = Paths.get(changedUri);
-						if (filePath.startsWith(scope.projectRoot)) {
-							scope.javaSourceLocator.refresh();
+			// Detect Java/build-tool file changes that require recompilation
+			Set<Path> projectsNeedingRecompile = new LinkedHashSet<>();
+			for (URI changedUri : allChangedUris) {
+				String path = changedUri.getPath();
+				if (path != null && (path.endsWith(".java")
+						|| path.endsWith("build.gradle") || path.endsWith("build.gradle.kts")
+						|| path.endsWith("pom.xml"))) {
+					Path filePath = Paths.get(changedUri);
+					for (ProjectScope scope : projectScopes) {
+						if (scope.projectRoot != null && filePath.startsWith(scope.projectRoot)) {
+							projectsNeedingRecompile.add(scope.projectRoot);
 							break;
 						}
 					}
 				}
 			}
-		}
 
-		for (ProjectScope scope : getAllScopes()) {
-			Set<URI> scopeUris;
-			if (projectScopes.isEmpty()) {
-				// No project scopes - process all URIs (backward compat)
-				scopeUris = allChangedUris;
-			} else {
-				// Only process URIs that belong to this project
-				scopeUris = allChangedUris.stream()
-						.filter(uri -> scope.projectRoot != null
-								&& Paths.get(uri).startsWith(scope.projectRoot))
-						.collect(Collectors.toSet());
-			}
-			if (!scopeUris.isEmpty()) {
-				// After a Java recompile, invalidate + rebuild the compilation unit
-				if (projectsNeedingRecompile.contains(scope.projectRoot)) {
-					scope.compilationUnitFactory.invalidateCompilationUnit();
+			// Trigger recompile for projects with Java/build-tool file changes
+			if (!projectsNeedingRecompile.isEmpty() && javaChangeListener != null) {
+				for (Path projectRoot : projectsNeedingRecompile) {
+					logger.info("Java/build files changed in {}, triggering recompile", projectRoot);
+					javaChangeListener.onJavaFilesChanged(projectRoot);
 				}
-				boolean isSameUnit = createOrUpdateCompilationUnit(scope);
-				compile(scope);
-				if (isSameUnit) {
-					visitAST(scope, scopeUris);
+			}
+
+			// Refresh Java source index for projects with Java file changes
+			for (URI changedUri : allChangedUris) {
+				String path = changedUri.getPath();
+				if (path != null && path.endsWith(".java")) {
+					for (ProjectScope scope : getAllScopes()) {
+						if (scope.projectRoot != null && scope.javaSourceLocator != null) {
+							Path filePath = Paths.get(changedUri);
+							if (filePath.startsWith(scope.projectRoot)) {
+								scope.javaSourceLocator.refresh();
+								break;
+							}
+						}
+					}
+				}
+			}
+
+			for (ProjectScope scope : getAllScopes()) {
+				Set<URI> scopeUris;
+				if (projectScopes.isEmpty()) {
+					// No project scopes - process all URIs (backward compat)
+					scopeUris = allChangedUris;
 				} else {
-					visitAST(scope);
+					// Only process URIs that belong to this project
+					scopeUris = allChangedUris.stream()
+							.filter(uri -> scope.projectRoot != null
+									&& Paths.get(uri).startsWith(scope.projectRoot))
+							.collect(Collectors.toSet());
+				}
+				if (!scopeUris.isEmpty()) {
+					// After a Java recompile, invalidate + rebuild the compilation unit
+					if (projectsNeedingRecompile.contains(scope.projectRoot)) {
+						scope.compilationUnitFactory.invalidateCompilationUnit();
+					}
+					boolean isSameUnit = createOrUpdateCompilationUnit(scope);
+					compile(scope);
+					if (isSameUnit) {
+						visitAST(scope, scopeUris);
+					} else {
+						visitAST(scope);
+					}
 				}
 			}
+			fileContentsTracker.resetChangedFiles();
+		} finally {
+			stateLock.writeLock().unlock();
 		}
-		fileContentsTracker.resetChangedFiles();
 	}
 
 	@Override
 	public void didChangeConfiguration(DidChangeConfigurationParams params) {
-		if (!(params.getSettings() instanceof JsonObject)) {
-			return;
+		stateLock.writeLock().lock();
+		try {
+			if (!(params.getSettings() instanceof JsonObject)) {
+				return;
+			}
+			JsonObject settings = (JsonObject) params.getSettings();
+			this.updateClasspath(settings);
+			this.updateFeatureToggles(settings);
+		} finally {
+			stateLock.writeLock().unlock();
 		}
-		JsonObject settings = (JsonObject) params.getSettings();
-		this.updateClasspath(settings);
-		this.updateFeatureToggles(settings);
 	}
 
 	private void updateFeatureToggles(JsonObject settings) {
@@ -385,19 +446,24 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	}
 
 	void updateClasspath(List<String> classpathList) {
-		// When project scopes are registered (via Gradle import), they handle
-		// their own classpaths. The default scope should not override them.
-		if (!projectScopes.isEmpty()) {
-			logger.info("updateClasspath() ignored — {} project scope(s) are active", projectScopes.size());
-			return;
-		}
-		if (!classpathList.equals(defaultScope.compilationUnitFactory.getAdditionalClasspathList())) {
-			defaultScope.compilationUnitFactory.setAdditionalClasspathList(classpathList);
-			createOrUpdateCompilationUnit(defaultScope);
-			fileContentsTracker.resetChangedFiles();
-			compile(defaultScope);
-			visitAST(defaultScope);
-			defaultScope.previousContext = null;
+		stateLock.writeLock().lock();
+		try {
+			// When project scopes are registered (via Gradle import), they handle
+			// their own classpaths. The default scope should not override them.
+			if (!projectScopes.isEmpty()) {
+				logger.info("updateClasspath() ignored — {} project scope(s) are active", projectScopes.size());
+				return;
+			}
+			if (!classpathList.equals(defaultScope.compilationUnitFactory.getAdditionalClasspathList())) {
+				defaultScope.compilationUnitFactory.setAdditionalClasspathList(classpathList);
+				createOrUpdateCompilationUnit(defaultScope);
+				fileContentsTracker.resetChangedFiles();
+				compile(defaultScope);
+				visitAST(defaultScope);
+				defaultScope.previousContext = null;
+			}
+		} finally {
+			stateLock.writeLock().unlock();
 		}
 	}
 
@@ -422,158 +488,187 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	@Override
 	public CompletableFuture<Hover> hover(HoverParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
-		ProjectScope scope = findProjectScope(uri);
-		if (scope == null || scope.astVisitor == null) {
-			return CompletableFuture.completedFuture(null);
-		}
-		recompileIfContextChanged(scope, uri);
+		ProjectScope scope = ensureCompiledForContext(uri);
 
-		HoverProvider provider = new HoverProvider(scope.astVisitor);
-		return provider.provideHover(params.getTextDocument(), params.getPosition());
+		stateLock.readLock().lock();
+		try {
+			if (scope == null || scope.astVisitor == null) {
+				return CompletableFuture.completedFuture(null);
+			}
+
+			HoverProvider provider = new HoverProvider(scope.astVisitor);
+			return provider.provideHover(params.getTextDocument(), params.getPosition());
+		} finally {
+			stateLock.readLock().unlock();
+		}
 	}
 
 	@Override
 	public CompletableFuture<Either<List<CompletionItem>, CompletionList>> completion(CompletionParams params) {
-		TextDocumentIdentifier textDocument = params.getTextDocument();
-		Position position = params.getPosition();
-		URI uri = URI.create(textDocument.getUri());
-
-		ProjectScope scope = findProjectScope(uri);
-		if (scope == null || scope.astVisitor == null) {
-			return CompletableFuture.completedFuture(Either.forRight(new CompletionList()));
-		}
-		recompileIfContextChanged(scope, uri);
-
-		String originalSource = null;
-		ASTNode offsetNode = scope.astVisitor.getNodeAtLineAndColumn(uri, position.getLine(),
-				position.getCharacter());
-		if (offsetNode == null) {
-			originalSource = fileContentsTracker.getContents(uri);
-			VersionedTextDocumentIdentifier versionedTextDocument = new VersionedTextDocumentIdentifier(
-					textDocument.getUri(), 1);
-			int offset = Positions.getOffset(originalSource, position);
-			String lineBeforeOffset = originalSource.substring(offset - position.getCharacter(), offset);
-			Matcher matcher = PATTERN_CONSTRUCTOR_CALL.matcher(lineBeforeOffset);
-			TextDocumentContentChangeEvent changeEvent = null;
-			if (matcher.matches()) {
-				changeEvent = new TextDocumentContentChangeEvent(new Range(position, position), 0, "a()");
-			} else {
-				changeEvent = new TextDocumentContentChangeEvent(new Range(position, position), 0, "a");
-			}
-			DidChangeTextDocumentParams didChangeParams = new DidChangeTextDocumentParams(versionedTextDocument,
-					Collections.singletonList(changeEvent));
-			// if the offset node is null, there is probably a syntax error.
-			// a completion request is usually triggered by the . character, and
-			// if there is no property name after the dot, it will cause a syntax
-			// error.
-			// this hack adds a placeholder property name in the hopes that it
-			// will correctly create a PropertyExpression to use for completion.
-			// we'll restore the original text after we're done handling the
-			// completion request.
-			didChange(didChangeParams);
-		}
-
-		CompletableFuture<Either<List<CompletionItem>, CompletionList>> result = null;
+		stateLock.writeLock().lock();
 		try {
-			CompletionProvider provider = new CompletionProvider(scope.astVisitor, scope.classGraphScanResult);
-			result = provider.provideCompletion(params.getTextDocument(), params.getPosition(), params.getContext());
+			TextDocumentIdentifier textDocument = params.getTextDocument();
+			Position position = params.getPosition();
+			URI uri = URI.create(textDocument.getUri());
 
-			// Add Spock-specific completions
-			SpockCompletionProvider spockProvider = new SpockCompletionProvider(scope.astVisitor);
-			ASTNode currentNode = scope.astVisitor.getNodeAtLineAndColumn(uri, position.getLine(),
+			ProjectScope scope = findProjectScope(uri);
+			if (scope == null || scope.astVisitor == null) {
+				return CompletableFuture.completedFuture(Either.forRight(new CompletionList()));
+			}
+			recompileIfContextChanged(scope, uri);
+
+			String originalSource = null;
+			ASTNode offsetNode = scope.astVisitor.getNodeAtLineAndColumn(uri, position.getLine(),
 					position.getCharacter());
-			if (currentNode != null) {
-				List<CompletionItem> spockItems = spockProvider.provideSpockCompletions(uri, position, currentNode);
-				if (!spockItems.isEmpty()) {
-					result = result.thenApply(either -> {
-						if (either.isLeft()) {
-							List<CompletionItem> combined = new ArrayList<>(either.getLeft());
-							combined.addAll(spockItems);
-							return Either.forLeft(combined);
+			if (offsetNode == null) {
+				originalSource = fileContentsTracker.getContents(uri);
+				if (originalSource != null) {
+					VersionedTextDocumentIdentifier versionedTextDocument = new VersionedTextDocumentIdentifier(
+							textDocument.getUri(), 1);
+					int offset = Positions.getOffset(originalSource, position);
+					if (offset >= 0 && offset <= originalSource.length()) {
+						String lineBeforeOffset = originalSource.substring(
+								Math.max(0, offset - position.getCharacter()), offset);
+						Matcher matcher = PATTERN_CONSTRUCTOR_CALL.matcher(lineBeforeOffset);
+						TextDocumentContentChangeEvent changeEvent;
+						if (matcher.matches()) {
+							changeEvent = new TextDocumentContentChangeEvent(new Range(position, position), 0, "a()");
 						} else {
-							CompletionList list = either.getRight();
-							list.getItems().addAll(spockItems);
-							return Either.forRight(list);
+							changeEvent = new TextDocumentContentChangeEvent(new Range(position, position), 0, "a");
 						}
-					});
+						DidChangeTextDocumentParams didChangeParams = new DidChangeTextDocumentParams(
+								versionedTextDocument, Collections.singletonList(changeEvent));
+						// Placeholder hack: inject a temporary property name to force a
+						// PropertyExpression in the AST when the cursor is after a dot
+						// with no property name yet (syntax error). Restored below.
+						didChangeInternal(didChangeParams);
+					} else {
+						logger.debug("completion: offset {} out of bounds for source length {}", offset,
+								originalSource.length());
+						originalSource = null; // nothing was injected
+					}
 				}
 			}
-		} finally {
-			if (originalSource != null) {
-				VersionedTextDocumentIdentifier versionedTextDocument = new VersionedTextDocumentIdentifier(
-						textDocument.getUri(), 1);
-				TextDocumentContentChangeEvent changeEvent = new TextDocumentContentChangeEvent(null, 0,
-						originalSource);
-				DidChangeTextDocumentParams didChangeParams = new DidChangeTextDocumentParams(versionedTextDocument,
-						Collections.singletonList(changeEvent));
-				didChange(didChangeParams);
-			}
-		}
 
-		return result;
+			CompletableFuture<Either<List<CompletionItem>, CompletionList>> result;
+			try {
+				CompletionProvider provider = new CompletionProvider(scope.astVisitor, scope.classGraphScanResult);
+				result = provider.provideCompletion(params.getTextDocument(), params.getPosition(),
+						params.getContext());
+
+				// Add Spock-specific completions
+				SpockCompletionProvider spockProvider = new SpockCompletionProvider(scope.astVisitor);
+				ASTNode currentNode = scope.astVisitor.getNodeAtLineAndColumn(uri, position.getLine(),
+						position.getCharacter());
+				if (currentNode != null) {
+					List<CompletionItem> spockItems = spockProvider.provideSpockCompletions(uri, position,
+							currentNode);
+					if (!spockItems.isEmpty()) {
+						result = result.thenApply(either -> {
+							if (either.isLeft()) {
+								List<CompletionItem> combined = new ArrayList<>(either.getLeft());
+								combined.addAll(spockItems);
+								return Either.forLeft(combined);
+							} else {
+								CompletionList list = either.getRight();
+								list.getItems().addAll(spockItems);
+								return Either.forRight(list);
+							}
+						});
+					}
+				}
+			} finally {
+				if (originalSource != null) {
+					VersionedTextDocumentIdentifier versionedTextDocument = new VersionedTextDocumentIdentifier(
+							textDocument.getUri(), 1);
+					TextDocumentContentChangeEvent changeEvent = new TextDocumentContentChangeEvent(null, 0,
+							originalSource);
+					DidChangeTextDocumentParams didChangeParams = new DidChangeTextDocumentParams(
+							versionedTextDocument, Collections.singletonList(changeEvent));
+					didChangeInternal(didChangeParams);
+				}
+			}
+
+			return result;
+		} finally {
+			stateLock.writeLock().unlock();
+		}
 	}
 
 	@Override
 	public CompletableFuture<Either<List<? extends Location>, List<? extends LocationLink>>> definition(
 			DefinitionParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
-		ProjectScope scope = findProjectScope(uri);
-		if (scope == null || scope.astVisitor == null) {
-			return CompletableFuture.completedFuture(Either.forLeft(Collections.emptyList()));
-		}
-		recompileIfContextChanged(scope, uri);
+		ProjectScope scope = ensureCompiledForContext(uri);
 
-		DefinitionProvider provider = new DefinitionProvider(scope.astVisitor, scope.javaSourceLocator);
-		return provider.provideDefinition(params.getTextDocument(), params.getPosition());
+		stateLock.readLock().lock();
+		try {
+			if (scope == null || scope.astVisitor == null) {
+				return CompletableFuture.completedFuture(Either.forLeft(Collections.emptyList()));
+			}
+
+			DefinitionProvider provider = new DefinitionProvider(scope.astVisitor, scope.javaSourceLocator);
+			return provider.provideDefinition(params.getTextDocument(), params.getPosition());
+		} finally {
+			stateLock.readLock().unlock();
+		}
 	}
 
 	@Override
 	public CompletableFuture<SignatureHelp> signatureHelp(SignatureHelpParams params) {
-		TextDocumentIdentifier textDocument = params.getTextDocument();
-		Position position = params.getPosition();
-		URI uri = URI.create(textDocument.getUri());
-
-		ProjectScope scope = findProjectScope(uri);
-		if (scope == null || scope.astVisitor == null) {
-			return CompletableFuture.completedFuture(new SignatureHelp());
-		}
-		recompileIfContextChanged(scope, uri);
-
-		String originalSource = null;
-		ASTNode offsetNode = scope.astVisitor.getNodeAtLineAndColumn(uri, position.getLine(),
-				position.getCharacter());
-		if (offsetNode == null) {
-			originalSource = fileContentsTracker.getContents(uri);
-			VersionedTextDocumentIdentifier versionedTextDocument = new VersionedTextDocumentIdentifier(
-					textDocument.getUri(), 1);
-			TextDocumentContentChangeEvent changeEvent = new TextDocumentContentChangeEvent(
-					new Range(position, position), 0, ")");
-			DidChangeTextDocumentParams didChangeParams = new DidChangeTextDocumentParams(versionedTextDocument,
-					Collections.singletonList(changeEvent));
-			// if the offset node is null, there is probably a syntax error.
-			// a signature help request is usually triggered by the ( character,
-			// and if there is no matching ), it will cause a syntax error.
-			// this hack adds a placeholder ) character in the hopes that it
-			// will correctly create a ArgumentListExpression to use for
-			// signature help.
-			// we'll restore the original text after we're done handling the
-			// signature help request.
-			didChange(didChangeParams);
-		}
-
+		stateLock.writeLock().lock();
 		try {
-			SignatureHelpProvider provider = new SignatureHelpProvider(scope.astVisitor);
-			return provider.provideSignatureHelp(params.getTextDocument(), params.getPosition());
-		} finally {
-			if (originalSource != null) {
-				VersionedTextDocumentIdentifier versionedTextDocument = new VersionedTextDocumentIdentifier(
-						textDocument.getUri(), 1);
-				TextDocumentContentChangeEvent changeEvent = new TextDocumentContentChangeEvent(null, 0,
-						originalSource);
-				DidChangeTextDocumentParams didChangeParams = new DidChangeTextDocumentParams(versionedTextDocument,
-						Collections.singletonList(changeEvent));
-				didChange(didChangeParams);
+			TextDocumentIdentifier textDocument = params.getTextDocument();
+			Position position = params.getPosition();
+			URI uri = URI.create(textDocument.getUri());
+
+			ProjectScope scope = findProjectScope(uri);
+			if (scope == null || scope.astVisitor == null) {
+				return CompletableFuture.completedFuture(new SignatureHelp());
 			}
+			recompileIfContextChanged(scope, uri);
+
+			String originalSource = null;
+			ASTNode offsetNode = scope.astVisitor.getNodeAtLineAndColumn(uri, position.getLine(),
+					position.getCharacter());
+			if (offsetNode == null) {
+				originalSource = fileContentsTracker.getContents(uri);
+				if (originalSource != null) {
+					VersionedTextDocumentIdentifier versionedTextDocument = new VersionedTextDocumentIdentifier(
+							textDocument.getUri(), 1);
+					int offset = Positions.getOffset(originalSource, position);
+					if (offset >= 0 && offset <= originalSource.length()) {
+						TextDocumentContentChangeEvent changeEvent = new TextDocumentContentChangeEvent(
+								new Range(position, position), 0, ")");
+						DidChangeTextDocumentParams didChangeParams = new DidChangeTextDocumentParams(
+								versionedTextDocument, Collections.singletonList(changeEvent));
+						// Placeholder hack: inject a temporary ) to close an unclosed ( and
+						// create an ArgumentListExpression in the AST. Restored below.
+						didChangeInternal(didChangeParams);
+					} else {
+						logger.debug("signatureHelp: offset {} out of bounds for source length {}", offset,
+								originalSource.length());
+						originalSource = null; // nothing was injected
+					}
+				}
+			}
+
+			try {
+				SignatureHelpProvider provider = new SignatureHelpProvider(scope.astVisitor);
+				return provider.provideSignatureHelp(params.getTextDocument(), params.getPosition());
+			} finally {
+				if (originalSource != null) {
+					VersionedTextDocumentIdentifier versionedTextDocument = new VersionedTextDocumentIdentifier(
+							textDocument.getUri(), 1);
+					TextDocumentContentChangeEvent changeEvent = new TextDocumentContentChangeEvent(null, 0,
+							originalSource);
+					DidChangeTextDocumentParams didChangeParams = new DidChangeTextDocumentParams(
+							versionedTextDocument, Collections.singletonList(changeEvent));
+					didChangeInternal(didChangeParams);
+				}
+			}
+		} finally {
+			stateLock.writeLock().unlock();
 		}
 	}
 
@@ -581,177 +676,317 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	public CompletableFuture<Either<List<? extends Location>, List<? extends LocationLink>>> typeDefinition(
 			TypeDefinitionParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
-		ProjectScope scope = findProjectScope(uri);
-		if (scope == null || scope.astVisitor == null) {
-			return CompletableFuture.completedFuture(Either.forLeft(Collections.emptyList()));
-		}
-		recompileIfContextChanged(scope, uri);
+		ProjectScope scope = ensureCompiledForContext(uri);
 
-		TypeDefinitionProvider provider = new TypeDefinitionProvider(scope.astVisitor, scope.javaSourceLocator);
-		return provider.provideTypeDefinition(params.getTextDocument(), params.getPosition());
+		stateLock.readLock().lock();
+		try {
+			if (scope == null || scope.astVisitor == null) {
+				return CompletableFuture.completedFuture(Either.forLeft(Collections.emptyList()));
+			}
+
+			TypeDefinitionProvider provider = new TypeDefinitionProvider(scope.astVisitor, scope.javaSourceLocator);
+			return provider.provideTypeDefinition(params.getTextDocument(), params.getPosition());
+		} finally {
+			stateLock.readLock().unlock();
+		}
 	}
 
 	@Override
 	public CompletableFuture<Either<List<? extends Location>, List<? extends LocationLink>>> implementation(
 			ImplementationParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
-		ProjectScope scope = findProjectScope(uri);
-		if (scope == null || scope.astVisitor == null) {
-			return CompletableFuture.completedFuture(Either.forLeft(Collections.emptyList()));
-		}
-		recompileIfContextChanged(scope, uri);
+		ProjectScope scope = ensureCompiledForContext(uri);
 
-		ImplementationProvider provider = new ImplementationProvider(scope.astVisitor);
-		return provider.provideImplementation(params.getTextDocument(), params.getPosition());
+		stateLock.readLock().lock();
+		try {
+			if (scope == null || scope.astVisitor == null) {
+				return CompletableFuture.completedFuture(Either.forLeft(Collections.emptyList()));
+			}
+
+			ImplementationProvider provider = new ImplementationProvider(scope.astVisitor);
+			return provider.provideImplementation(params.getTextDocument(), params.getPosition());
+		} finally {
+			stateLock.readLock().unlock();
+		}
 	}
 
 	@Override
 	public CompletableFuture<List<? extends DocumentHighlight>> documentHighlight(DocumentHighlightParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
-		ProjectScope scope = findProjectScope(uri);
-		if (scope == null || scope.astVisitor == null) {
-			return CompletableFuture.completedFuture(Collections.emptyList());
-		}
-		recompileIfContextChanged(scope, uri);
+		ProjectScope scope = ensureCompiledForContext(uri);
 
-		DocumentHighlightProvider provider = new DocumentHighlightProvider(scope.astVisitor);
-		return provider.provideDocumentHighlights(params.getTextDocument(), params.getPosition());
+		stateLock.readLock().lock();
+		try {
+			if (scope == null || scope.astVisitor == null) {
+				return CompletableFuture.completedFuture(Collections.emptyList());
+			}
+
+			DocumentHighlightProvider provider = new DocumentHighlightProvider(scope.astVisitor);
+			return provider.provideDocumentHighlights(params.getTextDocument(), params.getPosition());
+		} finally {
+			stateLock.readLock().unlock();
+		}
 	}
 
 	@Override
 	public CompletableFuture<List<? extends Location>> references(ReferenceParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
-		ProjectScope scope = findProjectScope(uri);
-		if (scope == null || scope.astVisitor == null) {
-			return CompletableFuture.completedFuture(Collections.emptyList());
-		}
-		recompileIfContextChanged(scope, uri);
+		ProjectScope scope = ensureCompiledForContext(uri);
 
-		ReferenceProvider provider = new ReferenceProvider(scope.astVisitor);
-		return provider.provideReferences(params.getTextDocument(), params.getPosition());
+		stateLock.readLock().lock();
+		try {
+			if (scope == null || scope.astVisitor == null) {
+				return CompletableFuture.completedFuture(Collections.emptyList());
+			}
+
+			ReferenceProvider provider = new ReferenceProvider(scope.astVisitor);
+			return provider.provideReferences(params.getTextDocument(), params.getPosition());
+		} finally {
+			stateLock.readLock().unlock();
+		}
 	}
 
 	@Override
 	public CompletableFuture<List<Either<SymbolInformation, DocumentSymbol>>> documentSymbol(
 			DocumentSymbolParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
-		ProjectScope scope = findProjectScope(uri);
-		if (scope == null || scope.astVisitor == null) {
-			return CompletableFuture.completedFuture(Collections.emptyList());
-		}
-		recompileIfContextChanged(scope, uri);
+		ProjectScope scope = ensureCompiledForContext(uri);
 
-		DocumentSymbolProvider provider = new DocumentSymbolProvider(scope.astVisitor);
-		return provider.provideDocumentSymbols(params.getTextDocument());
+		stateLock.readLock().lock();
+		try {
+			if (scope == null || scope.astVisitor == null) {
+				return CompletableFuture.completedFuture(Collections.emptyList());
+			}
+
+			DocumentSymbolProvider provider = new DocumentSymbolProvider(scope.astVisitor);
+			return provider.provideDocumentSymbols(params.getTextDocument());
+		} finally {
+			stateLock.readLock().unlock();
+		}
 	}
 
 	@Override
 	public CompletableFuture<Either<List<? extends SymbolInformation>, List<? extends WorkspaceSymbol>>> symbol(
 			WorkspaceSymbolParams params) {
-		// Workspace symbols aggregate across all project scopes
-		List<SymbolInformation> allSymbols = new ArrayList<>();
-		for (ProjectScope scope : getAllScopes()) {
-			if (scope.astVisitor != null) {
-				WorkspaceSymbolProvider provider = new WorkspaceSymbolProvider(scope.astVisitor);
-				List<? extends SymbolInformation> symbols = provider.provideWorkspaceSymbols(params.getQuery()).join();
-				allSymbols.addAll(symbols);
+		stateLock.readLock().lock();
+		try {
+			// Workspace symbols aggregate across all project scopes
+			List<SymbolInformation> allSymbols = new ArrayList<>();
+			for (ProjectScope scope : getAllScopes()) {
+				if (scope.astVisitor != null) {
+					WorkspaceSymbolProvider provider = new WorkspaceSymbolProvider(scope.astVisitor);
+					List<? extends SymbolInformation> symbols = provider.provideWorkspaceSymbols(params.getQuery())
+							.join();
+					allSymbols.addAll(symbols);
+				}
 			}
+			return CompletableFuture.completedFuture(Either.forLeft(allSymbols));
+		} finally {
+			stateLock.readLock().unlock();
 		}
-		return CompletableFuture.completedFuture(Either.forLeft(allSymbols));
 	}
 
 	@Override
 	public CompletableFuture<Either3<Range, PrepareRenameResult, PrepareRenameDefaultBehavior>> prepareRename(
 			PrepareRenameParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
-		ProjectScope scope = findProjectScope(uri);
-		if (scope == null || scope.astVisitor == null) {
-			return CompletableFuture.completedFuture(null);
-		}
-		recompileIfContextChanged(scope, uri);
+		ProjectScope scope = ensureCompiledForContext(uri);
 
-		RenameProvider provider = new RenameProvider(scope.astVisitor, fileContentsTracker);
-		return provider.providePrepareRename(params);
+		stateLock.readLock().lock();
+		try {
+			if (scope == null || scope.astVisitor == null) {
+				return CompletableFuture.completedFuture(null);
+			}
+
+			RenameProvider provider = new RenameProvider(scope.astVisitor, fileContentsTracker);
+			return provider.providePrepareRename(params);
+		} finally {
+			stateLock.readLock().unlock();
+		}
 	}
 
 	@Override
 	public CompletableFuture<WorkspaceEdit> rename(RenameParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
-		ProjectScope scope = findProjectScope(uri);
-		if (scope == null || scope.astVisitor == null) {
-			return CompletableFuture.completedFuture(new WorkspaceEdit());
-		}
-		recompileIfContextChanged(scope, uri);
+		ProjectScope scope = ensureCompiledForContext(uri);
 
-		RenameProvider provider = new RenameProvider(scope.astVisitor, fileContentsTracker);
-		return provider.provideRename(params);
+		stateLock.readLock().lock();
+		try {
+			if (scope == null || scope.astVisitor == null) {
+				return CompletableFuture.completedFuture(new WorkspaceEdit());
+			}
+
+			RenameProvider provider = new RenameProvider(scope.astVisitor, fileContentsTracker);
+			return provider.provideRename(params);
+		} finally {
+			stateLock.readLock().unlock();
+		}
 	}
 
 	@Override
 	public CompletableFuture<List<Either<Command, CodeAction>>> codeAction(CodeActionParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
-		ProjectScope scope = findProjectScope(uri);
-		if (scope == null || scope.astVisitor == null) {
-			return CompletableFuture.completedFuture(Collections.emptyList());
+		ProjectScope scope = ensureCompiledForContext(uri);
+
+		stateLock.readLock().lock();
+		try {
+			if (scope == null || scope.astVisitor == null) {
+				return CompletableFuture.completedFuture(Collections.emptyList());
+			}
+
+			CodeActionProvider provider = new CodeActionProvider(scope.astVisitor, scope.classGraphScanResult,
+					fileContentsTracker);
+			CompletableFuture<List<Either<Command, CodeAction>>> result = provider.provideCodeActions(params);
+
+			// Add Spock-specific code actions
+			SpockCodeActionProvider spockProvider = new SpockCodeActionProvider(scope.astVisitor);
+			List<Either<Command, CodeAction>> spockActions = spockProvider.provideCodeActions(params);
+			if (!spockActions.isEmpty()) {
+				result = result.thenApply(actions -> {
+					List<Either<Command, CodeAction>> combined = new ArrayList<>(actions);
+					combined.addAll(spockActions);
+					return combined;
+				});
+			}
+
+			return result;
+		} finally {
+			stateLock.readLock().unlock();
 		}
-		recompileIfContextChanged(scope, uri);
-
-		CodeActionProvider provider = new CodeActionProvider(scope.astVisitor, scope.classGraphScanResult,
-				fileContentsTracker);
-		CompletableFuture<List<Either<Command, CodeAction>>> result = provider.provideCodeActions(params);
-
-		// Add Spock-specific code actions
-		SpockCodeActionProvider spockProvider = new SpockCodeActionProvider(scope.astVisitor);
-		List<Either<Command, CodeAction>> spockActions = spockProvider.provideCodeActions(params);
-		if (!spockActions.isEmpty()) {
-			result = result.thenApply(actions -> {
-				List<Either<Command, CodeAction>> combined = new ArrayList<>(actions);
-				combined.addAll(spockActions);
-				return combined;
-			});
-		}
-
-		return result;
 	}
 
 	@Override
 	public CompletableFuture<List<InlayHint>> inlayHint(InlayHintParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
-		ProjectScope scope = findProjectScope(uri);
-		if (scope == null || scope.astVisitor == null) {
-			return CompletableFuture.completedFuture(Collections.emptyList());
-		}
-		recompileIfContextChanged(scope, uri);
+		ProjectScope scope = ensureCompiledForContext(uri);
 
-		InlayHintProvider provider = new InlayHintProvider(scope.astVisitor);
-		return provider.provideInlayHints(params);
+		stateLock.readLock().lock();
+		try {
+			if (scope == null || scope.astVisitor == null) {
+				return CompletableFuture.completedFuture(Collections.emptyList());
+			}
+
+			InlayHintProvider provider = new InlayHintProvider(scope.astVisitor);
+			return provider.provideInlayHints(params);
+		} finally {
+			stateLock.readLock().unlock();
+		}
 	}
 
 	@Override
 	public CompletableFuture<SemanticTokens> semanticTokensFull(SemanticTokensParams params) {
-		if (!semanticHighlightingEnabled) {
-			return CompletableFuture.completedFuture(new SemanticTokens(Collections.emptyList()));
-		}
-		URI uri = URI.create(params.getTextDocument().getUri());
-		ProjectScope scope = findProjectScope(uri);
-		if (scope == null || scope.astVisitor == null) {
-			return CompletableFuture.completedFuture(new SemanticTokens(Collections.emptyList()));
-		}
-		recompileIfContextChanged(scope, uri);
+		stateLock.readLock().lock();
+		try {
+			if (!semanticHighlightingEnabled) {
+				return CompletableFuture.completedFuture(new SemanticTokens(Collections.emptyList()));
+			}
+			URI uri = URI.create(params.getTextDocument().getUri());
+			ProjectScope scope = findProjectScope(uri);
+			if (scope == null || scope.astVisitor == null) {
+				return CompletableFuture.completedFuture(new SemanticTokens(Collections.emptyList()));
+			}
 
-		SemanticTokensProvider provider = new SemanticTokensProvider(scope.astVisitor, fileContentsTracker);
-		return provider.provideSemanticTokensFull(params.getTextDocument());
+			SemanticTokensProvider provider = new SemanticTokensProvider(scope.astVisitor, fileContentsTracker);
+			return provider.provideSemanticTokensFull(params.getTextDocument());
+		} finally {
+			stateLock.readLock().unlock();
+		}
+	}
+
+	@Override
+	public CompletableFuture<CompletionItem> resolveCompletionItem(CompletionItem unresolved) {
+		stateLock.readLock().lock();
+		try {
+			if (unresolved.getDocumentation() != null) {
+				// Already resolved
+				return CompletableFuture.completedFuture(unresolved);
+			}
+			String label = unresolved.getLabel();
+			CompletionItemKind kind = unresolved.getKind();
+			if (label == null || kind == null) {
+				return CompletableFuture.completedFuture(unresolved);
+			}
+
+			// Search all scopes for matching AST node to retrieve documentation
+			for (ProjectScope scope : getAllScopes()) {
+				if (scope.astVisitor == null) {
+					continue;
+				}
+				String docs = resolveDocumentation(scope, label, kind);
+				if (docs != null) {
+					unresolved.setDocumentation(new MarkupContent(MarkupKind.MARKDOWN, docs));
+					break;
+				}
+			}
+			return CompletableFuture.completedFuture(unresolved);
+		} finally {
+			stateLock.readLock().unlock();
+		}
+	}
+
+	private String resolveDocumentation(ProjectScope scope, String label, CompletionItemKind kind) {
+		if (kind == CompletionItemKind.Method) {
+			for (org.codehaus.groovy.ast.ClassNode classNode : scope.astVisitor.getClassNodes()) {
+				for (org.codehaus.groovy.ast.MethodNode method : classNode.getMethods()) {
+					if (method.getName().equals(label)) {
+						String docs = com.tomaszrup.groovyls.compiler.util.GroovydocUtils
+								.groovydocToMarkdownDescription(method.getGroovydoc());
+						if (docs != null) {
+							return docs;
+						}
+					}
+				}
+			}
+		} else if (kind == CompletionItemKind.Property || kind == CompletionItemKind.Field) {
+			for (org.codehaus.groovy.ast.ClassNode classNode : scope.astVisitor.getClassNodes()) {
+				for (org.codehaus.groovy.ast.PropertyNode prop : classNode.getProperties()) {
+					if (prop.getName().equals(label)) {
+						String docs = com.tomaszrup.groovyls.compiler.util.GroovydocUtils
+								.groovydocToMarkdownDescription(prop.getGroovydoc());
+						if (docs != null) {
+							return docs;
+						}
+					}
+				}
+				for (org.codehaus.groovy.ast.FieldNode field : classNode.getFields()) {
+					if (field.getName().equals(label)) {
+						String docs = com.tomaszrup.groovyls.compiler.util.GroovydocUtils
+								.groovydocToMarkdownDescription(field.getGroovydoc());
+						if (docs != null) {
+							return docs;
+						}
+					}
+				}
+			}
+		} else if (kind == CompletionItemKind.Class || kind == CompletionItemKind.Interface
+				|| kind == CompletionItemKind.Enum) {
+			for (org.codehaus.groovy.ast.ClassNode classNode : scope.astVisitor.getClassNodes()) {
+				if (classNode.getNameWithoutPackage().equals(label) || classNode.getName().equals(label)) {
+					String docs = com.tomaszrup.groovyls.compiler.util.GroovydocUtils
+							.groovydocToMarkdownDescription(classNode.getGroovydoc());
+					if (docs != null) {
+						return docs;
+					}
+				}
+			}
+		}
+		return null;
 	}
 
 	@Override
 	public CompletableFuture<List<? extends TextEdit>> formatting(DocumentFormattingParams params) {
-		if (!formattingEnabled) {
-			return CompletableFuture.completedFuture(Collections.emptyList());
+		stateLock.readLock().lock();
+		try {
+			if (!formattingEnabled) {
+				return CompletableFuture.completedFuture(Collections.emptyList());
+			}
+			URI uri = URI.create(params.getTextDocument().getUri());
+			String sourceText = fileContentsTracker.getContents(uri);
+			FormattingProvider provider = new FormattingProvider();
+			return provider.provideFormatting(params, sourceText);
+		} finally {
+			stateLock.readLock().unlock();
 		}
-		URI uri = URI.create(params.getTextDocument().getUri());
-		String sourceText = fileContentsTracker.getContents(uri);
-		FormattingProvider provider = new FormattingProvider();
-		return provider.provideFormatting(params, sourceText);
 	}
 
 	// --- INTERNAL
@@ -783,7 +1018,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 					Files.walk(targetDirectory.toPath()).sorted(Comparator.reverseOrder()).map(Path::toFile)
 							.forEach(File::delete);
 				} catch (IOException e) {
-					System.err.println("Failed to delete target directory: " + targetDirectory.getAbsolutePath());
+					logger.error("Failed to delete target directory: {}", targetDirectory.getAbsolutePath(), e);
 					scope.compilationUnit = null;
 					return false;
 				}
@@ -796,7 +1031,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		if (scope.compilationUnit != null) {
 			File targetDirectory = scope.compilationUnit.getConfiguration().getTargetDirectory();
 			if (targetDirectory != null && !targetDirectory.exists() && !targetDirectory.mkdirs()) {
-				System.err.println("Failed to create target directory: " + targetDirectory.getAbsolutePath());
+				logger.error("Failed to create target directory: {}", targetDirectory.getAbsolutePath());
 			}
 			GroovyClassLoader newClassLoader = scope.compilationUnit.getClassLoader();
 			if (!newClassLoader.equals(scope.classLoader)) {
@@ -816,6 +1051,44 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		}
 
 		return scope.compilationUnit != null && scope.compilationUnit.equals(oldCompilationUnit);
+	}
+
+	/**
+	 * Ensures the project scope that owns {@code uri} has an up-to-date
+	 * compilation for that context.  A brief <em>read-lock</em> check is
+	 * performed first; the write-lock is only acquired when the context has
+	 * actually changed and a recompilation is needed.
+	 *
+	 * <p><b>Important:</b> the caller must <em>not</em> hold any lock when
+	 * calling this method.</p>
+	 *
+	 * @return the {@link ProjectScope} that owns the URI, or {@code null}
+	 */
+	private ProjectScope ensureCompiledForContext(URI uri) {
+		stateLock.readLock().lock();
+		ProjectScope scope;
+		boolean needsRecompile;
+		try {
+			scope = findProjectScope(uri);
+			if (scope == null || scope.astVisitor == null) {
+				return scope;
+			}
+			needsRecompile = scope.previousContext != null && !scope.previousContext.equals(uri);
+		} finally {
+			stateLock.readLock().unlock();
+		}
+
+		if (needsRecompile) {
+			stateLock.writeLock().lock();
+			try {
+				// Double-check: another thread may have already recompiled
+				recompileIfContextChanged(scope, uri);
+			} finally {
+				stateLock.writeLock().unlock();
+			}
+		}
+
+		return scope;
 	}
 
 	protected void recompileIfContextChanged(ProjectScope scope, URI newContext) {

@@ -291,12 +291,12 @@
     "operators": {
       "patterns": [
         {
-          "name": "keyword.operator.assignment.groovy",
-          "match": "\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=|<<=|>>=|>>>=|\\*\\*=|\\?=|="
-        },
-        {
           "name": "keyword.operator.comparison.groovy",
           "match": "<=>|==~|===|!==|==|!=|<=|>=|<|>"
+        },
+        {
+          "name": "keyword.operator.assignment.groovy",
+          "match": "\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=|<<=|>>=|>>>=|\\*\\*=|\\?=|(?<![=!<>])=(?!=)"
         },
         {
           "name": "keyword.operator.logical.groovy",

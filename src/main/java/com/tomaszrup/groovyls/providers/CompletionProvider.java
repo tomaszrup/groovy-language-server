@@ -37,6 +37,7 @@ import org.codehaus.groovy.ast.FieldNode;
 import org.codehaus.groovy.ast.ImportNode;
 import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.ModuleNode;
+import org.codehaus.groovy.ast.Parameter;
 import org.codehaus.groovy.ast.PropertyNode;
 import org.codehaus.groovy.ast.VariableScope;
 import org.codehaus.groovy.ast.expr.ConstructorCallExpression;
@@ -49,7 +50,9 @@ import org.codehaus.groovy.ast.stmt.Statement;
 import org.eclipse.lsp4j.CompletionContext;
 import org.eclipse.lsp4j.CompletionItem;
 import org.eclipse.lsp4j.CompletionItemKind;
+import org.eclipse.lsp4j.CompletionItemLabelDetails;
 import org.eclipse.lsp4j.CompletionList;
+import org.eclipse.lsp4j.InsertTextFormat;
 import org.eclipse.lsp4j.MarkupContent;
 import org.eclipse.lsp4j.MarkupKind;
 import org.eclipse.lsp4j.Position;
@@ -65,6 +68,7 @@ import com.tomaszrup.groovyls.compiler.ast.ASTNodeVisitor;
 import com.tomaszrup.groovyls.compiler.util.GroovyASTUtils;
 import com.tomaszrup.groovyls.compiler.util.GroovydocUtils;
 import com.tomaszrup.groovyls.util.GroovyLanguageServerUtils;
+import com.tomaszrup.groovyls.util.GroovyNodeToStringUtils;
 
 public class CompletionProvider {
 	private ASTNodeVisitor ast;
@@ -182,10 +186,7 @@ public class CompletionProvider {
 			if (classNode.getNameWithoutPackage().startsWith(importText)) {
 				item.setSortText(classNode.getNameWithoutPackage());
 			}
-			String markdownDocs = GroovydocUtils.groovydocToMarkdownDescription(classNode.getGroovydoc());
-			if (markdownDocs != null) {
-				item.setDocumentation(new MarkupContent(MarkupKind.MARKDOWN, markdownDocs));
-			}
+			// Documentation deferred to completionItem/resolve
 			return item;
 		}).collect(Collectors.toList());
 		items.addAll(localClassItems);
@@ -290,10 +291,7 @@ public class CompletionProvider {
 			CompletionItem item = new CompletionItem();
 			item.setLabel(property.getName());
 			item.setKind(GroovyLanguageServerUtils.astNodeToCompletionItemKind(property));
-			String markdownDocs = GroovydocUtils.groovydocToMarkdownDescription(property.getGroovydoc());
-			if (markdownDocs != null) {
-				item.setDocumentation(new MarkupContent(MarkupKind.MARKDOWN, markdownDocs));
-			}
+			// Documentation deferred to completionItem/resolve
 			return item;
 		}).collect(Collectors.toList());
 		items.addAll(propItems);
@@ -309,10 +307,7 @@ public class CompletionProvider {
 			CompletionItem item = new CompletionItem();
 			item.setLabel(field.getName());
 			item.setKind(GroovyLanguageServerUtils.astNodeToCompletionItemKind(field));
-			String markdownDocs = GroovydocUtils.groovydocToMarkdownDescription(field.getGroovydoc());
-			if (markdownDocs != null) {
-				item.setDocumentation(new MarkupContent(MarkupKind.MARKDOWN, markdownDocs));
-			}
+			// Documentation deferred to completionItem/resolve
 			return item;
 		}).collect(Collectors.toList());
 		items.addAll(fieldItems);
@@ -332,10 +327,15 @@ public class CompletionProvider {
 			CompletionItem item = new CompletionItem();
 			item.setLabel(method.getName());
 			item.setKind(GroovyLanguageServerUtils.astNodeToCompletionItemKind(method));
-			String markdownDocs = GroovydocUtils.groovydocToMarkdownDescription(method.getGroovydoc());
-			if (markdownDocs != null) {
-				item.setDocumentation(new MarkupContent(MarkupKind.MARKDOWN, markdownDocs));
-			}
+			item.setInsertText(buildMethodSnippet(method));
+			item.setInsertTextFormat(InsertTextFormat.Snippet);
+			item.setFilterText(method.getName());
+			CompletionItemLabelDetails labelDetails = new CompletionItemLabelDetails();
+			labelDetails.setDetail(buildMethodParamsLabel(method));
+			labelDetails.setDescription(method.getReturnType().getNameWithoutPackage());
+			item.setLabelDetails(labelDetails);
+			item.setDetail(method.getReturnType().getNameWithoutPackage());
+			item.setDocumentation(buildMethodDocumentation(method));
 			return item;
 		}).collect(Collectors.toList());
 		items.addAll(methodItems);
@@ -367,13 +367,7 @@ public class CompletionProvider {
 			CompletionItem item = new CompletionItem();
 			item.setLabel(variable.getName());
 			item.setKind(GroovyLanguageServerUtils.astNodeToCompletionItemKind((ASTNode) variable));
-			if (variable instanceof AnnotatedNode) {
-				AnnotatedNode annotatedVar = (AnnotatedNode) variable;
-				String markdownDocs = GroovydocUtils.groovydocToMarkdownDescription(annotatedVar.getGroovydoc());
-				if (markdownDocs != null) {
-					item.setDocumentation(new MarkupContent(MarkupKind.MARKDOWN, markdownDocs));
-				}
-			}
+			// Documentation deferred to completionItem/resolve
 			return item;
 		}).collect(Collectors.toList());
 		items.addAll(variableItems);
@@ -439,10 +433,7 @@ public class CompletionProvider {
 			item.setLabel(classNode.getNameWithoutPackage());
 			item.setKind(GroovyLanguageServerUtils.astNodeToCompletionItemKind(classNode));
 			item.setDetail(packageName);
-			String markdownDocs = GroovydocUtils.groovydocToMarkdownDescription(classNode.getGroovydoc());
-			if (markdownDocs != null) {
-				item.setDocumentation(new MarkupContent(MarkupKind.MARKDOWN, markdownDocs));
-			}
+			// Documentation deferred to completionItem/resolve
 			if (packageName != null && !packageName.equals(enclosingPackageName) && !importNames.contains(className)) {
 				List<TextEdit> additionalTextEdits = new ArrayList<>();
 				TextEdit addImportEdit = createAddImportTextEdit(className, addImportRange);
@@ -510,6 +501,64 @@ public class CompletionProvider {
 			return CompletionItemKind.Enum;
 		}
 		return CompletionItemKind.Class;
+	}
+
+	private String buildMethodSnippet(MethodNode method) {
+		StringBuilder builder = new StringBuilder();
+		builder.append(method.getName());
+		builder.append("(");
+		Parameter[] params = method.getParameters();
+		for (int i = 0; i < params.length; i++) {
+			if (i > 0) {
+				builder.append(", ");
+			}
+			builder.append("${");
+			builder.append(i + 1);
+			builder.append(":");
+			builder.append(escapeSnippetText(params[i].getName()));
+			builder.append("}");
+		}
+		builder.append(")");
+		return builder.toString();
+	}
+
+	private String buildMethodParamsLabel(MethodNode method) {
+		StringBuilder builder = new StringBuilder();
+		builder.append("(");
+		Parameter[] params = method.getParameters();
+		for (int i = 0; i < params.length; i++) {
+			if (i > 0) {
+				builder.append(", ");
+			}
+			builder.append(params[i].getType().getNameWithoutPackage());
+			builder.append(" ");
+			builder.append(params[i].getName());
+		}
+		builder.append(")");
+		return builder.toString();
+	}
+
+	private String escapeSnippetText(String text) {
+		return text.replace("\\", "\\\\").replace("$", "\\$").replace("}", "\\}");
+	}
+
+	private MarkupContent buildMethodDocumentation(MethodNode method) {
+		StringBuilder builder = new StringBuilder();
+		builder.append("```groovy\n");
+		builder.append(GroovyNodeToStringUtils.methodToString(method, ast));
+		builder.append("\n```");
+		ClassNode declaringClass = method.getDeclaringClass();
+		if (declaringClass != null) {
+			builder.append("\n*");
+			builder.append(declaringClass.getName());
+			builder.append("*");
+		}
+		String groovydoc = GroovydocUtils.groovydocToMarkdownDescription(method.getGroovydoc());
+		if (groovydoc != null) {
+			builder.append("\n\n---\n\n");
+			builder.append(groovydoc);
+		}
+		return new MarkupContent(MarkupKind.MARKDOWN, builder.toString());
 	}
 
 	private TextEdit createAddImportTextEdit(String className, Range range) {

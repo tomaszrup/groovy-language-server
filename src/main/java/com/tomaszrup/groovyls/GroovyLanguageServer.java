@@ -148,7 +148,11 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
 
                 for (ProjectImporter importer : importers) {
                     try {
+                        logProgress("Discovering " + importer.getName() + " projects...");
                         List<Path> projects = importer.discoverProjects(folderPath);
+                        if (!projects.isEmpty()) {
+                            logProgress("Found " + projects.size() + " " + importer.getName() + " project(s)");
+                        }
                         for (Path projectRoot : projects) {
                             // Skip if this directory was already claimed by a
                             // higher-priority importer (e.g. Gradle before Maven)
@@ -158,13 +162,9 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                                 continue;
                             }
 
-                            if (client != null) {
-                                client.showMessage(new MessageParams(
-                                        MessageType.Info,
-                                        "Importing " + importer.getName() + " project: " + projectRoot
-                                ));
-                            }
+                            logProgress("Importing " + importer.getName() + " project: " + projectRoot.getFileName());
                             List<String> classpathList = importer.importProject(projectRoot);
+                            logProgress("Resolved " + classpathList.size() + " classpath entries for " + projectRoot.getFileName());
                             projectClasspaths.put(projectRoot, classpathList);
                             projectImporterMap.put(projectRoot, importer);
                             claimedRoots.add(projectRoot);
@@ -177,17 +177,18 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             }
 
             if (!projectClasspaths.isEmpty()) {
+                logProgress("Compiling " + projectClasspaths.size() + " project(s)...");
                 groovyServices.addProjects(projectClasspaths);
+                logProgress("Project import complete");
             }
         }
 
-        CompletionOptions completionOptions = new CompletionOptions(false, Arrays.asList("."));
+        CompletionOptions completionOptions = new CompletionOptions(true, Arrays.asList("."));
         ServerCapabilities serverCapabilities = new ServerCapabilities();
         serverCapabilities.setCompletionProvider(completionOptions);
-        serverCapabilities.setTextDocumentSync(TextDocumentSyncKind.Full);
+        serverCapabilities.setTextDocumentSync(TextDocumentSyncKind.Incremental);
         serverCapabilities.setDocumentSymbolProvider(true);
         serverCapabilities.setWorkspaceSymbolProvider(true);
-        serverCapabilities.setDocumentSymbolProvider(true);
         serverCapabilities.setReferencesProvider(true);
         serverCapabilities.setDefinitionProvider(true);
         serverCapabilities.setTypeDefinitionProvider(true);
@@ -243,5 +244,13 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     public void connect(LanguageClient client) {
         this.client = client;
         groovyServices.connect(client);
+    }
+
+    /** Send a progress log message to the client (visible in output channel). */
+    private void logProgress(String message) {
+        logger.info(message);
+        if (client != null) {
+            client.logMessage(new MessageParams(MessageType.Info, message));
+        }
     }
 }

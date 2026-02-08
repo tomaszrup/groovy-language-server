@@ -41,8 +41,11 @@ import com.tomaszrup.groovyls.compiler.util.GroovyASTUtils;
 import com.tomaszrup.groovyls.compiler.util.GroovydocUtils;
 import com.tomaszrup.groovyls.util.GroovyNodeToStringUtils;
 import com.tomaszrup.groovyls.util.SpockUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class HoverProvider {
+	private static final Logger logger = LoggerFactory.getLogger(HoverProvider.class);
 	private ASTNodeVisitor ast;
 
 	public HoverProvider(ASTNodeVisitor ast) {
@@ -178,7 +181,7 @@ public class HoverProvider {
 			Variable varNode = (Variable) hoverNode;
 			return GroovyNodeToStringUtils.variableToString(varNode, ast);
 		} else {
-			System.err.println("*** hover not available for node: " + hoverNode);
+			logger.debug("Hover not available for node: {}", hoverNode);
 		}
 		return null;
 	}
