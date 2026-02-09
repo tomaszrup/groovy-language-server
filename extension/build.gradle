@@ -15,7 +15,13 @@ task copyLocal(type: Copy) {
     from "$projectDir/package.json"
     from "$projectDir/LICENSE"
     from "$projectDir/README.md"
+    from "$projectDir/language-configuration.json"
     into "$buildDir"
+}
+
+task copySyntaxes(type: Copy) {
+    from "$projectDir/syntaxes"
+    into "$buildDir/syntaxes"
 }
 
 task webpack(type: Exec) {
@@ -47,6 +53,7 @@ task vsce(type: Exec) {
 tasks.webpack.dependsOn tasks.npmInstall
 tasks.vsce.dependsOn tasks.copyJar
 tasks.vsce.dependsOn tasks.copyLocal
+tasks.vsce.dependsOn tasks.copySyntaxes
 tasks.vsce.dependsOn tasks.webpack
 tasks.build.dependsOn tasks.vsce
 

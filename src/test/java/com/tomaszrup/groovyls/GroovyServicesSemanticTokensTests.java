@@ -326,6 +326,40 @@ class GroovyServicesSemanticTokensTests {
 	}
 
 	@Test
+	void testSemanticTokensExtendsImplementsKeywords() throws Exception {
+		Path filePath = srcRoot.resolve("SemanticExtendsImpl.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("interface MyIface {}\n");
+		contents.append("class Base {}\n");
+		contents.append("class Child extends Base implements MyIface {\n");
+		contents.append("}");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+
+		SemanticTokens result = services.semanticTokensFull(new SemanticTokensParams(textDocument)).get();
+		List<Integer> data = result.getData();
+		Assertions.assertFalse(data.isEmpty());
+
+		int keywordTypeIndex = SemanticTokensProvider.TOKEN_TYPES.indexOf("keyword");
+		boolean foundExtends = false;
+		boolean foundImplements = false;
+		for (int i = 0; i + 4 < data.size(); i += 5) {
+			int tokenType = data.get(i + 3);
+			int length = data.get(i + 2);
+			if (tokenType == keywordTypeIndex && length == "extends".length()) {
+				foundExtends = true;
+			}
+			if (tokenType == keywordTypeIndex && length == "implements".length()) {
+				foundImplements = true;
+			}
+		}
+		Assertions.assertTrue(foundExtends, "Should find a keyword token for 'extends'");
+		Assertions.assertTrue(foundImplements, "Should find a keyword token for 'implements'");
+	}
+
+	@Test
 	void testSemanticTokensDataMultipleOfFive() throws Exception {
 		Path filePath = srcRoot.resolve("SemanticMulti.groovy");
 		String uri = filePath.toUri().toString();

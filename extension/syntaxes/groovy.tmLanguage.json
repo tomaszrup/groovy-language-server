@@ -229,7 +229,11 @@
         },
         {
           "name": "keyword.other.groovy",
-          "match": "\\b(def|var|it|this|super|with|implements|extends)\\b"
+          "match": "\\b(def|var|it|this|super|with)\\b"
+        },
+        {
+          "name": "storage.type.groovy",
+          "match": "\\b(implements|extends)\\b"
         }
       ]
     },

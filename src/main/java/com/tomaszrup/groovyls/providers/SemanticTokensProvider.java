@@ -73,7 +73,8 @@ public class SemanticTokensProvider {
 			"function",    // 8
 			"method",      // 9
 			"decorator",   // 10
-			"enumMember"   // 11
+			"enumMember",  // 11
+			"keyword"      // 12
 	));
 
 	// Token modifiers — bit flags
@@ -98,6 +99,7 @@ public class SemanticTokensProvider {
 	private static final int TYPE_METHOD = 9;
 	private static final int TYPE_DECORATOR = 10;
 	private static final int TYPE_ENUM_MEMBER = 11;
+	private static final int TYPE_KEYWORD = 12;
 
 	private static final int MOD_DECLARATION = 1;       // bit 0
 	private static final int MOD_STATIC = 1 << 1;       // bit 1
@@ -227,11 +229,96 @@ public class SemanticTokensProvider {
 		// In Groovy 4, ClassNode.getColumnNumber() points to the 'class'/'interface'/'enum'
 		// keyword, not the class name. Find the actual name in the source.
 		int nameCol = findNameColumn(line, column, name);
+
+		// Emit a keyword token for the declaration keyword (class/interface/enum/trait/record)
+		// so it gets highlighted even when semantic tokens override TextMate scoping.
+		if (isClassDeclaration(node) && nameCol > 0 && nameCol > column) {
+			// The keyword spans from the original column to just before the name
+			String sourceLine = (sourceLines != null && line > 0 && line <= sourceLines.length)
+					? sourceLines[line - 1] : null;
+			if (sourceLine != null) {
+				// Extract the keyword text (trim whitespace between keyword and name)
+				int kwStart = column - 1; // 0-based
+				int kwEnd = nameCol - 1;  // 0-based, start of name
+				String between = sourceLine.substring(kwStart, Math.min(kwEnd, sourceLine.length()));
+				String keyword = between.trim();
+				if (!keyword.isEmpty()) {
+					addToken(tokens, line, column, keyword.length(), TYPE_KEYWORD, 0);
+				}
+			}
+		}
+
 		if (nameCol > 0) {
 			column = nameCol;
 		}
 
 		addToken(tokens, line, column, name.length(), tokenType, modifiers);
+
+		// Emit keyword tokens for 'extends' and 'implements' in class declarations
+		// so they match the 'class'/'trait' keyword coloring.
+		if (isClassDeclaration(node)) {
+			addExtendsImplementsKeywords(node, tokens);
+		}
+	}
+
+	/**
+	 * Emits TYPE_KEYWORD semantic tokens for the {@code extends} and
+	 * {@code implements} keywords that appear in a class/trait/interface
+	 * declaration, so they are colored consistently with the declaration keyword.
+	 */
+	private void addExtendsImplementsKeywords(ClassNode node, List<SemanticToken> tokens) {
+		if (sourceLines == null) {
+			return;
+		}
+
+		// Find 'extends' keyword before the superclass name
+		ClassNode superClass = node.getUnresolvedSuperClass();
+		if (superClass != null && superClass.getLineNumber() > 0 && superClass.getColumnNumber() > 0) {
+			addKeywordTokenBefore(superClass.getLineNumber(), superClass.getColumnNumber(), "extends", tokens);
+		}
+
+		// Find 'implements' keyword before the first interface name
+		ClassNode[] interfaces = node.getUnresolvedInterfaces();
+		if (interfaces != null && interfaces.length > 0) {
+			ClassNode firstInterface = null;
+			for (ClassNode iface : interfaces) {
+				if (iface.getLineNumber() > 0 && iface.getColumnNumber() > 0) {
+					if (firstInterface == null
+							|| iface.getLineNumber() < firstInterface.getLineNumber()
+							|| (iface.getLineNumber() == firstInterface.getLineNumber()
+									&& iface.getColumnNumber() < firstInterface.getColumnNumber())) {
+						firstInterface = iface;
+					}
+				}
+			}
+			if (firstInterface != null) {
+				addKeywordTokenBefore(firstInterface.getLineNumber(), firstInterface.getColumnNumber(),
+						"implements", tokens);
+			}
+		}
+	}
+
+	/**
+	 * Searches backward on the given line for a whole-word occurrence of
+	 * {@code keyword} before the specified column, and emits a TYPE_KEYWORD
+	 * semantic token if found.
+	 */
+	private void addKeywordTokenBefore(int groovyLine, int beforeColumn, String keyword,
+			List<SemanticToken> tokens) {
+		if (sourceLines == null || groovyLine <= 0 || groovyLine > sourceLines.length) {
+			return;
+		}
+		String line = sourceLines[groovyLine - 1];
+		int searchEnd = beforeColumn > 0 ? beforeColumn - 1 : line.length(); // 0-based
+		int idx = line.lastIndexOf(keyword, searchEnd - 1);
+		if (idx >= 0) {
+			boolean startOk = idx == 0 || !Character.isJavaIdentifierPart(line.charAt(idx - 1));
+			boolean endOk = (idx + keyword.length() >= line.length())
+					|| !Character.isJavaIdentifierPart(line.charAt(idx + keyword.length()));
+			if (startOk && endOk) {
+				addToken(tokens, groovyLine, idx + 1, keyword.length(), TYPE_KEYWORD, 0);
+			}
+		}
 	}
 
 	private void addMethodNodeToken(MethodNode node, List<SemanticToken> tokens) {
