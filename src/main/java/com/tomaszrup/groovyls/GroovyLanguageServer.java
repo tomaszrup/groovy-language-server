@@ -20,6 +20,7 @@
 ////////////////////////////////////////////////////////////////////////////////
 package com.tomaszrup.groovyls;
 
+import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.tomaszrup.groovyls.compiler.SharedClassGraphCache;
@@ -28,6 +29,7 @@ import com.tomaszrup.groovyls.config.CompilationUnitFactory;
 import com.tomaszrup.groovyls.config.ICompilationUnitFactory;
 import com.tomaszrup.groovyls.importers.GradleProjectImporter;
 import com.tomaszrup.groovyls.importers.MavenProjectImporter;
+import com.tomaszrup.groovyls.importers.ProjectDiscovery;
 import com.tomaszrup.groovyls.importers.ProjectImporter;
 import org.eclipse.lsp4j.*;
 import org.eclipse.lsp4j.jsonrpc.Launcher;
@@ -114,6 +116,12 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     private volatile Future<?> importFuture;
     /** Whether the on-disk classpath cache is enabled (default: true). */
     private volatile boolean classpathCacheEnabled = true;
+    /**
+     * Set of enabled importer names (e.g. "Gradle", "Maven"). When empty
+     * all importers are enabled.  Populated from the {@code groovy.project.importers}
+     * VS Code setting via {@code initializationOptions}.
+     */
+    private volatile Set<String> enabledImporters = Collections.emptySet();
 
     public GroovyLanguageServer() {
         this(new CompilationUnitFactory());
@@ -167,16 +175,16 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     /**
      * Called when Java or build-tool files change in a registered project.
      * Delegates to the appropriate build-tool importer for recompilation.
+     *
+     * <p>The classpath cache is <b>not</b> invalidated here.  Cache validity
+     * is checked on next startup via build-file stamps, and clearing it
+     * mid-session would only cause unnecessary full re-resolution on restart
+     * even when the classpath hasn't actually changed.</p>
      */
     private void recompileProject(Path projectRoot) {
         ProjectImporter importer = projectImporterMap.get(projectRoot);
         if (importer != null) {
             logger.info("Recompiling {} project: {}", importer.getName(), projectRoot);
-            // Invalidate classpath cache — build files may have changed
-            Path workspaceRoot = groovyServices.getWorkspaceRoot();
-            if (classpathCacheEnabled && workspaceRoot != null) {
-                ClasspathCache.invalidate(workspaceRoot);
-            }
             importer.recompile(projectRoot);
         } else {
             logger.warn("No importer found for project root: {}", projectRoot);
@@ -199,6 +207,31 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             if (opts.has("classpathCache") && !opts.get("classpathCache").getAsBoolean()) {
                 classpathCacheEnabled = false;
                 logger.info("Classpath caching disabled via initializationOptions");
+            }
+            // Parse enabled importers list (e.g. ["Gradle", "Maven"])
+            if (opts.has("enabledImporters") && opts.get("enabledImporters").isJsonArray()) {
+                JsonArray arr = opts.getAsJsonArray("enabledImporters");
+                Set<String> enabled = new LinkedHashSet<>();
+                for (JsonElement el : arr) {
+                    if (el.isJsonPrimitive()) {
+                        enabled.add(el.getAsString());
+                    }
+                }
+                if (!enabled.isEmpty()) {
+                    enabledImporters = Collections.unmodifiableSet(enabled);
+                    logger.info("Enabled importers: {}", enabledImporters);
+                }
+            }
+        }
+
+        // Set workspace bound on the Gradle importer so findGradleRoot()
+        // stops at the workspace root instead of walking to the filesystem root.
+        if (rootUriString != null) {
+            Path wsRoot = Paths.get(URI.create(rootUriString));
+            for (ProjectImporter importer : importers) {
+                if (importer instanceof GradleProjectImporter) {
+                    ((GradleProjectImporter) importer).setWorkspaceBound(wsRoot);
+                }
             }
         }
 
@@ -274,48 +307,170 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
      * </ol>
      */
     private void importProjectsAsync(List<WorkspaceFolder> folders) {
+        long totalStart = System.currentTimeMillis();
         try {
             Map<Path, List<String>> projectClasspaths = new ConcurrentHashMap<>();
             Map<Path, ProjectImporter> importerMapLocal = new ConcurrentHashMap<>();
             Set<Path> claimedRoots = Collections.synchronizedSet(new LinkedHashSet<>());
 
-            // Phase 1: Discover all projects (fast, sequential per-folder)
-            // Map: importer → list of discovered project roots
-            Map<ProjectImporter, List<Path>> discoveredByImporter = new LinkedHashMap<>();
-            for (WorkspaceFolder folder : folders) {
-                if (Thread.currentThread().isInterrupted()) {
-                    logProgress("Project import cancelled");
-                    return;
-                }
-                Path folderPath = Paths.get(URI.create(folder.getUri()));
+            // ── Phase 0: Try cache-first ──────────────────────────────────
+            // Load the on-disk cache ONCE.  This single load is used for
+            // all subsequent cache-validity checks (Phases 0, 1b).
+            Path workspaceRoot = groovyServices.getWorkspaceRoot();
+            boolean cacheHit = false;
+            List<Path> cachedDiscoveredRoots = null;
+            ClasspathCache.CacheData cachedData = null;
 
-                for (ProjectImporter importer : importers) {
-                    try {
-                        logProgress("Discovering " + importer.getName() + " projects...");
-                        List<Path> projects = importer.discoverProjects(folderPath);
-                        if (!projects.isEmpty()) {
-                            logProgress("Found " + projects.size() + " " + importer.getName() + " project(s)");
-                            // Filter out roots already claimed by a higher-priority importer
-                            List<Path> unclaimed = new ArrayList<>();
-                            for (Path p : projects) {
-                                if (claimedRoots.add(p)) {
-                                    unclaimed.add(p);
-                                } else {
-                                    logger.info("Skipping {} project at {} — already claimed by another importer",
-                                            importer.getName(), p);
-                                }
-                            }
-                            if (!unclaimed.isEmpty()) {
-                                discoveredByImporter
-                                        .computeIfAbsent(importer, k -> new ArrayList<>())
-                                        .addAll(unclaimed);
-                            }
+            if (classpathCacheEnabled && workspaceRoot != null) {
+                long cacheStart = System.currentTimeMillis();
+                Optional<ClasspathCache.CacheData> cached = ClasspathCache.load(workspaceRoot);
+                if (cached.isPresent()) {
+                    cachedData = cached.get();
+                    // We need project roots to validate stamps.  If the cache
+                    // contains a discovered-projects list we can use that;
+                    // otherwise we must fall through to discovery.
+                    Optional<List<Path>> cachedRoots = ClasspathCache.toDiscoveredProjectsList(cachedData);
+                    if (cachedRoots.isPresent()) {
+                        Map<String, String> currentStamps =
+                                ClasspathCache.computeBuildFileStamps(cachedRoots.get());
+                        if (ClasspathCache.isValid(cachedData, currentStamps)) {
+                            cachedDiscoveredRoots = cachedRoots.get();
+                            Map<Path, List<String>> cachedClasspaths =
+                                    ClasspathCache.toClasspathMap(cachedData);
+                            projectClasspaths.putAll(cachedClasspaths);
+                            cacheHit = true;
+
+                            long cacheElapsed = System.currentTimeMillis() - cacheStart;
+                            logProgress("Using cached classpath ("
+                                    + cachedDiscoveredRoots.size() + " projects, "
+                                    + cacheElapsed + "ms)");
+                        } else {
+                            logger.info("Classpath cache stamp mismatch — will re-discover and resolve");
                         }
-                    } catch (IOException e) {
-                        logger.error("Error discovering {} projects in {}: {}",
-                                importer.getName(), folderPath, e.getMessage(), e);
+                    } else {
+                        logger.info("Classpath cache has no discovered-projects list — will discover");
                     }
                 }
+            }
+
+            // ── Phase 1: Discover projects ────────────────────────────────
+            // Map: importer → list of discovered project roots
+            Map<ProjectImporter, List<Path>> discoveredByImporter = new LinkedHashMap<>();
+            List<Path> allDiscoveredRoots;
+
+            if (cacheHit && cachedDiscoveredRoots != null) {
+                // Use the cached project list — skip Files.walk() entirely.
+                allDiscoveredRoots = cachedDiscoveredRoots;
+                logProgress("Using cached project list (" + allDiscoveredRoots.size() + " projects)");
+
+                // We still need to populate importerMapLocal so that
+                // recompileProject() can look up the right importer.
+                // Assign all cached roots to the first importer that would
+                // claim them (Gradle first, then Maven).
+                for (Path root : allDiscoveredRoots) {
+                    for (ProjectImporter importer : importers) {
+                        // Check if a build file for this importer exists
+                        if (importer instanceof GradleProjectImporter
+                                && (root.resolve("build.gradle").toFile().exists()
+                                    || root.resolve("build.gradle.kts").toFile().exists())) {
+                            importerMapLocal.put(root, importer);
+                            discoveredByImporter
+                                    .computeIfAbsent(importer, k -> new ArrayList<>())
+                                    .add(root);
+                            break;
+                        } else if (importer instanceof MavenProjectImporter
+                                && root.resolve("pom.xml").toFile().exists()) {
+                            importerMapLocal.put(root, importer);
+                            discoveredByImporter
+                                    .computeIfAbsent(importer, k -> new ArrayList<>())
+                                    .add(root);
+                            break;
+                        }
+                    }
+                }
+            } else {
+                // No usable cache — discover from scratch using a SINGLE
+                // unified filesystem walk that finds both Gradle and Maven
+                // projects with directory pruning (skips .git, node_modules,
+                // build, target, etc.)
+                long discoveryStart = System.currentTimeMillis();
+                logProgress("Discovering projects...");
+
+                // Determine which importer names are enabled
+                Set<String> enabledNames = enabledImporters;
+
+                List<Path> gradleRoots = new ArrayList<>();
+                List<Path> mavenRoots = new ArrayList<>();
+
+                for (WorkspaceFolder folder : folders) {
+                    if (Thread.currentThread().isInterrupted()) {
+                        logProgress("Project import cancelled");
+                        return;
+                    }
+                    Path folderPath = Paths.get(URI.create(folder.getUri()));
+
+                    try {
+                        ProjectDiscovery.DiscoveryResult result =
+                                ProjectDiscovery.discoverAll(folderPath, enabledNames);
+                        gradleRoots.addAll(result.gradleProjects);
+                        mavenRoots.addAll(result.mavenProjects);
+                    } catch (IOException e) {
+                        logger.error("Error discovering projects in {}: {}",
+                                folderPath, e.getMessage(), e);
+                    }
+                }
+
+                // Map discovered roots to their importers, respecting priority
+                // (Gradle first — if a dir has both build.gradle and pom.xml, Gradle wins)
+                ProjectImporter gradleImporter = null;
+                ProjectImporter mavenImporter = null;
+                for (ProjectImporter importer : importers) {
+                    if (importer instanceof GradleProjectImporter) gradleImporter = importer;
+                    if (importer instanceof MavenProjectImporter) mavenImporter = importer;
+                }
+
+                if (gradleImporter != null) {
+                    for (Path p : gradleRoots) {
+                        if (claimedRoots.add(p)) {
+                            discoveredByImporter
+                                    .computeIfAbsent(gradleImporter, k -> new ArrayList<>())
+                                    .add(p);
+                        }
+                    }
+                    if (!gradleRoots.isEmpty()) {
+                        logProgress("Found " + gradleRoots.size() + " Gradle project(s)");
+                    } else {
+                        logProgress("No Gradle projects found");
+                    }
+                }
+
+                if (mavenImporter != null) {
+                    List<Path> unclaimed = new ArrayList<>();
+                    for (Path p : mavenRoots) {
+                        if (claimedRoots.add(p)) {
+                            unclaimed.add(p);
+                            discoveredByImporter
+                                    .computeIfAbsent(mavenImporter, k -> new ArrayList<>())
+                                    .add(p);
+                        }
+                    }
+                    if (!mavenRoots.isEmpty()) {
+                        logProgress("Found " + unclaimed.size() + " Maven project(s)"
+                                + (unclaimed.size() < mavenRoots.size()
+                                        ? " (" + (mavenRoots.size() - unclaimed.size()) + " already claimed by Gradle)"
+                                        : ""));
+                    } else {
+                        logProgress("No Maven projects found");
+                    }
+                }
+
+                long discoveryElapsed = System.currentTimeMillis() - discoveryStart;
+
+                allDiscoveredRoots = discoveredByImporter.values().stream()
+                        .flatMap(List::stream).collect(Collectors.toList());
+
+                logProgress("Discovery completed in " + discoveryElapsed + "ms ("
+                        + allDiscoveredRoots.size() + " projects)");
             }
 
             if (Thread.currentThread().isInterrupted()) {
@@ -323,19 +478,12 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                 return;
             }
 
-            // Collect all discovered roots for cache key computation
-            List<Path> allDiscoveredRoots = discoveredByImporter.values().stream()
-                    .flatMap(List::stream).collect(Collectors.toList());
-
-            // Phase 1a: Register discovered project scopes IMMEDIATELY so
-            // that didOpen can compile files with basic syntax while the
-            // classpath is being resolved in the background.
+            // ── Phase 1a: Register scopes ─────────────────────────────────
             if (!allDiscoveredRoots.isEmpty()) {
                 logProgress("Discovered " + allDiscoveredRoots.size()
                         + " project(s), registering scopes...");
                 groovyServices.registerDiscoveredProjects(allDiscoveredRoots);
 
-                // Assign importers for discovered roots
                 for (Map.Entry<ProjectImporter, List<Path>> de : discoveredByImporter.entrySet()) {
                     for (Path root : de.getValue()) {
                         importerMapLocal.put(root, de.getKey());
@@ -343,15 +491,17 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                 }
             }
 
-            // Phase 1b: Check classpath cache
-            Path workspaceRoot = groovyServices.getWorkspaceRoot();
-            boolean cacheHit = false;
-            if (classpathCacheEnabled && workspaceRoot != null && !allDiscoveredRoots.isEmpty()) {
-                Map<String, String> currentHashes = ClasspathCache.computeBuildFileHashes(allDiscoveredRoots);
-                Optional<ClasspathCache.CacheData> cached = ClasspathCache.load(workspaceRoot);
-                if (cached.isPresent() && ClasspathCache.isValid(cached.get(), currentHashes)) {
+            // ── Phase 1b: Cache validation for non-cache-first path ──────
+            // When Phase 0 didn't hit (e.g. cache had no discoveredProjects
+            // list), re-check using the SAME cachedData loaded in Phase 0
+            // now that we know the project roots.
+            if (!cacheHit && cachedData != null && !allDiscoveredRoots.isEmpty()) {
+                Map<String, String> currentStamps =
+                        ClasspathCache.computeBuildFileStamps(allDiscoveredRoots);
+                if (ClasspathCache.isValid(cachedData, currentStamps)) {
                     logProgress("Using cached classpath (build files unchanged)");
-                    Map<Path, List<String>> cachedClasspaths = ClasspathCache.toClasspathMap(cached.get());
+                    Map<Path, List<String>> cachedClasspaths =
+                            ClasspathCache.toClasspathMap(cachedData);
                     projectClasspaths.putAll(cachedClasspaths);
                     cacheHit = true;
                 } else {
@@ -359,78 +509,95 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                 }
             }
 
-            // Phase 2: Resolve classpaths per importer, in parallel across
-            //          importers.  Uses resolveClasspaths() which SKIPS the
-            //          expensive compilation step and only resolves dependency
-            //          JARs + discovers existing class-output directories.
-            //          (skipped entirely when cache hit)
+            // ── Phase 2: Resolve classpaths (skipped on cache hit) ───────
             if (!cacheHit) {
                 int totalProjects = discoveredByImporter.values().stream()
                         .mapToInt(List::size).sum();
-                logProgress("Resolving classpaths for " + totalProjects + " project(s) across "
-                        + discoveredByImporter.size() + " build tool(s)...");
 
-                List<Future<?>> importFutures = new ArrayList<>();
-                for (Map.Entry<ProjectImporter, List<Path>> entry : discoveredByImporter.entrySet()) {
-                    ProjectImporter importer = entry.getKey();
-                    List<Path> roots = entry.getValue();
+                if (totalProjects > 0) {
+                    logProgress("Resolving classpaths for " + totalProjects + " project(s) across "
+                            + discoveredByImporter.size() + " build tool(s)...");
 
-                    importFutures.add(parallelImportPool.submit(() -> {
-                        try {
-                            logProgress("Resolving classpaths for " + roots.size() + " "
-                                    + importer.getName() + " project(s)...");
-                            long start = System.currentTimeMillis();
+                    long resolveStart = System.currentTimeMillis();
+                    List<Future<?>> importFutures = new ArrayList<>();
+                    for (Map.Entry<ProjectImporter, List<Path>> entry : discoveredByImporter.entrySet()) {
+                        ProjectImporter importer = entry.getKey();
+                        List<Path> roots = entry.getValue();
 
-                            Map<Path, List<String>> batchResult = importer.resolveClasspaths(roots);
+                        importFutures.add(parallelImportPool.submit(() -> {
+                            try {
+                                logProgress("Resolving classpaths for " + roots.size() + " "
+                                        + importer.getName() + " project(s)...");
+                                long start = System.currentTimeMillis();
 
-                            long elapsed = System.currentTimeMillis() - start;
-                            logProgress(importer.getName() + " classpath resolution completed in "
-                                    + (elapsed / 1000) + "s (" + batchResult.size() + " projects)");
+                                Map<Path, List<String>> batchResult = importer.resolveClasspaths(roots);
 
-                            for (Map.Entry<Path, List<String>> e : batchResult.entrySet()) {
-                                projectClasspaths.put(e.getKey(), e.getValue());
+                                long elapsed = System.currentTimeMillis() - start;
+                                logProgress(importer.getName() + " classpath resolution completed in "
+                                        + (elapsed / 1000) + "s (" + batchResult.size() + " projects)");
+
+                                for (Map.Entry<Path, List<String>> e : batchResult.entrySet()) {
+                                    projectClasspaths.put(e.getKey(), e.getValue());
+                                }
+                            } catch (Exception e) {
+                                logger.error("Error resolving {} classpaths: {}",
+                                        importer.getName(), e.getMessage(), e);
+                                logProgress(importer.getName() + " classpath resolution failed: " + e.getMessage());
                             }
-                        } catch (Exception e) {
-                            logger.error("Error resolving {} classpaths: {}",
-                                    importer.getName(), e.getMessage(), e);
-                            logProgress(importer.getName() + " classpath resolution failed: " + e.getMessage());
-                        }
-                    }));
-                }
+                        }));
+                    }
 
-                // Wait for all importers to finish
-                for (Future<?> f : importFutures) {
-                    try {
-                        f.get();
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
+                    for (Future<?> f : importFutures) {
+                        try {
+                            f.get();
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            logProgress("Project import cancelled");
+                            return;
+                        } catch (ExecutionException e) {
+                            logger.error("Import task failed: {}", e.getCause().getMessage(), e.getCause());
+                        }
+                    }
+
+                    if (Thread.currentThread().isInterrupted()) {
                         logProgress("Project import cancelled");
                         return;
-                    } catch (ExecutionException e) {
-                        logger.error("Import task failed: {}", e.getCause().getMessage(), e.getCause());
+                    }
+
+                    long resolveElapsed = System.currentTimeMillis() - resolveStart;
+                    logProgress("Classpath resolution completed in "
+                            + (resolveElapsed / 1000) + "s");
+
+                    // Save classpath + discovered projects for next startup
+                    if (classpathCacheEnabled && workspaceRoot != null && !projectClasspaths.isEmpty()) {
+                        Map<String, String> stamps =
+                                ClasspathCache.computeBuildFileStamps(allDiscoveredRoots);
+                        ClasspathCache.save(workspaceRoot, projectClasspaths, stamps, allDiscoveredRoots);
                     }
                 }
-
-                if (Thread.currentThread().isInterrupted()) {
-                    logProgress("Project import cancelled");
-                    return;
-                }
-
-                // Save classpath cache for next startup
-                if (classpathCacheEnabled && workspaceRoot != null && !projectClasspaths.isEmpty()) {
-                    Map<String, String> hashes = ClasspathCache.computeBuildFileHashes(allDiscoveredRoots);
-                    ClasspathCache.save(workspaceRoot, projectClasspaths, hashes);
+            } else {
+                // Cache hit — re-save with discoveredProjects if the cache
+                // didn't contain them (upgrade from v1 format)
+                if (cachedData != null && cachedData.discoveredProjects == null
+                        && classpathCacheEnabled && workspaceRoot != null
+                        && !projectClasspaths.isEmpty() && !allDiscoveredRoots.isEmpty()) {
+                    Map<String, String> stamps =
+                            ClasspathCache.computeBuildFileStamps(allDiscoveredRoots);
+                    ClasspathCache.save(workspaceRoot, projectClasspaths, stamps, allDiscoveredRoots);
                 }
             }
 
-            // Phase 3: Update all registered scopes with resolved classpaths
+            // ── Phase 3: Apply classpaths ─────────────────────────────────
             projectImporterMap.putAll(importerMapLocal);
 
             if (!projectClasspaths.isEmpty()) {
                 logProgress("Updating classpaths for " + projectClasspaths.size() + " project(s)...");
                 groovyServices.updateProjectClasspaths(projectClasspaths);
             }
-            logProgress("Project import complete");
+
+            long totalElapsed = System.currentTimeMillis() - totalStart;
+            logProgress("Project import complete (" + totalElapsed + "ms"
+                    + (cacheHit ? ", cached" : "") + ")");
         } catch (Exception e) {
             logger.error("Background project import failed: {}", e.getMessage(), e);
             logProgress("Project import failed: " + e.getMessage());

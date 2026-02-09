@@ -50,6 +50,21 @@ public class GradleProjectImporter implements ProjectImporter {
 
     private static final Logger logger = LoggerFactory.getLogger(GradleProjectImporter.class);
 
+    /**
+     * Optional upper bound for {@link #findGradleRoot(Path)} so that the
+     * search stops at the workspace root instead of walking all the way to
+     * the filesystem root.  Set via {@link #setWorkspaceBound(Path)}.
+     */
+    private volatile Path workspaceBound;
+
+    /**
+     * Sets an upper bound for the Gradle-root search.  When set,
+     * {@link #findGradleRoot(Path)} will not walk above this directory.
+     */
+    public void setWorkspaceBound(Path bound) {
+        this.workspaceBound = bound;
+    }
+
     @Override
     public String getName() {
         return "Gradle";
@@ -57,16 +72,10 @@ public class GradleProjectImporter implements ProjectImporter {
 
     @Override
     public List<Path> discoverProjects(Path workspaceRoot) throws IOException {
-        List<Path> gradleProjects = new ArrayList<>();
-        try (Stream<Path> fileStream = Files.walk(workspaceRoot)) {
-            fileStream
-                    .filter(Files::isRegularFile)
-                    .filter(p -> Set.of("build.gradle", "build.gradle.kts").contains(p.getFileName().toString()))
-                    .map(buildFile -> buildFile.getParent())
-                    .filter(this::isJvmProject)
-                    .forEach(gradleProjects::add);
-        }
-        return gradleProjects;
+        // Delegate to the unified discovery with directory pruning
+        ProjectDiscovery.DiscoveryResult result = ProjectDiscovery.discoverAll(
+                workspaceRoot, Set.of("Gradle"));
+        return result.gradleProjects;
     }
 
     @Override
@@ -296,14 +305,24 @@ public class GradleProjectImporter implements ProjectImporter {
      * Walk up from the given directory to find the Gradle root (the directory
      * containing {@code settings.gradle} or {@code settings.gradle.kts}).
      * Returns the given directory itself if no parent with settings is found.
+     *
+     * <p>The search is bounded by {@link #workspaceBound} (if set) so that we
+     * never walk above the workspace root into unrelated parent directories.
+     * Without a bound, the old behaviour of walking to the filesystem root
+     * is preserved for backward compatibility.</p>
      */
     private Path findGradleRoot(Path projectDir) {
         Path dir = projectDir;
         Path lastSettingsDir = null;
+        Path bound = workspaceBound;
         while (dir != null) {
             if (Files.isRegularFile(dir.resolve("settings.gradle"))
                     || Files.isRegularFile(dir.resolve("settings.gradle.kts"))) {
                 lastSettingsDir = dir;
+            }
+            // Stop if we've reached the workspace root
+            if (bound != null && dir.equals(bound)) {
+                break;
             }
             dir = dir.getParent();
         }
@@ -423,10 +442,7 @@ public class GradleProjectImporter implements ProjectImporter {
     }
 
     private boolean isJvmProject(Path projectDir) {
-        return Files.isDirectory(projectDir.resolve("src/main/java"))
-                || Files.isDirectory(projectDir.resolve("src/main/groovy"))
-                || Files.isDirectory(projectDir.resolve("src/test/java"))
-                || Files.isDirectory(projectDir.resolve("src/test/groovy"));
+        return ProjectDiscovery.isJvmProject(projectDir);
     }
 
     /**

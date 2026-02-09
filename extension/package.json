@@ -122,6 +122,15 @@
           ],
           "default": null,
           "description": "Specifies the folder path to the Maven installation. Use this if mvn is not on your PATH."
+        },
+        "groovy.project.importers": {
+          "type": "array",
+          "default": [],
+          "description": "Limit which build-tool importers are active during project discovery. Valid values: \"Gradle\", \"Maven\". An empty array (default) enables all importers. Set to [\"Gradle\"] to skip Maven discovery entirely, or [\"Maven\"] to skip Gradle.",
+          "items": {
+            "type": "string",
+            "enum": ["Gradle", "Maven"]
+          }
         }
       }
     }

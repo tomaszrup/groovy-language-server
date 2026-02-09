@@ -77,8 +77,11 @@ class ClasspathCacheTests {
         Map<String, String> hashes = ClasspathCache.computeBuildFileHashes(
                 Arrays.asList(workspaceRoot.resolve("projectA"), workspaceRoot.resolve("projectB")));
 
+        List<Path> discoveredProjects = Arrays.asList(
+                workspaceRoot.resolve("projectA"), workspaceRoot.resolve("projectB"));
+
         // Save
-        ClasspathCache.save(workspaceRoot, classpaths, hashes);
+        ClasspathCache.save(workspaceRoot, classpaths, hashes, discoveredProjects);
 
         // Load
         Optional<ClasspathCache.CacheData> loaded = ClasspathCache.load(workspaceRoot);
@@ -124,8 +127,10 @@ class ClasspathCacheTests {
         Map<String, String> originalHashes = ClasspathCache.computeBuildFileHashes(
                 Collections.singletonList(projectRoot));
 
-        // Modify the build file
-        Files.write(projectRoot.resolve("build.gradle"), "v2".getBytes(StandardCharsets.UTF_8));
+        // Modify the build file — use different size to guarantee stamp change
+        // even if filesystem timestamp resolution is coarse.
+        Files.write(projectRoot.resolve("build.gradle"),
+                "version 2 — changed content with different length".getBytes(StandardCharsets.UTF_8));
 
         Map<String, String> newHashes = ClasspathCache.computeBuildFileHashes(
                 Collections.singletonList(projectRoot));
@@ -192,7 +197,7 @@ class ClasspathCacheTests {
         // Save something
         Map<Path, List<String>> classpaths = new LinkedHashMap<>();
         classpaths.put(workspaceRoot, Arrays.asList("/a.jar"));
-        ClasspathCache.save(workspaceRoot, classpaths, Collections.emptyMap());
+        ClasspathCache.save(workspaceRoot, classpaths, Collections.emptyMap(), null);
 
         // Verify it exists
         assertTrue(ClasspathCache.load(workspaceRoot).isPresent());
@@ -343,5 +348,68 @@ class ClasspathCacheTests {
         assertEquals(2, hashes.size());
         String absRoot = projectRoot.toAbsolutePath().normalize().toString();
         assertTrue(hashes.containsKey(absRoot + "/gradle/libs.versions.toml"));
+    }
+
+    // ---- Discovered projects round-trip ----
+
+    @Test
+    void discoveredProjectsSavedAndRestored() throws IOException {
+        Path workspaceRoot = tempDir.resolve("workspace");
+        Files.createDirectories(workspaceRoot);
+
+        Map<Path, List<String>> classpaths = new LinkedHashMap<>();
+        classpaths.put(workspaceRoot.resolve("p1"), Arrays.asList("/a.jar"));
+
+        List<Path> discoveredProjects = Arrays.asList(
+                workspaceRoot.resolve("p1"),
+                workspaceRoot.resolve("p2"));
+
+        ClasspathCache.save(workspaceRoot, classpaths, Collections.emptyMap(), discoveredProjects);
+
+        Optional<ClasspathCache.CacheData> loaded = ClasspathCache.load(workspaceRoot);
+        assertTrue(loaded.isPresent());
+
+        Optional<List<Path>> restored = ClasspathCache.toDiscoveredProjectsList(loaded.get());
+        assertTrue(restored.isPresent(), "Discovered projects should be present");
+        assertEquals(2, restored.get().size());
+        assertEquals(workspaceRoot.resolve("p1").toAbsolutePath().normalize(), restored.get().get(0));
+        assertEquals(workspaceRoot.resolve("p2").toAbsolutePath().normalize(), restored.get().get(1));
+    }
+
+    @Test
+    void toDiscoveredProjectsListReturnsEmptyWhenNull() {
+        ClasspathCache.CacheData data = new ClasspathCache.CacheData();
+        data.discoveredProjects = null;
+        assertFalse(ClasspathCache.toDiscoveredProjectsList(data).isPresent());
+    }
+
+    @Test
+    void toDiscoveredProjectsListReturnsEmptyWhenEmpty() {
+        ClasspathCache.CacheData data = new ClasspathCache.CacheData();
+        data.discoveredProjects = Collections.emptyList();
+        assertFalse(ClasspathCache.toDiscoveredProjectsList(data).isPresent());
+    }
+
+    // ---- Build file stamp format ----
+
+    @Test
+    void computeBuildFileStampsUsesLastModifiedAndSize() throws IOException {
+        Path projectRoot = tempDir.resolve("project");
+        Files.createDirectories(projectRoot);
+        Files.write(projectRoot.resolve("build.gradle"), "apply plugin: 'java'".getBytes(StandardCharsets.UTF_8));
+
+        Map<String, String> stamps = ClasspathCache.computeBuildFileStamps(
+                Collections.singletonList(projectRoot));
+
+        assertEquals(1, stamps.size());
+        String stamp = stamps.values().iterator().next();
+        // Stamp format: "<lastModified>:<size>"
+        assertTrue(stamp.contains(":"), "Stamp should contain ':' separator");
+        String[] parts = stamp.split(":");
+        assertEquals(2, parts.length, "Stamp should have exactly two parts");
+        long lastModified = Long.parseLong(parts[0]);
+        long size = Long.parseLong(parts[1]);
+        assertTrue(lastModified > 0, "Last modified should be positive");
+        assertEquals(20, size, "Size should match 'apply plugin: \'java\'' (20 bytes)");
     }
 }

@@ -171,6 +171,24 @@ function restartLanguageServer() {
   );
 }
 
+/**
+ * Build the initializationOptions object passed to the language server.
+ * Reads VS Code settings and translates them into the format expected by
+ * GroovyLanguageServer.initialize().
+ */
+function buildInitializationOptions(): Record<string, unknown> {
+  const config = vscode.workspace.getConfiguration("groovy");
+  const options: Record<string, unknown> = {};
+
+  // Enabled importers (empty array means all enabled)
+  const importers = config.get<string[]>("project.importers");
+  if (importers && importers.length > 0) {
+    options.enabledImporters = importers;
+  }
+
+  return options;
+}
+
 function startLanguageServer() {
   vscode.window.withProgress(
     { location: vscode.ProgressLocation.Notification, title: INITIALIZING_MESSAGE, cancellable: false },
@@ -246,6 +264,8 @@ function startLanguageServer() {
             { scheme: "file", language: "groovy" },
             { scheme: "untitled", language: "groovy" },
           ],
+          // Pass configuration to the server as initialization options
+          initializationOptions: buildInitializationOptions(),
           synchronize: {
             configurationSection: "groovy",
             fileEvents: [
@@ -286,13 +306,20 @@ function startLanguageServer() {
           setStatusBar("importing");
           languageClient.onNotification("window/logMessage", (params: { type: number; message: string }) => {
             const msg = params.message;
-            if (msg.startsWith("Discovering ") || msg.startsWith("Importing ") ||
+            if (msg.startsWith("Using cached ")) {
+              // Cache hit — show a brief "cached" indicator then transition to ready
+              setStatusBar("importing", msg);
+            } else if (msg.startsWith("Discovering ") || msg.startsWith("Importing ") ||
                 msg.startsWith("Batch-importing ") ||
                 msg.startsWith("Found ") || msg.startsWith("Resolved ") ||
-                msg.startsWith("Compiling ") ||
-                msg.startsWith("Gradle import ") || msg.startsWith("Maven import ")) {
+                msg.startsWith("Compiling ") || msg.startsWith("Resolving ") ||
+                msg.startsWith("Discovery completed") ||
+                msg.startsWith("Classpath resolution completed") ||
+                msg.startsWith("Discovered ") || msg.startsWith("Updating classpaths") ||
+                msg.startsWith("Gradle import ") || msg.startsWith("Maven import ") ||
+                msg.startsWith("No Gradle ") || msg.startsWith("No Maven ")) {
               setStatusBar("importing", msg);
-            } else if (msg === "Project import complete" || msg.startsWith("Project import failed")) {
+            } else if (msg.startsWith("Project import complete") || msg.startsWith("Project import failed")) {
               setStatusBar("ready");
             }
           });

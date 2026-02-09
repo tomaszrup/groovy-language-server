@@ -31,8 +31,8 @@ import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.*;
-import java.util.stream.Stream;
 
 /**
  * Discovers and imports Maven-based JVM projects. Shells out to the {@code mvn}
@@ -60,16 +60,10 @@ public class MavenProjectImporter implements ProjectImporter {
 
     @Override
     public List<Path> discoverProjects(Path workspaceRoot) throws IOException {
-        List<Path> mavenProjects = new ArrayList<>();
-        try (Stream<Path> fileStream = Files.walk(workspaceRoot)) {
-            fileStream
-                    .filter(Files::isRegularFile)
-                    .filter(p -> "pom.xml".equals(p.getFileName().toString()))
-                    .map(pomFile -> pomFile.getParent())
-                    .filter(this::isJvmProject)
-                    .forEach(mavenProjects::add);
-        }
-        return mavenProjects;
+        // Delegate to the unified discovery with directory pruning
+        ProjectDiscovery.DiscoveryResult result = ProjectDiscovery.discoverAll(
+                workspaceRoot, Set.of("Maven"));
+        return result.mavenProjects;
     }
 
     @Override
@@ -175,10 +169,7 @@ public class MavenProjectImporter implements ProjectImporter {
     // ---- private helpers ----
 
     private boolean isJvmProject(Path projectDir) {
-        return Files.isDirectory(projectDir.resolve("src/main/java"))
-                || Files.isDirectory(projectDir.resolve("src/main/groovy"))
-                || Files.isDirectory(projectDir.resolve("src/test/java"))
-                || Files.isDirectory(projectDir.resolve("src/test/groovy"));
+        return ProjectDiscovery.isJvmProject(projectDir);
     }
 
     /**

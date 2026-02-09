@@ -52,13 +52,14 @@ public class ClasspathCache {
     private static final Logger logger = LoggerFactory.getLogger(ClasspathCache.class);
 
     /** Bump when the JSON schema changes to force cache invalidation. */
-    private static final int CACHE_VERSION = 1;
+    private static final int CACHE_VERSION = 2;
 
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 
     /**
-     * Build file names whose content should be hashed for cache validation.
-     * Any change to these files invalidates the cached classpath.
+     * Build file names whose modification is tracked for cache validation.
+     * {@code gradle.lockfile} is intentionally excluded — it is a build
+     * output, not a classpath-affecting input.
      */
     private static final String[] BUILD_FILE_NAMES = {
             "build.gradle",
@@ -66,7 +67,6 @@ public class ClasspathCache {
             "settings.gradle",
             "settings.gradle.kts",
             "pom.xml",
-            "gradle.lockfile",
             "gradle/libs.versions.toml"
     };
 
@@ -74,12 +74,23 @@ public class ClasspathCache {
 
     /** JSON-serializable cache entry. */
     public static class CacheData {
-        int version;
-        long timestamp;
-        /** Relative path → SHA-256 hex of each build file that existed at cache time. */
-        Map<String, String> buildFileHashes;
+        public int version;
+        public long timestamp;
+        /**
+         * Relative path → file stamp ({@code "<lastModified>:<size>"}) of
+         * each build file that existed at cache time.  Changed from SHA-256
+         * content hashes in v2 to avoid reading entire files on startup.
+         */
+        public Map<String, String> buildFileHashes;
         /** Normalised project root path → list of classpath entry strings. */
-        Map<String, List<String>> classpaths;
+        public Map<String, List<String>> classpaths;
+        /**
+         * Discovered project root paths (absolute, normalised).  Persisted so
+         * that the expensive {@code Files.walk()} discovery phase can be
+         * skipped on subsequent starts when the cache is valid.
+         * May be {@code null} for caches created before this field was added.
+         */
+        public List<String> discoveredProjects;
     }
 
     // ---- Public API ----
@@ -112,16 +123,18 @@ public class ClasspathCache {
     }
 
     /**
-     * Persist the resolved classpaths to disk for future server starts.
+     * Persist the resolved classpaths and discovered project list to disk.
      *
-     * @param workspaceRoot   the workspace root (used to derive cache file name)
-     * @param classpaths      map from project root to classpath entries
-     * @param buildFileHashes the build-file hashes computed via
-     *                        {@link #computeBuildFileHashes(Collection)}
+     * @param workspaceRoot      the workspace root (used to derive cache file name)
+     * @param classpaths         map from project root to classpath entries
+     * @param buildFileHashes    the build-file stamps computed via
+     *                           {@link #computeBuildFileStamps(Collection)}
+     * @param discoveredProjects all discovered project root paths (may be {@code null})
      */
     public static void save(Path workspaceRoot,
                             Map<Path, List<String>> classpaths,
-                            Map<String, String> buildFileHashes) {
+                            Map<String, String> buildFileHashes,
+                            List<Path> discoveredProjects) {
         Path cacheFile = getCacheFile(workspaceRoot);
         try {
             Files.createDirectories(cacheFile.getParent());
@@ -135,6 +148,13 @@ public class ClasspathCache {
             for (Map.Entry<Path, List<String>> entry : classpaths.entrySet()) {
                 data.classpaths.put(entry.getKey().toAbsolutePath().normalize().toString(),
                         entry.getValue());
+            }
+            // Persist discovered project roots so discovery can be skipped
+            if (discoveredProjects != null) {
+                data.discoveredProjects = new ArrayList<>();
+                for (Path p : discoveredProjects) {
+                    data.discoveredProjects.add(p.toAbsolutePath().normalize().toString());
+                }
             }
 
             // Atomic write: temp file → rename
@@ -177,29 +197,43 @@ public class ClasspathCache {
     }
 
     /**
-     * Compute SHA-256 hashes of all relevant build files found under the given
-     * project roots.
+     * Compute lightweight file stamps ({@code "<lastModified>:<size>"}) for all
+     * relevant build files found under the given project roots.  This replaces
+     * the previous SHA-256 content hashing approach: no file I/O is needed
+     * beyond a single {@code stat} call per file, making cache validation
+     * dramatically faster.
      *
      * @param projectRoots all discovered project root directories
-     * @return map from relative-ish key ({@code "<root>/<filename>"}) to hex
-     *         digest; files that don't exist are silently omitted
+     * @return map from key ({@code "<root>/<filename>"}) to stamp string;
+     *         files that don't exist are silently omitted
      */
-    public static Map<String, String> computeBuildFileHashes(Collection<Path> projectRoots) {
-        Map<String, String> hashes = new TreeMap<>();
+    public static Map<String, String> computeBuildFileStamps(Collection<Path> projectRoots) {
+        Map<String, String> stamps = new TreeMap<>();
         for (Path root : projectRoots) {
             Path absRoot = root.toAbsolutePath().normalize();
             for (String name : BUILD_FILE_NAMES) {
                 Path buildFile = absRoot.resolve(name);
                 if (Files.isRegularFile(buildFile)) {
-                    String hash = sha256(buildFile);
-                    if (hash != null) {
-                        // Key: <normalised root>/<build file name>
-                        hashes.put(absRoot + "/" + name, hash);
+                    try {
+                        long lastModified = Files.getLastModifiedTime(buildFile).toMillis();
+                        long size = Files.size(buildFile);
+                        stamps.put(absRoot + "/" + name, lastModified + ":" + size);
+                    } catch (IOException e) {
+                        logger.debug("Could not stat file for stamping: {}", buildFile);
                     }
                 }
             }
         }
-        return hashes;
+        return stamps;
+    }
+
+    /**
+     * @deprecated Use {@link #computeBuildFileStamps(Collection)} instead.
+     *             Retained for backward compatibility with existing tests.
+     */
+    @Deprecated
+    public static Map<String, String> computeBuildFileHashes(Collection<Path> projectRoots) {
+        return computeBuildFileStamps(projectRoots);
     }
 
     /**
@@ -212,6 +246,23 @@ public class ClasspathCache {
             result.put(Paths.get(entry.getKey()), entry.getValue());
         }
         return result;
+    }
+
+    /**
+     * Convert cached discovered project roots back into a {@code List<Path>}.
+     *
+     * @return the list of project root paths, or {@link Optional#empty()} if
+     *         the cache does not contain discovered project data
+     */
+    public static Optional<List<Path>> toDiscoveredProjectsList(CacheData data) {
+        if (data.discoveredProjects == null || data.discoveredProjects.isEmpty()) {
+            return Optional.empty();
+        }
+        List<Path> result = new ArrayList<>();
+        for (String s : data.discoveredProjects) {
+            result.add(Paths.get(s));
+        }
+        return Optional.of(result);
     }
 
     // ---- Cache directory / file helpers ----

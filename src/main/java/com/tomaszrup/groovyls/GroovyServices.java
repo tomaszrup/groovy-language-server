@@ -47,7 +47,10 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 
 import org.codehaus.groovy.ast.ASTNode;
+import org.codehaus.groovy.control.CompilationFailedException;
+import org.codehaus.groovy.control.CompilerConfiguration;
 import org.codehaus.groovy.control.ErrorCollector;
+import org.codehaus.groovy.control.Phases;
 import org.eclipse.lsp4j.*;
 import org.eclipse.lsp4j.jsonrpc.messages.Either;
 import org.eclipse.lsp4j.jsonrpc.messages.Either3;
@@ -291,16 +294,12 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		synchronized (scopesMutationLock) {
 			this.workspaceRoot = workspaceRoot;
 			ProjectScope ds = new ProjectScope(workspaceRoot, defaultScope.compilationUnitFactory);
+			// Defer compilation — the default scope is compiled lazily via
+			// ensureScopeCompiled() when an LSP request targets it.  This
+			// avoids wasting time compiling with an empty classpath when
+			// registerDiscoveredProjects() will replace the scope moments later.
+			ds.compiled = false;
 			this.defaultScope = ds;
-		}
-		ProjectScope ds = defaultScope;
-		ds.lock.writeLock().lock();
-		try {
-			createOrUpdateCompilationUnit(ds);
-			resetChangedFilesForScope(ds);
-			ds.compiled = true;
-		} finally {
-			ds.lock.writeLock().unlock();
 		}
 	}
 
@@ -360,11 +359,28 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	 * the full classpath so that diagnostics and completions reflect all
 	 * dependency types.
 	 *
+	 * <p><b>Lazy optimisation:</b> only scopes that have open files are
+	 * recompiled eagerly.  All other scopes stay uncompiled and will be
+	 * compiled on-demand via {@link #ensureScopeCompiled} when a file
+	 * belonging to them is first opened.</p>
+	 *
 	 * @param projectClasspaths map from project root to classpath entries
 	 */
 	public void updateProjectClasspaths(Map<Path, List<String>> projectClasspaths) {
 		logger.info("updateProjectClasspaths called with {} projects", projectClasspaths.size());
 		List<ProjectScope> scopes = projectScopes;
+
+		// Collect open URIs once so we can check which scopes have open files.
+		Set<URI> openURIs = fileContentsTracker.getOpenURIs();
+
+		// Build a set of scopes that own at least one open file.
+		Set<ProjectScope> scopesWithOpenFiles = new HashSet<>();
+		for (URI uri : openURIs) {
+			ProjectScope owning = findProjectScope(uri);
+			if (owning != null) {
+				scopesWithOpenFiles.add(owning);
+			}
+		}
 
 		for (ProjectScope scope : scopes) {
 			List<String> classpath = projectClasspaths.get(scope.projectRoot);
@@ -390,9 +406,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			}
 		}
 
-		// Recompile files that are already open so the user gets updated
-		// diagnostics reflecting the resolved classpath.
-		Set<URI> openURIs = fileContentsTracker.getOpenURIs();
+		// Only recompile scopes that have open files — all others stay lazy.
 		for (URI uri : openURIs) {
 			ProjectScope scope = findProjectScope(uri);
 			if (scope != null && scope.classpathResolved) {
@@ -556,6 +570,11 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			} finally {
 				scope.lock.writeLock().unlock();
 			}
+		} else if (isImportPendingFor(scope != null ? scope : defaultScope)) {
+			// Import is still in progress — provide immediate syntax-only
+			// diagnostics so the user sees parse errors without waiting for
+			// the full classpath resolution to complete.
+			backgroundCompiler.submit(() -> syntaxCheckSingleFile(uri));
 		}
 	}
 
@@ -1905,6 +1924,49 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			compileAndVisitAST(scope, uri);
 		} catch (Exception e) {
 			logger.error("Failed to recompile after restoring document {}: {}", uri, e.getMessage());
+		}
+	}
+
+	/**
+	 * Performs a quick, syntax-only parse of a single file and publishes
+	 * any syntax errors as diagnostics.  This is used when a file is opened
+	 * while the background project import is still in progress — it gives
+	 * the user immediate feedback on parse errors without waiting for full
+	 * classpath resolution.
+	 *
+	 * <p>The compilation unit is lightweight: no classpath, no other source
+	 * files, compiled only to {@link Phases#CONVERSION} (parse + syntax
+	 * check).  The file will be fully recompiled with the real classpath
+	 * once import finishes and {@code onImportComplete()} replays open files.</p>
+	 */
+	private void syntaxCheckSingleFile(URI uri) {
+		String source = fileContentsTracker.getContents(uri);
+		if (source == null) {
+			return;
+		}
+		try {
+			CompilerConfiguration config = new CompilerConfiguration();
+			GroovyLSCompilationUnit unit = new GroovyLSCompilationUnit(config);
+			unit.addSource(uri.toString(), source);
+			try {
+				unit.compile(Phases.CONVERSION);
+			} catch (CompilationFailedException e) {
+				// Expected for code with syntax errors — diagnostics are in the error collector
+			} catch (Exception e) {
+				logger.debug("Syntax check failed for {}: {}", uri, e.getMessage());
+			}
+
+			ErrorCollector collector = unit.getErrorCollector();
+			if (collector != null) {
+				DiagnosticHandler.DiagnosticResult result = diagnosticHandler.handleErrorCollector(
+						unit, collector, null, null);
+				LanguageClient client = languageClient;
+				if (client != null) {
+					result.getDiagnosticsToPublish().forEach(client::publishDiagnostics);
+				}
+			}
+		} catch (Exception e) {
+			logger.debug("Syntax-only check failed for {}: {}", uri, e.getMessage());
 		}
 	}
 
