@@ -42,6 +42,9 @@ public class Ranges {
 	}
 
 	public static String getSubstring(String string, Range range, int maxLines) {
+		if (string == null) {
+			return null;
+		}
 		BufferedReader reader = new BufferedReader(new StringReader(string));
 		StringBuilder builder = new StringBuilder();
 		Position start = range.getStart();
@@ -58,11 +61,16 @@ public class Ranges {
 		try {
 			for (int i = 0; i < startLine; i++) {
 				// ignore these lines
-				reader.readLine();
+				if (reader.readLine() == null) {
+					return builder.toString();
+				}
 			}
 			for (int i = 0; i < startChar; i++) {
 				// ignore these characters
-				reader.read();
+				int ch = reader.read();
+				if (ch == -1) {
+					return builder.toString();
+				}
 			}
 			int endCharStart = startChar;
 			int maxLineBreaks = endLine - startLine;
@@ -70,7 +78,11 @@ public class Ranges {
 				endCharStart = 0;
 				int readLines = 0;
 				while (readLines < maxLineBreaks) {
-					char character = (char) reader.read();
+					int ch = reader.read();
+					if (ch == -1) {
+						return builder.toString();
+					}
+					char character = (char) ch;
 					if (character == '\n') {
 						readLines++;
 					}
@@ -79,7 +91,11 @@ public class Ranges {
 			}
 			// the remaining characters on the final line
 			for (int i = endCharStart; i < endChar; i++) {
-				builder.append((char) reader.read());
+				int ch = reader.read();
+				if (ch == -1) {
+					return builder.toString();
+				}
+				builder.append((char) ch);
 			}
 		} catch (IOException e) {
 			return null;

@@ -25,7 +25,9 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -50,9 +52,22 @@ public class JavadocResolver {
 	private static final Logger logger = LoggerFactory.getLogger(JavadocResolver.class);
 
 	/**
-	 * Cache: sourcesJarPath -> (className -> list of parsed Javadoc entries)
+	 * Maximum number of source JAR entries cached.
 	 */
-	private static final ConcurrentHashMap<String, Map<String, List<JavadocEntry>>> cache = new ConcurrentHashMap<>();
+	private static final int MAX_CACHE_SIZE = 500;
+
+	/**
+	 * Cache: sourcesJarPath -> (className -> list of parsed Javadoc entries).
+	 * Bounded LRU map: eldest entries are evicted when the cache exceeds
+	 * {@link #MAX_CACHE_SIZE} keys.
+	 */
+	private static final Map<String, Map<String, List<JavadocEntry>>> cache =
+			Collections.synchronizedMap(new LinkedHashMap<String, Map<String, List<JavadocEntry>>>(16, 0.75f, true) {
+				@Override
+				protected boolean removeEldestEntry(Map.Entry<String, Map<String, List<JavadocEntry>>> eldest) {
+					return size() > MAX_CACHE_SIZE;
+				}
+			});
 
 	// Matches a Javadoc comment block: /** ... */
 	private static final Pattern JAVADOC_PATTERN = Pattern.compile("/\\*\\*(.*?)\\*/", Pattern.DOTALL);
@@ -105,7 +120,10 @@ public class JavadocResolver {
 			String memberName, CompletionItemKind kind, String signature) {
 		try {
 			String jarKey = sourcesJar.toAbsolutePath().toString();
-			Map<String, List<JavadocEntry>> jarCache = cache.computeIfAbsent(jarKey, k -> new ConcurrentHashMap<>());
+			Map<String, List<JavadocEntry>> jarCache;
+			synchronized (cache) {
+				jarCache = cache.computeIfAbsent(jarKey, k -> new ConcurrentHashMap<>());
+			}
 
 			List<JavadocEntry> entries = jarCache.computeIfAbsent(declaringClass, className -> {
 				return parseJavadocFromJar(sourcesJar, className);
@@ -326,7 +344,7 @@ public class JavadocResolver {
 		String[] lines = javadocContent.split("\n");
 		StringBuilder description = new StringBuilder();
 		List<String> paramDocs = new ArrayList<>();
-		String returnDoc = null;
+		String[] returnDoc = { null };
 		List<String> throwsDocs = new ArrayList<>();
 		List<String> seeDocs = new ArrayList<>();
 		String sinceDoc = null;
@@ -340,35 +358,35 @@ public class JavadocResolver {
 			String line = rawLine.replaceFirst("^\\s*\\*\\s?", "").trim();
 
 			if (line.startsWith("@param ")) {
-				flushTag(currentTagType, currentTag, description, paramDocs, throwsDocs, seeDocs);
+				flushTag(currentTagType, currentTag, description, paramDocs, returnDoc, throwsDocs, seeDocs);
 				currentTagType = "param";
 				currentTag = new StringBuilder(line.substring(7).trim());
 			} else if (line.startsWith("@return ") || line.equals("@return")) {
-				flushTag(currentTagType, currentTag, description, paramDocs, throwsDocs, seeDocs);
+				flushTag(currentTagType, currentTag, description, paramDocs, returnDoc, throwsDocs, seeDocs);
 				currentTagType = "return";
 				currentTag = new StringBuilder(line.length() > 8 ? line.substring(8).trim() : "");
 			} else if (line.startsWith("@throws ") || line.startsWith("@exception ")) {
-				flushTag(currentTagType, currentTag, description, paramDocs, throwsDocs, seeDocs);
+				flushTag(currentTagType, currentTag, description, paramDocs, returnDoc, throwsDocs, seeDocs);
 				currentTagType = "throws";
 				String content = line.startsWith("@throws ") ? line.substring(8) : line.substring(11);
 				currentTag = new StringBuilder(content.trim());
 			} else if (line.startsWith("@see ")) {
-				flushTag(currentTagType, currentTag, description, paramDocs, throwsDocs, seeDocs);
+				flushTag(currentTagType, currentTag, description, paramDocs, returnDoc, throwsDocs, seeDocs);
 				currentTagType = "see";
 				currentTag = new StringBuilder(line.substring(5).trim());
 			} else if (line.startsWith("@since ")) {
-				flushTag(currentTagType, currentTag, description, paramDocs, throwsDocs, seeDocs);
+				flushTag(currentTagType, currentTag, description, paramDocs, returnDoc, throwsDocs, seeDocs);
 				sinceDoc = line.substring(7).trim();
 				currentTagType = null;
 				currentTag = null;
 			} else if (line.startsWith("@deprecated")) {
-				flushTag(currentTagType, currentTag, description, paramDocs, throwsDocs, seeDocs);
+				flushTag(currentTagType, currentTag, description, paramDocs, returnDoc, throwsDocs, seeDocs);
 				deprecatedDoc = line.length() > 12 ? line.substring(12).trim() : "";
 				currentTagType = null;
 				currentTag = null;
 			} else if (line.startsWith("@")) {
 				// Other tag, just flush current
-				flushTag(currentTagType, currentTag, description, paramDocs, throwsDocs, seeDocs);
+				flushTag(currentTagType, currentTag, description, paramDocs, returnDoc, throwsDocs, seeDocs);
 				currentTagType = null;
 				currentTag = null;
 			} else {
@@ -383,7 +401,7 @@ public class JavadocResolver {
 				}
 			}
 		}
-		flushTag(currentTagType, currentTag, description, paramDocs, throwsDocs, seeDocs);
+		flushTag(currentTagType, currentTag, description, paramDocs, returnDoc, throwsDocs, seeDocs);
 
 		// Build the final Markdown
 		StringBuilder md = new StringBuilder();
@@ -416,8 +434,8 @@ public class JavadocResolver {
 			}
 		}
 
-		if (returnDoc != null) {
-			md.append("\n**@return** ").append(htmlToMarkdown(returnDoc)).append("\n");
+		if (returnDoc[0] != null) {
+			md.append("\n**@return** ").append(htmlToMarkdown(returnDoc[0])).append("\n");
 		}
 
 		if (!throwsDocs.isEmpty()) {
@@ -449,7 +467,7 @@ public class JavadocResolver {
 	}
 
 	private static void flushTag(String tagType, StringBuilder tagContent,
-			StringBuilder description, List<String> paramDocs,
+			StringBuilder description, List<String> paramDocs, String[] returnDoc,
 			List<String> throwsDocs, List<String> seeDocs) {
 		if (tagType == null || tagContent == null) {
 			return;
@@ -459,13 +477,15 @@ public class JavadocResolver {
 			case "param":
 				paramDocs.add(content);
 				break;
+			case "return":
+				returnDoc[0] = content;
+				break;
 			case "throws":
 				throwsDocs.add(content);
 				break;
 			case "see":
 				seeDocs.add(content);
 				break;
-			// "return" is handled inline already for simplicity
 		}
 	}
 

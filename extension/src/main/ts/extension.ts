@@ -58,7 +58,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.StatusBarAlignment.Left
   );
   statusBarItem.name = "Groovy Language Server";
-  statusBarItem.command = "groovy.restartServer";
+  statusBarItem.command = "groovy.showOutputChannel";
   context.subscriptions.push(statusBarItem);
 
   context.subscriptions.push(
@@ -67,6 +67,12 @@ export function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push(
     vscode.commands.registerCommand("groovy.restartServer", restartLanguageServer)
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("groovy.showOutputChannel", () => {
+      outputChannel?.show();
+    })
   );
 
   startLanguageServer();
@@ -103,13 +109,13 @@ function setStatusBar(
     case "ready":
       statusBarItem.text = "$(check) Groovy";
       statusBarItem.tooltip =
-        "Groovy Language Server: Ready (click to restart)";
+        "Groovy Language Server: Ready (click to show output)";
       statusBarItem.show();
       break;
     case "error":
       statusBarItem.text = "$(error) Groovy";
       statusBarItem.tooltip =
-        "Groovy Language Server: Error (click to restart)";
+        "Groovy Language Server: Error (click to show output)";
       statusBarItem.show();
       break;
     case "stopped":

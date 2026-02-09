@@ -25,9 +25,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
@@ -80,11 +82,11 @@ public class JavaSourceLocator {
             + "(?:[\\w\\[\\]<>,?]+)\\s+"  // type
             + "(\\w+)\\s*[;=]");           // field name followed by ; or =
 
-    /** Maps fully-qualified class name → source file path */
-    private final Map<String, Path> classNameToSource = new HashMap<>();
+    /** Maps fully-qualified class name → source file path (volatile for safe publication) */
+    private volatile Map<String, Path> classNameToSource = Collections.emptyMap();
 
-    /** All project roots being tracked */
-    private final List<Path> projectRoots = new ArrayList<>();
+    /** All project roots being tracked (thread-safe for concurrent adds) */
+    private final List<Path> projectRoots = new CopyOnWriteArrayList<>();
 
     public JavaSourceLocator() {
     }
@@ -94,27 +96,34 @@ public class JavaSourceLocator {
      */
     public void addProjectRoot(Path projectRoot) {
         projectRoots.add(projectRoot);
+        Map<String, Path> snapshot = new HashMap<>(classNameToSource);
         for (String sourceDir : JAVA_SOURCE_DIRS) {
             Path sourcePath = projectRoot.resolve(sourceDir);
             if (Files.isDirectory(sourcePath)) {
-                indexSourceDirectory(sourcePath);
+                indexSourceDirectory(sourcePath, snapshot);
             }
         }
+        classNameToSource = Collections.unmodifiableMap(snapshot);
     }
 
     /**
      * Re-scan all registered project roots. Call this when files change.
      */
     public void refresh() {
-        classNameToSource.clear();
         List<Path> roots = new ArrayList<>(projectRoots);
-        projectRoots.clear();
+        Map<String, Path> snapshot = new HashMap<>();
         for (Path root : roots) {
-            addProjectRoot(root);
+            for (String sourceDir : JAVA_SOURCE_DIRS) {
+                Path sourcePath = root.resolve(sourceDir);
+                if (Files.isDirectory(sourcePath)) {
+                    indexSourceDirectory(sourcePath, snapshot);
+                }
+            }
         }
+        classNameToSource = Collections.unmodifiableMap(snapshot);
     }
 
-    private void indexSourceDirectory(Path sourceRoot) {
+    private void indexSourceDirectory(Path sourceRoot, Map<String, Path> target) {
         try (Stream<Path> stream = Files.walk(sourceRoot)) {
             stream
                     .filter(Files::isRegularFile)
@@ -122,7 +131,7 @@ public class JavaSourceLocator {
                     .forEach(javaFile -> {
                         String fqcn = pathToClassName(sourceRoot, javaFile);
                         if (fqcn != null) {
-                            classNameToSource.put(fqcn, javaFile);
+                            target.put(fqcn, javaFile);
                         }
                     });
         } catch (IOException e) {
@@ -245,10 +254,8 @@ public class JavaSourceLocator {
                     }
                     continue;
                 }
-                if (line.trim().startsWith("/*") || line.trim().startsWith("*")) {
-                    if (line.trim().startsWith("/*")) {
-                        inBlockComment = true;
-                    }
+                if (line.trim().startsWith("/*")) {
+                    inBlockComment = true;
                     if (line.contains("*/")) {
                         inBlockComment = false;
                     }
@@ -313,10 +320,8 @@ public class JavaSourceLocator {
                     }
                     continue;
                 }
-                if (line.trim().startsWith("/*") || line.trim().startsWith("*")) {
-                    if (line.trim().startsWith("/*")) {
-                        inBlockComment = true;
-                    }
+                if (line.trim().startsWith("/*")) {
+                    inBlockComment = true;
                     if (line.contains("*/")) {
                         inBlockComment = false;
                     }
@@ -385,10 +390,8 @@ public class JavaSourceLocator {
                     }
                     continue;
                 }
-                if (line.trim().startsWith("/*") || line.trim().startsWith("*")) {
-                    if (line.trim().startsWith("/*")) {
-                        inBlockComment = true;
-                    }
+                if (line.trim().startsWith("/*")) {
+                    inBlockComment = true;
                     if (line.contains("*/")) {
                         inBlockComment = false;
                     }

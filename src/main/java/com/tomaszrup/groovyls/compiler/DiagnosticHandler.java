@@ -20,6 +20,7 @@
 package com.tomaszrup.groovyls.compiler;
 
 import java.net.URI;
+import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
@@ -111,7 +112,18 @@ public class DiagnosticHandler {
 						diagnostic.setRange(range);
 						diagnostic.setSeverity(cause.isFatal() ? DiagnosticSeverity.Error : DiagnosticSeverity.Warning);
 						diagnostic.setMessage(cause.getMessage());
-						URI uri = Paths.get(cause.getSourceLocator()).toUri();
+						String sourceLocator = cause.getSourceLocator();
+						if (sourceLocator == null || sourceLocator.isEmpty()) {
+							logger.debug("Skipping diagnostic with null/empty source locator: {}", cause.getMessage());
+							return;
+						}
+						URI uri;
+						try {
+							uri = Paths.get(sourceLocator).toUri();
+						} catch (InvalidPathException e) {
+							logger.debug("Skipping diagnostic with invalid source locator '{}': {}", sourceLocator, cause.getMessage());
+							return;
+						}
 						logger.info("  Diagnostic [{}] in {}: {}", projectRoot, uri, cause.getMessage());
 						diagnosticsByFile.computeIfAbsent(uri, (key) -> new ArrayList<>()).add(diagnostic);
 					});

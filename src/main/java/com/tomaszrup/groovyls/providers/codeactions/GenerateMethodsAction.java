@@ -209,13 +209,8 @@ public class GenerateMethodsAction {
         sb.append("        ").append(className).append(" that = (").append(className).append(") o\n");
 
         for (FieldInfo field : fields) {
-            if (isPrimitive(field.type)) {
-                sb.append("        if (").append(field.name).append(" != that.").append(field.name)
-                        .append(") return false\n");
-            } else {
-                sb.append("        if (").append(field.name).append(" != that.").append(field.name)
-                        .append(") return false\n");
-            }
+            sb.append("        if (").append(field.name).append(" != that.").append(field.name)
+                    .append(") return false\n");
         }
 
         sb.append("        return true\n");

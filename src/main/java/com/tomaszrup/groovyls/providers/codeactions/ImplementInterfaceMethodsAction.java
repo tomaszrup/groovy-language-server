@@ -203,13 +203,7 @@ public class ImplementInterfaceMethodsAction {
             sb.append(") {\n");
 
             // Default body
-            if (returnType.equals("void")) {
-                sb.append("        throw new UnsupportedOperationException(\"Not yet implemented\")\n");
-            } else if (returnType.equals("boolean")) {
-                sb.append("        throw new UnsupportedOperationException(\"Not yet implemented\")\n");
-            } else {
-                sb.append("        throw new UnsupportedOperationException(\"Not yet implemented\")\n");
-            }
+            sb.append("        throw new UnsupportedOperationException(\"Not yet implemented\")\n");
 
             sb.append("    }\n\n");
         }

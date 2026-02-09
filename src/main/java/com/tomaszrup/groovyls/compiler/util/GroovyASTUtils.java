@@ -23,8 +23,10 @@ package com.tomaszrup.groovyls.compiler.util;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -142,10 +144,34 @@ public class GroovyASTUtils {
         if (definitionNode == null) {
             return Collections.emptyList();
         }
-        return ast.getNodes().stream().filter(otherNode -> {
-            ASTNode otherDefinition = getDefinition(otherNode, false, ast);
-            return definitionNode.equals(otherDefinition) && node.getLineNumber() != -1 && node.getColumnNumber() != -1;
-        }).collect(Collectors.toList());
+
+        // Use the lazily-built reference index (O(1) lookup) instead of
+        // scanning all AST nodes on every "Find References" request.
+        Map<ASTNode, List<ASTNode>> index = ast.getReferenceIndex();
+        if (index == null) {
+            index = buildReferenceIndex(ast);
+            ast.setReferenceIndex(index);
+        }
+        List<ASTNode> refs = index.get(definitionNode);
+        return refs != null ? refs : Collections.emptyList();
+    }
+
+    /**
+     * Builds a reverse index mapping each definition node to its list of
+     * referencing AST nodes. Called once per AST snapshot and cached.
+     */
+    private static Map<ASTNode, List<ASTNode>> buildReferenceIndex(ASTNodeVisitor ast) {
+        Map<ASTNode, List<ASTNode>> index = new HashMap<>();
+        for (ASTNode otherNode : ast.getNodes()) {
+            if (otherNode.getLineNumber() == -1 || otherNode.getColumnNumber() == -1) {
+                continue;
+            }
+            ASTNode def = getDefinition(otherNode, false, ast);
+            if (def != null) {
+                index.computeIfAbsent(def, k -> new ArrayList<>()).add(otherNode);
+            }
+        }
+        return index;
     }
 
     private static ClassNode tryToResolveOriginalClassNode(ClassNode node, boolean strict, ASTNodeVisitor ast) {
@@ -256,6 +282,7 @@ public class GroovyASTUtils {
                 }
                 i++;
             }
+            return result;
         }
         return Collections.emptyList();
     }
@@ -474,11 +501,9 @@ public class GroovyASTUtils {
             return new Range(new Position(0, 0), new Position(0, 0));
         }
         ASTNode afterNode = null;
-        if (afterNode == null) {
-            List<ImportNode> importNodes = moduleNode.getImports();
-            if (importNodes.size() > 0) {
-                afterNode = importNodes.get(importNodes.size() - 1);
-            }
+        List<ImportNode> importNodes = moduleNode.getImports();
+        if (importNodes.size() > 0) {
+            afterNode = importNodes.get(importNodes.size() - 1);
         }
         if (afterNode == null) {
             afterNode = moduleNode.getPackage();

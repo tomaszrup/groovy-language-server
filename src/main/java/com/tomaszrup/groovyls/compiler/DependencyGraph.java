@@ -69,7 +69,7 @@ public class DependencyGraph {
 	 * @param newDeps the set of source URIs that {@code file} depends on
 	 *                (imports, superclass references, interface references)
 	 */
-	public void updateDependencies(URI file, Set<URI> newDeps) {
+	public synchronized void updateDependencies(URI file, Set<URI> newDeps) {
 		Set<URI> oldDeps = dependsOn.getOrDefault(file, Collections.emptySet());
 
 		// Remove stale reverse edges
@@ -97,8 +97,9 @@ public class DependencyGraph {
 		if (newDeps.isEmpty()) {
 			dependsOn.remove(file);
 		} else {
-			dependsOn.put(file, ConcurrentHashMap.newKeySet());
-			dependsOn.get(file).addAll(newDeps);
+			Set<URI> newSet = ConcurrentHashMap.newKeySet();
+			newSet.addAll(newDeps);
+			dependsOn.put(file, newSet);
 		}
 	}
 
@@ -116,7 +117,7 @@ public class DependencyGraph {
 	 * @param changedFiles the set of files that were directly modified
 	 * @return the set of transitively affected dependent files
 	 */
-	public Set<URI> getTransitiveDependents(Set<URI> changedFiles) {
+	public synchronized Set<URI> getTransitiveDependents(Set<URI> changedFiles) {
 		Set<URI> visited = new HashSet<>(changedFiles);
 		Set<URI> result = new HashSet<>();
 		Queue<URI> queue = new ArrayDeque<>(changedFiles);
@@ -165,7 +166,7 @@ public class DependencyGraph {
 	 * @param maxDepth  maximum traversal depth
 	 * @return the set of dependency URIs (excluding the seed files themselves)
 	 */
-	public Set<URI> getTransitiveDependencies(Set<URI> seedFiles, int maxDepth) {
+	public synchronized Set<URI> getTransitiveDependencies(Set<URI> seedFiles, int maxDepth) {
 		Set<URI> visited = new HashSet<>(seedFiles);
 		Set<URI> result = new HashSet<>();
 		Queue<URI> queue = new ArrayDeque<>(seedFiles);
@@ -210,7 +211,7 @@ public class DependencyGraph {
 	 */
 	public Set<URI> getDirectDependents(URI file) {
 		Set<URI> deps = dependedOnBy.get(file);
-		return deps != null ? Collections.unmodifiableSet(deps) : Collections.emptySet();
+		return deps != null ? new HashSet<>(deps) : Collections.emptySet();
 	}
 
 	/**
@@ -222,7 +223,7 @@ public class DependencyGraph {
 	 */
 	public Set<URI> getDirectDependencies(URI file) {
 		Set<URI> deps = dependsOn.get(file);
-		return deps != null ? Collections.unmodifiableSet(deps) : Collections.emptySet();
+		return deps != null ? new HashSet<>(deps) : Collections.emptySet();
 	}
 
 	/**
@@ -231,7 +232,7 @@ public class DependencyGraph {
 	 *
 	 * @param file the URI of the removed/deleted file
 	 */
-	public void removeFile(URI file) {
+	public synchronized void removeFile(URI file) {
 		// Remove forward edges (file → its dependencies)
 		Set<URI> oldDeps = dependsOn.remove(file);
 		if (oldDeps != null) {
@@ -266,7 +267,7 @@ public class DependencyGraph {
 	 * is fully invalidated (e.g. classpath change) and will be rebuilt from
 	 * scratch.
 	 */
-	public void clear() {
+	public synchronized void clear() {
 		dependsOn.clear();
 		dependedOnBy.clear();
 	}

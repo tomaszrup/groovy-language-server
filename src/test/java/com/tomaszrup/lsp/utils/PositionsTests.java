@@ -75,13 +75,13 @@ class PositionsTests {
 
 	@Test
 	void testValidPositiveLineNegativeColumn() {
-		// valid() returns true if line >= 0 OR character >= 0
-		Assertions.assertTrue(Positions.valid(new Position(1, -1)));
+		// valid() returns true only if BOTH line >= 0 AND character >= 0
+		Assertions.assertFalse(Positions.valid(new Position(1, -1)));
 	}
 
 	@Test
 	void testValidNegativeLinePositiveColumn() {
-		Assertions.assertTrue(Positions.valid(new Position(-1, 1)));
+		Assertions.assertFalse(Positions.valid(new Position(-1, 1)));
 	}
 
 	@Test

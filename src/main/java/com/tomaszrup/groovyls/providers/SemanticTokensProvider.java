@@ -25,7 +25,9 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 
 import org.codehaus.groovy.ast.ASTNode;
@@ -111,6 +113,7 @@ public class SemanticTokensProvider {
 	private ASTNodeVisitor ast;
 	private FileContentsTracker fileContentsTracker;
 	private String[] sourceLines;
+	private Set<ClassNode> classNodeSet;
 
 	public SemanticTokensProvider(ASTNodeVisitor ast, FileContentsTracker fileContentsTracker) {
 		this.ast = ast;
@@ -131,6 +134,9 @@ public class SemanticTokensProvider {
 		// Load source lines for accurate name position lookup
 		String source = fileContentsTracker != null ? fileContentsTracker.getContents(uri) : null;
 		this.sourceLines = source != null ? source.split("\n", -1) : new String[0];
+
+		// Precompute set of declared classes for O(1) lookup
+		this.classNodeSet = new HashSet<>(ast.getClassNodes());
 
 		List<ASTNode> nodes = ast.getNodes(uri);
 		List<SemanticToken> tokens = new ArrayList<>();
@@ -675,12 +681,7 @@ public class SemanticTokensProvider {
 	 * declaration, as opposed to a type reference (e.g. in extends/implements).
 	 */
 	private boolean isClassDeclaration(ClassNode node) {
-		for (ClassNode cn : ast.getClassNodes()) {
-			if (cn == node) {
-				return true;
-			}
-		}
-		return false;
+		return classNodeSet != null && classNodeSet.contains(node);
 	}
 
 	/**

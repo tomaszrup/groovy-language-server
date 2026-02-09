@@ -2,7 +2,7 @@
   "name": "groovy-spock-support",
   "displayName": "Groovy & Spock Language Support",
   "description": "Language support for Groovy and Spock",
-  "version": "0.0.13",
+  "version": "0.0.15",
   "publisher": "TomaszRup",
   "homepage": "https://github.com/tomaszrup/groovy-language-server",
   "repository": {
@@ -77,6 +77,11 @@
       {
         "command": "groovy.restartServer",
         "title": "Restart Groovy language server",
+        "category": "Groovy"
+      },
+      {
+        "command": "groovy.showOutputChannel",
+        "title": "Show Output Channel",
         "category": "Groovy"
       }
     ],

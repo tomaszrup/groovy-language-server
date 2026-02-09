@@ -24,6 +24,8 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
+import com.tomaszrup.groovyls.util.FileContentsTracker;
+
 import org.codehaus.groovy.ast.ASTNode;
 import org.codehaus.groovy.ast.AnnotationNode;
 import org.codehaus.groovy.ast.ClassNode;
@@ -48,9 +50,11 @@ import com.tomaszrup.groovyls.util.GroovyLanguageServerUtils;
 public class AddOverrideAction {
 
     private ASTNodeVisitor ast;
+    private FileContentsTracker fileContentsTracker;
 
-    public AddOverrideAction(ASTNodeVisitor ast) {
+    public AddOverrideAction(ASTNodeVisitor ast, FileContentsTracker fileContentsTracker) {
         this.ast = ast;
+        this.fileContentsTracker = fileContentsTracker;
     }
 
     public List<CodeAction> provideCodeActions(CodeActionParams params) {
@@ -171,10 +175,30 @@ public class AddOverrideAction {
         int insertLine = methodRange.getStart().getLine();
         int insertCol = methodRange.getStart().getCharacter();
 
+        // Detect indentation character from the existing line
+        char indentChar = ' ';
+        if (fileContentsTracker != null) {
+            String contents = fileContentsTracker.getContents(uri);
+            if (contents != null) {
+                String[] lines = contents.split("\n", -1);
+                if (insertLine < lines.length) {
+                    String methodLine = lines[insertLine];
+                    for (int i = 0; i < methodLine.length(); i++) {
+                        if (methodLine.charAt(i) == '\t') {
+                            indentChar = '\t';
+                            break;
+                        } else if (methodLine.charAt(i) != ' ') {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         // Build indentation to match the method
         StringBuilder indent = new StringBuilder();
         for (int i = 0; i < insertCol; i++) {
-            indent.append(" ");
+            indent.append(indentChar);
         }
 
         String annotationText = indent.toString() + "@Override\n";

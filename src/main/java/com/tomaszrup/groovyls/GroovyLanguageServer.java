@@ -66,12 +66,13 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
 
             try (ServerSocket serverSocket = new ServerSocket(port)) {
                 logger.info("Groovy Language Server listening on port {}", port);
-                Socket socket = serverSocket.accept();
-                logger.info("Client connected.");
+                try (Socket socket = serverSocket.accept()) {
+                    logger.info("Client connected.");
 
-                InputStream in = socket.getInputStream();
-                OutputStream out = socket.getOutputStream();
-                startServer(in, out);
+                    InputStream in = socket.getInputStream();
+                    OutputStream out = socket.getOutputStream();
+                    startServer(in, out);
+                }
             }
         } else {
             logger.info("Groovy Language Server starting in stdio mode.");

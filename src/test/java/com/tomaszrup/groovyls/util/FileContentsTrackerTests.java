@@ -21,6 +21,8 @@
 package com.tomaszrup.groovyls.util;
 
 import java.net.URI;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.Collections;
 import java.util.Set;
 
@@ -264,5 +266,69 @@ class FileContentsTrackerTests {
 		// Should return null for a file that doesn't exist on disk and isn't open
 		String contents = tracker.getContents(uri);
 		Assertions.assertNull(contents);
+	}
+
+	// ------------------------------------------------------------------
+	// hasChangedURIsUnder
+	// ------------------------------------------------------------------
+
+	private static final Path TEST_ROOT;
+	static {
+		// Use a temp-dir-based root so paths are absolute and platform-safe
+		TEST_ROOT = Paths.get(System.getProperty("java.io.tmpdir")).resolve("groovyls-test");
+	}
+
+	@Test
+	void testHasChangedURIsUnderReturnsFalseWhenEmpty() {
+		Path root = TEST_ROOT.resolve("project");
+		Assertions.assertFalse(tracker.hasChangedURIsUnder(root));
+	}
+
+	@Test
+	void testHasChangedURIsUnderReturnsTrueForMatchingRoot() {
+		Path root = TEST_ROOT.resolve("project");
+		URI uri = root.resolve("src/Main.groovy").toUri();
+		tracker.forceChanged(uri);
+		Assertions.assertTrue(tracker.hasChangedURIsUnder(root));
+	}
+
+	@Test
+	void testHasChangedURIsUnderReturnsFalseForDifferentRoot() {
+		Path rootA = TEST_ROOT.resolve("project-a");
+		URI uri = TEST_ROOT.resolve("project-b/src/Main.groovy").toUri();
+		tracker.forceChanged(uri);
+		Assertions.assertFalse(tracker.hasChangedURIsUnder(rootA));
+	}
+
+	@Test
+	void testHasChangedURIsUnderWithNullRootChecksAny() {
+		URI uri = TEST_ROOT.resolve("anywhere/file.groovy").toUri();
+		tracker.forceChanged(uri);
+		Assertions.assertTrue(tracker.hasChangedURIsUnder(null));
+	}
+
+	@Test
+	void testHasChangedURIsUnderWithNullRootReturnsFalseWhenEmpty() {
+		Assertions.assertFalse(tracker.hasChangedURIsUnder(null));
+	}
+
+	@Test
+	void testHasChangedURIsUnderMultipleProjectsOnlyMatchesCorrectOne() {
+		Path rootA = TEST_ROOT.resolve("project-a");
+		Path rootB = TEST_ROOT.resolve("project-b");
+		URI uriB = rootB.resolve("src/Main.groovy").toUri();
+		tracker.forceChanged(uriB);
+		Assertions.assertFalse(tracker.hasChangedURIsUnder(rootA));
+		Assertions.assertTrue(tracker.hasChangedURIsUnder(rootB));
+	}
+
+	@Test
+	void testHasChangedURIsUnderAfterResetReturnsFalse() {
+		Path root = TEST_ROOT.resolve("project");
+		URI uri = root.resolve("src/Main.groovy").toUri();
+		tracker.forceChanged(uri);
+		Assertions.assertTrue(tracker.hasChangedURIsUnder(root));
+		tracker.resetChangedFiles();
+		Assertions.assertFalse(tracker.hasChangedURIsUnder(root));
 	}
 }

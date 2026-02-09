@@ -43,29 +43,6 @@ public class GroovydocUtils {
 		String currentTagType = null;
 
 		int n = lines.length;
-		if (n == 1) {
-			// strip end of groovydoc comment
-			int c = lines[0].indexOf("*/");
-			if (c != -1) {
-				lines[0] = lines[0].substring(0, c);
-			}
-		}
-		// strip start of groovydoc comment
-		String firstLine = lines[0];
-		int lengthToRemove = Math.min(firstLine.length(), 3);
-		firstLine = firstLine.substring(lengthToRemove);
-		processGroovydocLine(firstLine, descriptionBuilder, paramDocs, throwsDocs, seeDocs,
-				new String[]{currentTagType}, new StringBuilder[]{currentTagContent});
-		// Re-read state from array wrappers
-		currentTagType = null;
-		currentTagContent = null;
-
-		// Actually process all lines with proper state tracking
-		descriptionBuilder = new StringBuilder();
-		paramDocs = new ArrayList<>();
-		throwsDocs = new ArrayList<>();
-		seeDocs = new ArrayList<>();
-		returnDocs = new ArrayList<>();
 
 		for (int i = 0; i < n; i++) {
 			String line = lines[i];

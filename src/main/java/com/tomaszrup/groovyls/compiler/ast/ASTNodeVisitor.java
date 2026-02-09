@@ -29,8 +29,8 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.Stack;
-import java.util.stream.Collectors;
+import java.util.ArrayDeque;
+import java.util.Deque;
 
 import org.codehaus.groovy.ast.ASTNode;
 import org.codehaus.groovy.ast.AnnotatedNode;
@@ -114,14 +114,17 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		@Override
 		public boolean equals(Object o) {
 			// some ASTNode subclasses, like ClassNode, override equals() with
-			// comparisons that are not strict. we need strict.
+			// comparisons that are not strict. we need strict identity.
+			if (this == o) return true;
+			if (!(o instanceof ASTLookupKey)) return false;
 			ASTLookupKey other = (ASTLookupKey) o;
 			return node == other.node;
 		}
 
 		@Override
 		public int hashCode() {
-			return node.hashCode();
+			// Use identity hash to match the identity semantics of equals()
+			return System.identityHashCode(node);
 		}
 	}
 
@@ -137,7 +140,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		return sourceUnit;
 	}
 
-	private Stack<ASTNode> stack = new Stack<>();
+	private Deque<ASTNode> stack = new ArrayDeque<>();
 	private Map<URI, List<ASTNode>> nodesByURI = new HashMap<>();
 	private Map<URI, List<ClassNode>> classNodesByURI = new HashMap<>();
 	private Map<String, ClassNode> classNodesByName = new HashMap<>();
@@ -149,6 +152,30 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 	 * the inter-file dependency graph for incremental compilation.
 	 */
 	private Map<URI, Set<String>> dependenciesByURI = new HashMap<>();
+
+	/**
+	 * Lazily-built reverse index: definition node → list of referencing nodes.
+	 * Built on first {@link #getReferenceIndex()} call after each compilation,
+	 * automatically invalidated when the visitor is replaced (copy-on-write).
+	 */
+	private volatile Map<ASTNode, List<ASTNode>> referenceIndex;
+
+	/**
+	 * Returns the lazily-built reference index, or {@code null} if it hasn't
+	 * been built yet. Callers should use
+	 * {@link #setReferenceIndex(Map)} to store a freshly built index.
+	 */
+	public Map<ASTNode, List<ASTNode>> getReferenceIndex() {
+		return referenceIndex;
+	}
+
+	/**
+	 * Stores a pre-built reference index. The index maps each definition
+	 * node to the list of AST nodes that reference it.
+	 */
+	public void setReferenceIndex(Map<ASTNode, List<ASTNode>> index) {
+		this.referenceIndex = index;
+	}
 
 	private void pushASTNode(ASTNode node) {
 		boolean isSynthetic = false;
@@ -162,17 +189,17 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 
 			ASTNodeLookupData data = new ASTNodeLookupData();
 			data.uri = uri;
-			if (stack.size() > 0) {
-				data.parent = stack.lastElement();
+			if (!stack.isEmpty()) {
+				data.parent = stack.peekLast();
 			}
 			lookup.put(new ASTLookupKey(node), data);
 		}
 
-		stack.add(node);
+		stack.addLast(node);
 	}
 
 	private void popASTNode() {
-		stack.pop();
+		stack.removeLast();
 	}
 
 	public List<ClassNode> getClassNodes() {
@@ -220,56 +247,53 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 
 	public ASTNode getNodeAtLineAndColumn(URI uri, int line, int column) {
 		Position position = new Position(line, column);
-		Map<ASTNode, Range> nodeToRange = new HashMap<>();
 		List<ASTNode> nodes = nodesByURI.get(uri);
 		if (nodes == null) {
 			return null;
 		}
-		List<ASTNode> foundNodes = nodes.stream().filter(node -> {
+
+		ASTNode best = null;
+		Range bestRange = null;
+
+		for (ASTNode node : nodes) {
 			if (node.getLineNumber() == -1) {
-				// can't be the offset node if it has no position
-				// also, do this first because it's the fastest comparison
-				return false;
+				continue;
 			}
 			Range range = GroovyLanguageServerUtils.astNodeToRange(node);
-			if (range == null) {
-				return false;
+			if (range == null || !Ranges.contains(range, position)) {
+				continue;
 			}
-			boolean result = Ranges.contains(range, position);
-			if (result) {
-				// save the range object to avoid creating it again when we
-				// sort the nodes
-				nodeToRange.put(node, range);
+
+			if (best == null) {
+				best = node;
+				bestRange = range;
+				continue;
 			}
-			return result;
-		}).sorted((n1, n2) -> {
-			int result = Positions.COMPARATOR.reversed().compare(nodeToRange.get(n1).getStart(),
-					nodeToRange.get(n2).getStart());
-			if (result != 0) {
-				return result;
-			}
-			result = Positions.COMPARATOR.compare(nodeToRange.get(n1).getEnd(), nodeToRange.get(n2).getEnd());
-			if (result != 0) {
-				return result;
-			}
-			// n1 and n2 have the same range
-			if (contains(n1, n2)) {
-				if (n1 instanceof ClassNode && n2 instanceof ConstructorNode) {
-					return -1;
+
+			// Prefer later start (more specific/inner node)
+			int startCmp = Positions.COMPARATOR.compare(range.getStart(), bestRange.getStart());
+			if (startCmp > 0) {
+				best = node;
+				bestRange = range;
+			} else if (startCmp == 0) {
+				// Same start — prefer earlier end (tighter range)
+				int endCmp = Positions.COMPARATOR.compare(range.getEnd(), bestRange.getEnd());
+				if (endCmp < 0) {
+					best = node;
+					bestRange = range;
+				} else if (endCmp == 0) {
+					// Identical range — prefer child over parent
+					// Exception: ClassNode vs ConstructorNode — keep ClassNode
+					if (contains(best, node)
+							&& !(best instanceof ClassNode && node instanceof ConstructorNode)) {
+						best = node;
+						bestRange = range;
+					}
 				}
-				return 1;
-			} else if (contains(n2, n1)) {
-				if (n2 instanceof ClassNode && n1 instanceof ConstructorNode) {
-					return 1;
-				}
-				return -1;
 			}
-			return 0;
-		}).collect(Collectors.toList());
-		if (foundNodes.size() == 0) {
-			return null;
 		}
-		return foundNodes.get(0);
+
+		return best;
 	}
 
 	public ASTNode getParent(ASTNode child) {
@@ -358,22 +382,21 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 				: new HashSet<>(excludedURIs);
 
 		// Share list/set references for non-excluded URIs (shallow copy).
-		// This is safe because the list/set values for non-excluded URIs are
-		// never mutated — visitSourceUnit() creates new containers only for
-		// the URIs being re-visited (which are the excluded ones).
+		// Wrapped in unmodifiable views to prevent accidental mutation — the
+		// original visitor may still be held by other threads.
 		for (Map.Entry<URI, List<ASTNode>> entry : nodesByURI.entrySet()) {
 			if (!excluded.contains(entry.getKey())) {
-				copy.nodesByURI.put(entry.getKey(), entry.getValue());
+				copy.nodesByURI.put(entry.getKey(), Collections.unmodifiableList(entry.getValue()));
 			}
 		}
 		for (Map.Entry<URI, List<ClassNode>> entry : classNodesByURI.entrySet()) {
 			if (!excluded.contains(entry.getKey())) {
-				copy.classNodesByURI.put(entry.getKey(), entry.getValue());
+				copy.classNodesByURI.put(entry.getKey(), Collections.unmodifiableList(entry.getValue()));
 			}
 		}
 		for (Map.Entry<URI, Set<String>> entry : dependenciesByURI.entrySet()) {
 			if (!excluded.contains(entry.getKey())) {
-				copy.dependenciesByURI.put(entry.getKey(), entry.getValue());
+				copy.dependenciesByURI.put(entry.getKey(), Collections.unmodifiableSet(entry.getValue()));
 			}
 		}
 

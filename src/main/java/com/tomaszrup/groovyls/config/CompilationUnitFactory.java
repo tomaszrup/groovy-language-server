@@ -104,6 +104,13 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 		resolvedClasspathCache = null;
 		compilationUnit = null;
 		config = null;
+		if (classLoader != null) {
+			try {
+				classLoader.close();
+			} catch (IOException e) {
+				logger.debug("Failed to close old GroovyClassLoader", e);
+			}
+		}
 		classLoader = null;
 	}
 
@@ -304,20 +311,22 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 			if (Files.exists(dirPath)) {
 				logger.info("Building file cache for .groovy sources: {}", dirPath);
 				logger.info("  excludedSubRoots: {}", excludedSubRoots);
-				Files.walk(dirPath).forEach((filePath) -> {
-					if (!filePath.toString().endsWith(FILE_EXTENSION_GROOVY)) {
-						return;
-					}
-					if (isInsideExcludedDirectory(filePath, dirPath)) {
-						logger.debug("  Excluded (dir): {}", filePath);
-						return;
-					}
-					if (isInsideExcludedSubRoot(filePath)) {
-						logger.info("  Excluded (subproject): {}", filePath);
-						return;
-					}
-					cachedGroovyFiles.add(filePath);
-				});
+				try (java.util.stream.Stream<Path> stream = Files.walk(dirPath)) {
+					stream.forEach((filePath) -> {
+						if (!filePath.toString().endsWith(FILE_EXTENSION_GROOVY)) {
+							return;
+						}
+						if (isInsideExcludedDirectory(filePath, dirPath)) {
+							logger.debug("  Excluded (dir): {}", filePath);
+							return;
+						}
+						if (isInsideExcludedSubRoot(filePath)) {
+							logger.info("  Excluded (subproject): {}", filePath);
+							return;
+						}
+						cachedGroovyFiles.add(filePath);
+					});
+				}
 				logger.info("File cache built: {} .groovy files", cachedGroovyFiles.size());
 			}
 		} catch (IOException e) {

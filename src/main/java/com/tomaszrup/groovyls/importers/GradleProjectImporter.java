@@ -499,8 +499,16 @@ public class GradleProjectImporter implements ProjectImporter {
 
             @Override
             public void write(byte[] bytes, int off, int len) {
+                int start = off;
                 for (int i = off; i < off + len; i++) {
-                    write(bytes[i]);
+                    if (bytes[i] == '\n') {
+                        buffer.write(bytes, start, i - start);
+                        flush();
+                        start = i + 1;
+                    }
+                }
+                if (start < off + len) {
+                    buffer.write(bytes, start, off + len - start);
                 }
             }
 

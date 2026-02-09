@@ -146,7 +146,7 @@ public class CompilationOrchestrator {
 			scanResultHolder[0] = null;
 		}
 
-		return compilationUnit != null && compilationUnit.equals(oldCompilationUnit);
+		return compilationUnit != null && compilationUnit == oldCompilationUnit;
 	}
 
 	/**
@@ -156,7 +156,7 @@ public class CompilationOrchestrator {
 	 */
 	private void updateClassGraphScan(GroovyClassLoader newClassLoader,
 			ScanResult[] scanResultHolder, GroovyClassLoader[] classLoaderHolder) {
-		if (newClassLoader.equals(classLoaderHolder[0])) {
+		if (newClassLoader == classLoaderHolder[0]) {
 			return;
 		}
 		classLoaderHolder[0] = newClassLoader;

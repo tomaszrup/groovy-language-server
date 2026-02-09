@@ -243,8 +243,11 @@ public class FormattingProvider {
 				result.append("\n");
 			}
 
-			// Update braceDepth based on code-only braces
-			braceDepth += countNetBraces(line, charStates, lineStart);
+			// Update braceDepth based on code-only braces.
+			// Use trimmedLine (pre-indentation) with the original offset of the
+			// trimmed content so that character positions align with charStates.
+			int trimOffset = findFirstNonWhitespace(charStates, lineStart);
+			braceDepth += countNetBraces(trimmedLine, charStates, trimOffset);
 			if (braceDepth < 0) {
 				braceDepth = 0;
 			}
@@ -506,16 +509,21 @@ public class FormattingProvider {
 		// Since we're working with the trimmed line, find the first non-ws position.
 		int origOffset = findFirstNonWhitespace(charStates, lineStartOffset);
 		int stateIdx = origOffset;
+		// Track how many characters we've inserted (e.g. spaces after commas)
+		// so that stateIdx stays aligned with the original charStates array.
+		int offsetDelta = 0;
 
 		for (int i = 0; i < line.length(); i++) {
 			char c = line.charAt(i);
-			LexState charState = (stateIdx < charStates.length) ? charStates[stateIdx] : LexState.CODE;
+			int mappedIdx = stateIdx - offsetDelta;
+			LexState charState = (mappedIdx >= 0 && mappedIdx < charStates.length) ? charStates[mappedIdx] : LexState.CODE;
 
 			if (c == ',' && charState == LexState.CODE) {
 				sb.append(c);
 				if (i + 1 < line.length() && line.charAt(i + 1) != ' '
 						&& line.charAt(i + 1) != '\t' && line.charAt(i + 1) != '\n') {
 					sb.append(' ');
+					offsetDelta++;
 				}
 			} else {
 				sb.append(c);

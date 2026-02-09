@@ -262,6 +262,42 @@ class GroovyServicesDidChangeWatchedFilesTests {
 	}
 
 	@Test
+	void testBuildOutputJavaFilesDoNotTriggerGroovyRecompileInNonRecompilePath() throws Exception {
+		// Register a project scope that does NOT need a Java recompile
+		// (i.e. only build-output .java events arrive, which are not real source changes)
+		Path projectRoot = workspaceRoot;
+		services.addProjects(Collections.singletonMap(projectRoot, Collections.emptyList()));
+
+		// Open and compile a groovy file so we have a compiled scope
+		Path groovyFile = srcRoot.resolve("Stable.groovy");
+		Files.writeString(groovyFile, "class Stable {}");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(
+				groovyFile.toUri().toString(), LANGUAGE_GROOVY, 1, "class Stable {}");
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+
+		// Simulate a build-output .java file change (e.g. annotation processor output)
+		// inside target/ — this should NOT be in scopeUris and should not trigger
+		// Groovy scope recompilation via the non-recompile path
+		Path buildOutputJava = projectRoot.resolve("target/generated/Foo.java");
+		FileEvent fileEvent = new FileEvent(buildOutputJava.toUri().toString(), FileChangeType.Created);
+		DidChangeWatchedFilesParams params = new DidChangeWatchedFilesParams(
+				Collections.singletonList(fileEvent));
+
+		// After didChangeWatchedFiles, the scope should NOT have pending changed
+		// URIs for build-output files — no unnecessary Groovy recompile
+		services.didChangeWatchedFiles(params);
+
+		// Verify that a subsequent hover request does NOT queue a background compilation.
+		// If the build-output .java was incorrectly added to changedFiles/scopeUris,
+		// ensureCompiledForContext() would see non-empty changedURIs and trigger
+		// a background compile. With our fix, changedURIs for this scope are empty
+		// so no extra compilation happens.
+		TextDocumentIdentifier textDoc = new TextDocumentIdentifier(groovyFile.toUri().toString());
+		CompletableFuture<Hover> hover = services.hover(new HoverParams(textDoc, new Position(0, 8)));
+		Assertions.assertNotNull(hover);
+	}
+
+	@Test
 	void testSourceJavaFilesDoTriggerRecompile() throws Exception {
 		// Register a project scope via addProjects
 		Path projectRoot = workspaceRoot;

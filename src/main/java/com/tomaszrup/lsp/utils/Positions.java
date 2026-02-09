@@ -36,7 +36,7 @@ public class Positions {
 	};
 
 	public static boolean valid(Position p) {
-		return p.getLine() >= 0 || p.getCharacter() >= 0;
+		return p.getLine() >= 0 && p.getCharacter() >= 0;
 	}
 
 	public static int getOffset(String string, Position position) {
@@ -44,8 +44,7 @@ public class Positions {
 		int character = position.getCharacter();
 		int currentIndex = 0;
 		if (line > 0) {
-			BufferedReader reader = new BufferedReader(new StringReader(string));
-			try {
+			try (BufferedReader reader = new BufferedReader(new StringReader(string))) {
 				int readLines = 0;
 				while (true) {
 					int readChar = reader.read();
@@ -62,10 +61,6 @@ public class Positions {
 				}
 			} catch (IOException e) {
 				return -1;
-			}
-			try {
-				reader.close();
-			} catch (IOException e) {
 			}
 		}
 		return currentIndex + character;

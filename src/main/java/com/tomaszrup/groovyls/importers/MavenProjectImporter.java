@@ -350,7 +350,10 @@ public class MavenProjectImporter implements ProjectImporter {
      */
     private String findMavenWrapper(Path startDir) {
         Path dir = startDir;
-        while (dir != null) {
+        // Limit traversal to prevent walking past the workspace root into system dirs
+        int maxDepth = 10;
+        int depth = 0;
+        while (dir != null && depth < maxDepth) {
             Path wrapper = dir.resolve(isWindows() ? "mvnw.cmd" : "mvnw");
             if (Files.isRegularFile(wrapper)) {
                 return wrapper.toAbsolutePath().toString();
@@ -363,6 +366,7 @@ public class MavenProjectImporter implements ProjectImporter {
                 }
             }
             dir = dir.getParent();
+            depth++;
         }
         return null;
     }

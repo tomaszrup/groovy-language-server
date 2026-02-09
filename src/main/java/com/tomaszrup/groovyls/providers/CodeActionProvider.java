@@ -120,7 +120,7 @@ public class CodeActionProvider {
 		}
 
 		// Add @Override
-		AddOverrideAction addOverrideAction = new AddOverrideAction(ast);
+		AddOverrideAction addOverrideAction = new AddOverrideAction(ast, fileContentsTracker);
 		for (CodeAction action : addOverrideAction.provideCodeActions(params)) {
 			codeActions.add(Either.forRight(action));
 		}
@@ -217,20 +217,38 @@ public class CodeActionProvider {
 	 * Creates a QuickFix to remove all unused imports at once.
 	 */
 	private CodeAction createRemoveAllUnusedImportsAction(URI uri, List<Diagnostic> diagnostics) {
-		List<TextEdit> edits = new ArrayList<>();
+		List<int[]> ranges = new ArrayList<>();
 		for (Diagnostic diagnostic : diagnostics) {
 			Range range = diagnostic.getRange();
 			if (range == null) {
 				continue;
 			}
-			edits.add(new TextEdit(
-					new Range(new Position(range.getStart().getLine(), 0),
-							new Position(range.getEnd().getLine() + 1, 0)),
-					""));
+			ranges.add(new int[] { range.getStart().getLine(), range.getEnd().getLine() + 1 });
 		}
 
-		if (edits.isEmpty()) {
+		if (ranges.isEmpty()) {
 			return null;
+		}
+
+		// Sort by start line and merge overlapping/adjacent ranges
+		ranges.sort((a, b) -> Integer.compare(a[0], b[0]));
+		List<int[]> merged = new ArrayList<>();
+		merged.add(ranges.get(0));
+		for (int i = 1; i < ranges.size(); i++) {
+			int[] last = merged.get(merged.size() - 1);
+			int[] cur = ranges.get(i);
+			if (cur[0] <= last[1]) {
+				last[1] = Math.max(last[1], cur[1]);
+			} else {
+				merged.add(cur);
+			}
+		}
+
+		List<TextEdit> edits = new ArrayList<>();
+		for (int[] r : merged) {
+			edits.add(new TextEdit(
+					new Range(new Position(r[0], 0), new Position(r[1], 0)),
+					""));
 		}
 
 		WorkspaceEdit workspaceEdit = new WorkspaceEdit();

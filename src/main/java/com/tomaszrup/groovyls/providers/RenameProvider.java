@@ -307,12 +307,12 @@ public class RenameProvider {
 		// need to find it manually
 		String className = classNode.getNameWithoutPackage();
 		int dollarIndex = className.indexOf('$');
-		if (dollarIndex != 01) {
+		if (dollarIndex != -1) {
 			// it's an inner class, so remove the outer name prefix
 			className = className.substring(dollarIndex + 1);
 		}
 
-		Pattern classPattern = Pattern.compile("(class\\s+)" + className + "\\b");
+		Pattern classPattern = Pattern.compile("(class\\s+)" + Pattern.quote(className) + "\\b");
 		Matcher classMatcher = classPattern.matcher(text);
 		if (!classMatcher.find()) {
 			// couldn't find the name!
@@ -334,7 +334,7 @@ public class RenameProvider {
 	private TextEdit createTextEditToRenameMethodNode(MethodNode methodNode, String newName, String text, Range range) {
 		// the AST doesn't give us access to the name location, so we
 		// need to find it manually
-		Pattern methodPattern = Pattern.compile("\\b" + methodNode.getName() + "\\b(?=\\s*\\()");
+		Pattern methodPattern = Pattern.compile("\\b" + Pattern.quote(methodNode.getName()) + "\\b(?=\\s*\\()");
 		Matcher methodMatcher = methodPattern.matcher(text);
 		if (!methodMatcher.find()) {
 			// couldn't find the name!
@@ -356,7 +356,7 @@ public class RenameProvider {
 			Range range) {
 		// the AST doesn't give us access to the name location, so we
 		// need to find it manually
-		Pattern propPattern = Pattern.compile("\\b" + propNode.getName() + "\\b");
+		Pattern propPattern = Pattern.compile("\\b" + Pattern.quote(propNode.getName()) + "\\b");
 		Matcher propMatcher = propPattern.matcher(text);
 		if (!propMatcher.find()) {
 			// couldn't find the name!
