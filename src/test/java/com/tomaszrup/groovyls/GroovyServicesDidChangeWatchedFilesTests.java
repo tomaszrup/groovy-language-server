@@ -23,6 +23,8 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import org.eclipse.lsp4j.*;
 import org.eclipse.lsp4j.jsonrpc.messages.Either;
@@ -202,6 +204,94 @@ class GroovyServicesDidChangeWatchedFilesTests {
 		// Should handle multiple events without error
 	}
 
+	@Test
+	void testIsBuildOutputFileDetectsGradleBuildDir() {
+		Path projectRoot = Paths.get("/project");
+		Assertions.assertTrue(GroovyServices.isBuildOutputFile(
+				projectRoot.resolve("build/generated/sources/Foo.java"), projectRoot));
+		Assertions.assertTrue(GroovyServices.isBuildOutputFile(
+				projectRoot.resolve("build/classes/java/main/Foo.class"), projectRoot));
+	}
+
+	@Test
+	void testIsBuildOutputFileDetectsMavenTargetDir() {
+		Path projectRoot = Paths.get("/project");
+		Assertions.assertTrue(GroovyServices.isBuildOutputFile(
+				projectRoot.resolve("target/generated-sources/Foo.java"), projectRoot));
+	}
+
+	@Test
+	void testIsBuildOutputFileAllowsSrcFiles() {
+		Path projectRoot = Paths.get("/project");
+		Assertions.assertFalse(GroovyServices.isBuildOutputFile(
+				projectRoot.resolve("src/main/java/Foo.java"), projectRoot));
+		Assertions.assertFalse(GroovyServices.isBuildOutputFile(
+				projectRoot.resolve("lib/Foo.java"), projectRoot));
+	}
+
+	@Test
+	void testBuildOutputJavaFilesDoNotTriggerRecompile() throws Exception {
+		// Register a project scope via addProjects
+		Path projectRoot = workspaceRoot;
+		services.addProjects(Collections.singletonMap(projectRoot, Collections.emptyList()));
+
+		// Open a groovy file to establish a compiled scope
+		Path groovyFile = srcRoot.resolve("BuildOutput.groovy");
+		Files.writeString(groovyFile, "class BuildOutput {}");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(
+				groovyFile.toUri().toString(), LANGUAGE_GROOVY, 1, "class BuildOutput {}");
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+
+		final boolean[] listenerCalled = { false };
+		services.setJavaChangeListener(root -> {
+			listenerCalled[0] = true;
+		});
+
+		// Simulate a .java file change inside build/generated/ (annotation processor output)
+		Path generatedJavaFile = projectRoot.resolve("build/generated/sources/annotationProcessor/Foo.java");
+		FileEvent fileEvent = new FileEvent(generatedJavaFile.toUri().toString(), FileChangeType.Created);
+		DidChangeWatchedFilesParams params = new DidChangeWatchedFilesParams(
+				Collections.singletonList(fileEvent));
+		services.didChangeWatchedFiles(params);
+
+		// Wait a bit to ensure the debounce doesn't fire
+		Thread.sleep(500);
+
+		Assertions.assertFalse(listenerCalled[0],
+				"Java change listener should NOT fire for build-output .java files");
+	}
+
+	@Test
+	void testSourceJavaFilesDoTriggerRecompile() throws Exception {
+		// Register a project scope via addProjects
+		Path projectRoot = workspaceRoot;
+		services.addProjects(Collections.singletonMap(projectRoot, Collections.emptyList()));
+
+		// Open a groovy file to establish a compiled scope
+		Path groovyFile = srcRoot.resolve("SourceJava.groovy");
+		Files.writeString(groovyFile, "class SourceJava {}");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(
+				groovyFile.toUri().toString(), LANGUAGE_GROOVY, 1, "class SourceJava {}");
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+
+		CountDownLatch latch = new CountDownLatch(1);
+		services.setJavaChangeListener(root -> {
+			latch.countDown();
+		});
+
+		// Simulate a .java file change inside src/ (real source file)
+		Path sourceJavaFile = projectRoot.resolve("src/main/java/Bar.java");
+		FileEvent fileEvent = new FileEvent(sourceJavaFile.toUri().toString(), FileChangeType.Changed);
+		DidChangeWatchedFilesParams params = new DidChangeWatchedFilesParams(
+				Collections.singletonList(fileEvent));
+		services.didChangeWatchedFiles(params);
+
+		// The listener should fire (after the debounce delay)
+		boolean fired = latch.await(5, TimeUnit.SECONDS);
+		Assertions.assertTrue(fired,
+				"Java change listener should fire for source .java files");
+	}
+
 	// --- Stub ---
 
 	private static class StubLanguageClient implements LanguageClient {
@@ -224,6 +314,11 @@ class GroovyServicesDidChangeWatchedFilesTests {
 
 		@Override
 		public void logMessage(MessageParams message) {
+		}
+
+		@Override
+		public CompletableFuture<Void> refreshSemanticTokens() {
+			return CompletableFuture.completedFuture(null);
 		}
 	}
 }

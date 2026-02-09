@@ -33,6 +33,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -94,6 +95,18 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	/** Debounce delay for didChange recompilation (milliseconds). */
 	private static final long DEBOUNCE_DELAY_MS = 300;
 
+	/** Debounce delay for Java/build-file recompile triggers (milliseconds). */
+	private static final long JAVA_RECOMPILE_DEBOUNCE_MS = 2000;
+
+	/**
+	 * Common build output directory names.  {@code .java} files under these
+	 * directories (relative to a project root) are ignored when deciding
+	 * whether to trigger a Java recompile, preventing feedback loops with
+	 * annotation processors and source generators.
+	 */
+	private static final Set<String> BUILD_OUTPUT_DIRS = Set.of(
+			"build", "target", ".gradle", "out", "bin");
+
 	/**
 	 * Maximum number of simultaneously changed files for which incremental
 	 * compilation is attempted instead of falling back to full compilation.
@@ -153,6 +166,14 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		 */
 		volatile boolean compiled = false;
 
+		/**
+		 * Whether this scope's classpath has been resolved (dependency JARs
+		 * are known). Scopes registered via {@code registerDiscoveredProjects}
+		 * start with empty classpaths ({@code classpathResolved = false}) and
+		 * are upgraded later via {@code updateProjectClasspaths}.
+		 */
+		volatile boolean classpathResolved = false;
+
 		ProjectScope(Path projectRoot, ICompilationUnitFactory factory) {
 			this.projectRoot = projectRoot;
 			this.compilationUnitFactory = factory;
@@ -179,6 +200,19 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		return t;
 	});
 	private volatile ScheduledFuture<?> pendingDebounce;
+
+	/**
+	 * Executor for debounced Java/build-file recompile scheduling.
+	 * Uses a single thread so that per-project recompiles are serialised.
+	 */
+	private final ScheduledExecutorService javaRecompileExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+		Thread t = new Thread(r, "groovyls-java-recompile");
+		t.setDaemon(true);
+		return t;
+	});
+
+	/** Per-project debounce futures for Java/build-file recompiles. */
+	private final ConcurrentHashMap<Path, ScheduledFuture<?>> pendingJavaRecompiles = new ConcurrentHashMap<>();
 
 	/**
 	 * Single-threaded executor for background compilations triggered by
@@ -275,6 +309,110 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	}
 
 	/**
+	 * Register discovered project roots immediately, <b>before</b> classpath
+	 * resolution.  Each scope is created with an empty classpath and
+	 * {@code classpathResolved = false}.  This allows
+	 * {@link #findProjectScope(URI)} to work right away so that didOpen can
+	 * compile open files with basic syntax while the heavy classpath
+	 * resolution runs in the background.
+	 *
+	 * <p>Call {@link #updateProjectClasspaths(Map)} once classpath resolution
+	 * completes to upgrade scopes with their full classpath.</p>
+	 *
+	 * @param projectRoots all discovered project root paths
+	 */
+	public void registerDiscoveredProjects(List<Path> projectRoots) {
+		synchronized (scopesMutationLock) {
+			logger.info("registerDiscoveredProjects called with {} projects", projectRoots.size());
+
+			List<ProjectScope> newScopes = new ArrayList<>();
+			for (Path projectRoot : projectRoots) {
+				CompilationUnitFactory factory = new CompilationUnitFactory();
+
+				// Compute nested project roots that this project should NOT scan
+				List<Path> excludedRoots = new ArrayList<>();
+				for (Path other : projectRoots) {
+					if (!other.equals(projectRoot) && other.startsWith(projectRoot)) {
+						excludedRoots.add(other);
+					}
+				}
+				factory.setExcludedSubRoots(excludedRoots);
+				// Note: no classpath set yet — classpathResolved stays false
+
+				newScopes.add(new ProjectScope(projectRoot, factory));
+			}
+
+			// Sort scopes by path length descending for longest-prefix-first matching
+			newScopes.sort((a, b) -> b.projectRoot.toString().length() - a.projectRoot.toString().length());
+
+			// Publish the immutable list atomically (volatile write)
+			projectScopes = Collections.unmodifiableList(newScopes);
+		}
+
+		// Clear stale diagnostics from the default scope.
+		clearDefaultScopeDiagnostics();
+	}
+
+	/**
+	 * Update existing project scopes with their resolved classpaths.
+	 * Called after background classpath resolution completes.  Scopes that
+	 * were already compiled (with an empty classpath) are recompiled with
+	 * the full classpath so that diagnostics and completions reflect all
+	 * dependency types.
+	 *
+	 * @param projectClasspaths map from project root to classpath entries
+	 */
+	public void updateProjectClasspaths(Map<Path, List<String>> projectClasspaths) {
+		logger.info("updateProjectClasspaths called with {} projects", projectClasspaths.size());
+		List<ProjectScope> scopes = projectScopes;
+
+		for (ProjectScope scope : scopes) {
+			List<String> classpath = projectClasspaths.get(scope.projectRoot);
+			if (classpath != null) {
+				scope.lock.writeLock().lock();
+				try {
+					((CompilationUnitFactory) scope.compilationUnitFactory)
+							.setAdditionalClasspathList(classpath);
+					scope.classpathResolved = true;
+
+					// If the scope was already compiled with an empty classpath,
+					// force a fresh compilation with the real classpath.
+					if (scope.compiled) {
+						logger.info("Forcing recompilation of {} with resolved classpath",
+								scope.projectRoot);
+						scope.compiled = false;
+						scope.compilationUnit = null;
+						scope.astVisitor = null;
+					}
+				} finally {
+					scope.lock.writeLock().unlock();
+				}
+			}
+		}
+
+		// Recompile files that are already open so the user gets updated
+		// diagnostics reflecting the resolved classpath.
+		Set<URI> openURIs = fileContentsTracker.getOpenURIs();
+		for (URI uri : openURIs) {
+			ProjectScope scope = findProjectScope(uri);
+			if (scope != null && scope.classpathResolved) {
+				scope.lock.writeLock().lock();
+				try {
+					ensureScopeCompiled(scope);
+					compileAndVisitAST(scope, uri);
+				} finally {
+					scope.lock.writeLock().unlock();
+				}
+			}
+		}
+
+		// Ask the client to re-request semantic tokens for open editors.
+		if (languageClient != null) {
+			languageClient.refreshSemanticTokens();
+		}
+	}
+
+	/**
 	 * Register all build-tool projects at once with their resolved classpaths.
 	 * This allows computing proper subproject exclusions so that parent projects
 	 * don't scan source files belonging to nested subprojects.
@@ -315,7 +453,9 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 				logger.info("  Project {}: excluding {} subproject root(s): {}", projectRoot, excludedRoots.size(), excludedRoots);
 				factory.setExcludedSubRoots(excludedRoots);
 
-				newScopes.add(new ProjectScope(projectRoot, factory));
+				ProjectScope scope = new ProjectScope(projectRoot, factory);
+				scope.classpathResolved = true;
+				newScopes.add(scope);
 			}
 
 			// Sort scopes by path length descending for longest-prefix-first matching
@@ -389,6 +529,16 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	@Override
 	public void connect(LanguageClient client) {
 		languageClient = client;
+	}
+
+	/**
+	 * Shuts down background executors.  Called from
+	 * {@link GroovyLanguageServer#shutdown()}.
+	 */
+	public void shutdown() {
+		debounceExecutor.shutdownNow();
+		javaRecompileExecutor.shutdownNow();
+		backgroundCompiler.shutdownNow();
 	}
 
 	// --- NOTIFICATIONS
@@ -491,7 +641,10 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 				.map(fileEvent -> URI.create(fileEvent.getUri()))
 				.collect(Collectors.toSet());
 
-		// Detect Java/build-tool file changes that require recompilation
+		// Detect Java/build-tool file changes that require recompilation.
+		// Generated .java files under build output directories (build/,
+		// target/, etc.) are excluded to prevent feedback loops with
+		// annotation processors and source generators.
 		Set<Path> projectsNeedingRecompile = new LinkedHashSet<>();
 		List<ProjectScope> scopes = projectScopes; // volatile read once
 		for (URI changedUri : allChangedUris) {
@@ -502,6 +655,12 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 				Path filePath = Paths.get(changedUri);
 				for (ProjectScope scope : scopes) {
 					if (scope.projectRoot != null && filePath.startsWith(scope.projectRoot)) {
+						// Skip generated/build-output .java files to prevent
+						// feedback loops (annotation processors, source generators)
+						if (path.endsWith(".java") && isBuildOutputFile(filePath, scope.projectRoot)) {
+							logger.debug("Ignoring build-output Java file: {}", filePath);
+							break;
+						}
 						projectsNeedingRecompile.add(scope.projectRoot);
 						break;
 					}
@@ -509,11 +668,13 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			}
 		}
 
-		// Trigger recompile for projects with Java/build-tool file changes
-		if (!projectsNeedingRecompile.isEmpty() && javaChangeListener != null) {
+		// Schedule debounced async recompile for affected projects.
+		// The Gradle/Maven build runs on a background thread so the
+		// notification handler returns immediately, allowing other LSP
+		// messages (diagnostics, hover, etc.) to be processed.
+		if (!projectsNeedingRecompile.isEmpty()) {
 			for (Path projectRoot : projectsNeedingRecompile) {
-				logger.info("Java/build files changed in {}, triggering recompile", projectRoot);
-				javaChangeListener.onJavaFilesChanged(projectRoot);
+				scheduleJavaRecompile(projectRoot);
 			}
 		}
 
@@ -533,8 +694,14 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			}
 		}
 
-		// Process each scope independently under its own lock
+		// Process each non-recompile scope independently under its own lock.
+		// Scopes that need a Java recompile are handled by the debounced
+		// async handler (scheduleJavaRecompile) instead.
 		for (ProjectScope scope : getAllScopes()) {
+			if (projectsNeedingRecompile.contains(scope.projectRoot)) {
+				continue; // handled by scheduleJavaRecompile
+			}
+
 			Set<URI> scopeUris;
 			if (scopes.isEmpty()) {
 				// No project scopes - process all URIs (backward compat)
@@ -552,24 +719,17 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 					// Invalidate file cache so that new/deleted .groovy files are picked up
 					scope.compilationUnitFactory.invalidateFileCache();
 
-					// After a Java recompile, invalidate + rebuild the compilation unit
-					if (projectsNeedingRecompile.contains(scope.projectRoot)) {
-						scope.compilationUnitFactory.invalidateCompilationUnit();
-						// Full rebuild — clear dependency graph (will be rebuilt)
-						scope.dependencyGraph.clear();
-					} else {
-						// Handle .groovy file deletions: remove from dependency graph
-						for (URI changedUri : scopeUris) {
-							String uriPath = changedUri.getPath();
-							if (uriPath != null && uriPath.endsWith(".groovy")) {
-								// Check if file was deleted (no longer exists)
-								try {
-									if (!Files.exists(Paths.get(changedUri))) {
-										scope.dependencyGraph.removeFile(changedUri);
-									}
-								} catch (Exception e) {
-									// ignore URIs that can't be converted to Path
+					// Handle .groovy file deletions: remove from dependency graph
+					for (URI changedUri : scopeUris) {
+						String uriPath = changedUri.getPath();
+						if (uriPath != null && uriPath.endsWith(".groovy")) {
+							// Check if file was deleted (no longer exists)
+							try {
+								if (!Files.exists(Paths.get(changedUri))) {
+									scope.dependencyGraph.removeFile(changedUri);
 								}
+							} catch (Exception e) {
+								// ignore URIs that can't be converted to Path
 							}
 						}
 					}
@@ -582,23 +742,117 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 					} else {
 						visitAST(scope);
 					}
-					// Update dependency graph after watched-file-driven recompilation
-					if (scope.astVisitor != null) {
-						if (projectsNeedingRecompile.contains(scope.projectRoot)) {
-							// Full rebuild — update all dependencies
-							for (URI uri : scope.astVisitor.getDependenciesByURI().keySet()) {
-								Set<URI> deps = scope.astVisitor.resolveSourceDependencies(uri);
-								scope.dependencyGraph.updateDependencies(uri, deps);
-							}
-						} else {
-							updateDependencyGraph(scope, scopeUris);
-						}
-					}
+					updateDependencyGraph(scope, scopeUris);
 				} finally {
 					scope.lock.writeLock().unlock();
 				}
 			}
 		}
+	}
+
+	/**
+	 * Returns {@code true} if the given file path is inside a build output
+	 * directory (e.g. {@code build/}, {@code target/}, {@code .gradle/},
+	 * {@code out/}, {@code bin/}) relative to the project root.
+	 *
+	 * <p>Generated {@code .java} files produced by annotation processors or
+	 * source generators live in these directories. Treating them as
+	 * &ldquo;source changes&rdquo; would create an infinite recompile loop:
+	 * a user edit triggers a Gradle build, which generates {@code .java}
+	 * files, which trigger another build, and so on.</p>
+	 */
+	static boolean isBuildOutputFile(Path filePath, Path projectRoot) {
+		Path relativePath = projectRoot.relativize(filePath);
+		if (relativePath.getNameCount() == 0) {
+			return false;
+		}
+		String firstSegment = relativePath.getName(0).toString();
+		return BUILD_OUTPUT_DIRS.contains(firstSegment);
+	}
+
+	/**
+	 * Schedules a debounced, asynchronous Java/build-tool recompile for the
+	 * given project root.  Multiple rapid-fire file changes are coalesced
+	 * into a single recompile that fires {@value #JAVA_RECOMPILE_DEBOUNCE_MS}
+	 * ms after the last change.
+	 *
+	 * <p>The recompile runs on a dedicated background thread so that the
+	 * calling notification handler returns immediately and doesn't block
+	 * other LSP message processing (hover, completion, diagnostics for
+	 * other projects, etc.).</p>
+	 */
+	private void scheduleJavaRecompile(Path projectRoot) {
+		ScheduledFuture<?> prev = pendingJavaRecompiles.get(projectRoot);
+		if (prev != null) {
+			prev.cancel(false);
+		}
+		logger.info("Scheduling debounced Java recompile for {} ({}ms delay)",
+				projectRoot, JAVA_RECOMPILE_DEBOUNCE_MS);
+		pendingJavaRecompiles.put(projectRoot, javaRecompileExecutor.schedule(() -> {
+			try {
+				executeJavaRecompile(projectRoot);
+			} catch (Exception e) {
+				logger.error("Error during debounced Java recompile for {}: {}",
+						projectRoot, e.getMessage(), e);
+			} finally {
+				pendingJavaRecompiles.remove(projectRoot);
+			}
+		}, JAVA_RECOMPILE_DEBOUNCE_MS, TimeUnit.MILLISECONDS));
+	}
+
+	/**
+	 * Executes the full Java recompile flow for a project: delegates to the
+	 * {@link JavaChangeListener} (which runs the Gradle/Maven build), then
+	 * invalidates the Groovy compilation unit and recompiles the scope so
+	 * that diagnostics and AST data reflect the updated Java classes.
+	 *
+	 * <p>Called on the {@link #javaRecompileExecutor} thread.</p>
+	 */
+	private void executeJavaRecompile(Path projectRoot) {
+		logger.info("Java/build files changed in {}, triggering recompile", projectRoot);
+		if (javaChangeListener != null) {
+			javaChangeListener.onJavaFilesChanged(projectRoot);
+		}
+
+		// Find the scope for this project and recompile the Groovy AST
+		ProjectScope scope = findProjectScopeByRoot(projectRoot);
+		if (scope == null) {
+			logger.warn("No scope found for project root after Java recompile: {}", projectRoot);
+			return;
+		}
+
+		scope.lock.writeLock().lock();
+		try {
+			scope.compilationUnitFactory.invalidateFileCache();
+			scope.compilationUnitFactory.invalidateCompilationUnit();
+			scope.dependencyGraph.clear();
+			ensureScopeCompiled(scope);
+			createOrUpdateCompilationUnit(scope);
+			resetChangedFilesForScope(scope);
+			compile(scope);
+			visitAST(scope);
+			// Full rebuild — update all dependencies
+			if (scope.astVisitor != null) {
+				for (URI uri : scope.astVisitor.getDependenciesByURI().keySet()) {
+					Set<URI> deps = scope.astVisitor.resolveSourceDependencies(uri);
+					scope.dependencyGraph.updateDependencies(uri, deps);
+				}
+			}
+		} finally {
+			scope.lock.writeLock().unlock();
+		}
+	}
+
+	/**
+	 * Finds a project scope by its exact root path.
+	 */
+	private ProjectScope findProjectScopeByRoot(Path root) {
+		for (ProjectScope scope : getAllScopes()) {
+			if (root.equals(scope.projectRoot)) {
+				return scope;
+			}
+		}
+		return null;
 	}
 
 	@Override

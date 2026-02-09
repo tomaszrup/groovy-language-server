@@ -96,6 +96,20 @@ public class MavenProjectImporter implements ProjectImporter {
      */
     @Override
     public Map<Path, List<String>> importProjects(List<Path> projectRoots) {
+        return doImportProjects(projectRoots, true);
+    }
+
+    /**
+     * Resolve classpaths for all Maven projects <b>without compiling</b>
+     * source code.  Only resolves dependency JARs and discovers existing
+     * compiled class directories from prior builds.
+     */
+    @Override
+    public Map<Path, List<String>> resolveClasspaths(List<Path> projectRoots) {
+        return doImportProjects(projectRoots, false);
+    }
+
+    private Map<Path, List<String>> doImportProjects(List<Path> projectRoots, boolean compile) {
         Map<Path, List<String>> result = new ConcurrentHashMap<>();
         int parallelism = Math.max(2, Runtime.getRuntime().availableProcessors());
         ExecutorService pool = Executors.newFixedThreadPool(parallelism, r -> {
@@ -108,7 +122,14 @@ public class MavenProjectImporter implements ProjectImporter {
             for (Path root : projectRoots) {
                 futures.add(pool.submit(() -> {
                     try {
-                        List<String> cp = importProject(root);
+                        List<String> cp = new ArrayList<>();
+                        if (compile) {
+                            compileProject(root);
+                        }
+                        cp.addAll(resolveClasspath(root));
+                        cp.addAll(discoverClassDirs(root));
+                        logger.info("Classpath for Maven project {}: {} entries (compile={})",
+                                root, cp.size(), compile);
                         result.put(root, cp);
                     } catch (Exception e) {
                         logger.error("Error importing Maven project {}: {}", root, e.getMessage(), e);

@@ -71,6 +71,25 @@ public interface ProjectImporter {
     }
 
     /**
+     * Resolve classpaths for the given projects <b>without compiling</b>
+     * source code first.  This is much faster than {@link #importProjects}
+     * because it skips the build tasks ({@code classes}/{@code testClasses})
+     * and only resolves dependency JARs from the build tool's configuration
+     * metadata.  Existing compiled class-output directories (e.g.
+     * {@code build/classes/}) are still discovered from prior builds.
+     *
+     * <p>The default implementation delegates to {@link #importProjects},
+     * which includes compilation.  Subclasses should override to provide a
+     * faster, resolution-only path.</p>
+     *
+     * @param projectRoots all project roots discovered for this importer
+     * @return map from project root to its classpath entries
+     */
+    default Map<Path, List<String>> resolveClasspaths(List<Path> projectRoots) {
+        return importProjects(projectRoots);
+    }
+
+    /**
      * Recompile Java sources after file changes so that the Groovy compilation
      * unit picks up updated classes.
      */

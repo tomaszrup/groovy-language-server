@@ -108,12 +108,28 @@ public class GradleProjectImporter implements ProjectImporter {
      */
     @Override
     public Map<Path, List<String>> importProjects(List<Path> projectRoots) {
+        return doImportProjects(projectRoots, true);
+    }
+
+    /**
+     * Resolve classpaths for the given projects <b>without compiling</b>
+     * source code.  This skips the expensive {@code classes}/{@code testClasses}
+     * Gradle tasks and only resolves dependency JARs via the init-script plus
+     * any already-existing compiled class output directories.
+     */
+    @Override
+    public Map<Path, List<String>> resolveClasspaths(List<Path> projectRoots) {
+        return doImportProjects(projectRoots, false);
+    }
+
+    private Map<Path, List<String>> doImportProjects(List<Path> projectRoots, boolean compile) {
         Map<Path, List<String>> result = new LinkedHashMap<>();
 
         // Group subprojects by their Gradle root (the dir with settings.gradle)
         Map<Path, List<Path>> groupedByRoot = groupByGradleRoot(projectRoots);
 
-        logger.info("Grouped {} project(s) into {} Gradle root(s)", projectRoots.size(), groupedByRoot.size());
+        logger.info("Grouped {} project(s) into {} Gradle root(s) (compile={})",
+                projectRoots.size(), groupedByRoot.size(), compile);
 
         for (Map.Entry<Path, List<Path>> entry : groupedByRoot.entrySet()) {
             Path gradleRoot = entry.getKey();
@@ -122,7 +138,7 @@ public class GradleProjectImporter implements ProjectImporter {
             logger.info("Importing Gradle root {} with {} subproject(s)", gradleRoot, subprojects.size());
 
             try {
-                Map<Path, List<String>> batchResult = importBatch(gradleRoot, subprojects);
+                Map<Path, List<String>> batchResult = importBatch(gradleRoot, subprojects, compile);
                 result.putAll(batchResult);
             } catch (Exception e) {
                 logger.error("Batch import failed for Gradle root {}, falling back to individual imports: {}",
@@ -140,8 +156,12 @@ public class GradleProjectImporter implements ProjectImporter {
     /**
      * Import a group of subprojects that share the same Gradle root using a
      * single Tooling API connection.
+     *
+     * @param compile if {@code true}, runs {@code classes testClasses} before
+     *                resolving classpaths; if {@code false}, skips compilation
+     *                (faster — only resolves dependency JARs)
      */
-    private Map<Path, List<String>> importBatch(Path gradleRoot, List<Path> subprojects) {
+    private Map<Path, List<String>> importBatch(Path gradleRoot, List<Path> subprojects, boolean compile) {
         Map<Path, List<String>> result = new LinkedHashMap<>();
 
         GradleConnector connector = GradleConnector.newConnector()
@@ -149,8 +169,12 @@ public class GradleProjectImporter implements ProjectImporter {
 
         try (ProjectConnection connection = connector.connect()) {
             // 1. Compile everything at the root level (one invocation)
-            logger.info("Compiling all projects from Gradle root: {}", gradleRoot);
-            runCompileTasks(connection, gradleRoot);
+            if (compile) {
+                logger.info("Compiling all projects from Gradle root: {}", gradleRoot);
+                runCompileTasks(connection, gradleRoot);
+            } else {
+                logger.info("Skipping compilation, resolving classpaths only for Gradle root: {}", gradleRoot);
+            }
 
             // 2. Resolve classpath for ALL subprojects in a single init-script run
             logger.info("Resolving classpaths for {} subproject(s) from root: {}", subprojects.size(), gradleRoot);

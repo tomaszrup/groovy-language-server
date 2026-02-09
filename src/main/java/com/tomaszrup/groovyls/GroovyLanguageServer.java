@@ -256,15 +256,21 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
      * Performs the heavy Gradle/Maven project discovery and import on a
      * background thread with progress reporting to the client.
      *
-     * <p><b>Performance strategy:</b>
+     * <p><b>Performance strategy (lazy two-phase import):</b>
      * <ol>
-     *   <li>Discover all projects across all importers first (fast)</li>
-     *   <li>Use {@link ProjectImporter#importProjects(List)} so that each
-     *       importer can batch subprojects that share a common build root
-     *       (e.g. Gradle multi-project builds use a single Tooling API
-     *       connection instead of one per subproject)</li>
-     *   <li>Import different importers in parallel (Gradle and Maven
-     *       concurrently)</li>
+     *   <li><b>Phase 1 — Discovery (fast):</b> discover all projects across
+     *       all importers and register scopes immediately with empty
+     *       classpaths.  This lets {@code didOpen} compile files with basic
+     *       syntax while the classpath is being resolved.</li>
+     *   <li><b>Phase 1b — Cache check:</b> if a valid classpath cache
+     *       exists, apply cached classpaths instantly.</li>
+     *   <li><b>Phase 2 — Classpath resolution (no compilation):</b> resolve
+     *       dependency JARs and discover existing class-output directories
+     *       via {@link ProjectImporter#resolveClasspaths}. This is
+     *       dramatically faster than a full import because it skips the
+     *       expensive {@code classes}/{@code testClasses} build tasks.</li>
+     *   <li>Update scopes with resolved classpaths; recompile any files
+     *       the user already had open.</li>
      * </ol>
      */
     private void importProjectsAsync(List<WorkspaceFolder> folders) {
@@ -321,6 +327,22 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             List<Path> allDiscoveredRoots = discoveredByImporter.values().stream()
                     .flatMap(List::stream).collect(Collectors.toList());
 
+            // Phase 1a: Register discovered project scopes IMMEDIATELY so
+            // that didOpen can compile files with basic syntax while the
+            // classpath is being resolved in the background.
+            if (!allDiscoveredRoots.isEmpty()) {
+                logProgress("Discovered " + allDiscoveredRoots.size()
+                        + " project(s), registering scopes...");
+                groovyServices.registerDiscoveredProjects(allDiscoveredRoots);
+
+                // Assign importers for discovered roots
+                for (Map.Entry<ProjectImporter, List<Path>> de : discoveredByImporter.entrySet()) {
+                    for (Path root : de.getValue()) {
+                        importerMapLocal.put(root, de.getKey());
+                    }
+                }
+            }
+
             // Phase 1b: Check classpath cache
             Path workspaceRoot = groovyServices.getWorkspaceRoot();
             boolean cacheHit = false;
@@ -331,27 +353,21 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                     logProgress("Using cached classpath (build files unchanged)");
                     Map<Path, List<String>> cachedClasspaths = ClasspathCache.toClasspathMap(cached.get());
                     projectClasspaths.putAll(cachedClasspaths);
-                    // Assign importers for cached roots by matching against discovered roots
-                    for (Path cachedRoot : cachedClasspaths.keySet()) {
-                        for (Map.Entry<ProjectImporter, List<Path>> de : discoveredByImporter.entrySet()) {
-                            if (de.getValue().contains(cachedRoot)) {
-                                importerMapLocal.put(cachedRoot, de.getKey());
-                                break;
-                            }
-                        }
-                    }
                     cacheHit = true;
                 } else {
-                    logger.info("Classpath cache miss — will perform full import");
+                    logger.info("Classpath cache miss — will resolve classpaths");
                 }
             }
 
-            // Phase 2: Batch-import per importer, in parallel across importers
+            // Phase 2: Resolve classpaths per importer, in parallel across
+            //          importers.  Uses resolveClasspaths() which SKIPS the
+            //          expensive compilation step and only resolves dependency
+            //          JARs + discovers existing class-output directories.
             //          (skipped entirely when cache hit)
             if (!cacheHit) {
                 int totalProjects = discoveredByImporter.values().stream()
                         .mapToInt(List::size).sum();
-                logProgress("Importing " + totalProjects + " project(s) across "
+                logProgress("Resolving classpaths for " + totalProjects + " project(s) across "
                         + discoveredByImporter.size() + " build tool(s)...");
 
                 List<Future<?>> importFutures = new ArrayList<>();
@@ -361,24 +377,23 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
 
                     importFutures.add(parallelImportPool.submit(() -> {
                         try {
-                            logProgress("Batch-importing " + roots.size() + " "
+                            logProgress("Resolving classpaths for " + roots.size() + " "
                                     + importer.getName() + " project(s)...");
                             long start = System.currentTimeMillis();
 
-                            Map<Path, List<String>> batchResult = importer.importProjects(roots);
+                            Map<Path, List<String>> batchResult = importer.resolveClasspaths(roots);
 
                             long elapsed = System.currentTimeMillis() - start;
-                            logProgress(importer.getName() + " import completed in "
+                            logProgress(importer.getName() + " classpath resolution completed in "
                                     + (elapsed / 1000) + "s (" + batchResult.size() + " projects)");
 
                             for (Map.Entry<Path, List<String>> e : batchResult.entrySet()) {
                                 projectClasspaths.put(e.getKey(), e.getValue());
-                                importerMapLocal.put(e.getKey(), importer);
                             }
                         } catch (Exception e) {
-                            logger.error("Error importing {} projects: {}",
+                            logger.error("Error resolving {} classpaths: {}",
                                     importer.getName(), e.getMessage(), e);
-                            logProgress(importer.getName() + " import failed: " + e.getMessage());
+                            logProgress(importer.getName() + " classpath resolution failed: " + e.getMessage());
                         }
                     }));
                 }
@@ -408,12 +423,12 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                 }
             }
 
-            // Phase 3: Register all projects with GroovyServices
+            // Phase 3: Update all registered scopes with resolved classpaths
             projectImporterMap.putAll(importerMapLocal);
 
             if (!projectClasspaths.isEmpty()) {
-                logProgress("Compiling " + projectClasspaths.size() + " project(s)...");
-                groovyServices.addProjects(projectClasspaths);
+                logProgress("Updating classpaths for " + projectClasspaths.size() + " project(s)...");
+                groovyServices.updateProjectClasspaths(projectClasspaths);
             }
             logProgress("Project import complete");
         } catch (Exception e) {
@@ -429,6 +444,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         if (importFuture != null) {
             importFuture.cancel(true);
         }
+        groovyServices.shutdown();
         parallelImportPool.shutdownNow();
         importExecutor.shutdownNow();
         SharedClassGraphCache.getInstance().clear();
