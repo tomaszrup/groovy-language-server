@@ -24,6 +24,7 @@ shadowJar {
     exclude(dependency('org.slf4j:.*'))
     exclude(dependency('org.eclipse.lsp4j:.*'))
     exclude(dependency('com.google.code.gson:gson'))
+    exclude(dependency('org.apache.groovy:.*'))
   }
 
   // Strip bundled metadata that serves no runtime purpose
