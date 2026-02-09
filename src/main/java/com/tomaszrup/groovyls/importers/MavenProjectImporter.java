@@ -28,14 +28,19 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.concurrent.TimeUnit;
+import java.util.Map;
+import java.util.concurrent.*;
 import java.util.stream.Stream;
 
 /**
  * Discovers and imports Maven-based JVM projects. Shells out to the {@code mvn}
  * command to compile Java sources and resolve the dependency classpath via
  * {@code dependency:build-classpath}.
+ *
+ * <p>Maven projects are imported in parallel (up to the number of available
+ * CPU cores) since they are typically independent of each other.</p>
  */
 public class MavenProjectImporter implements ProjectImporter {
 
@@ -82,6 +87,57 @@ public class MavenProjectImporter implements ProjectImporter {
 
         logger.info("Classpath for Maven project {}: {} entries", projectRoot, classpathList.size());
         return classpathList;
+    }
+
+    /**
+     * Import all Maven projects in parallel. Each project gets its own
+     * {@code mvn} invocation, but they run concurrently since Maven
+     * modules are typically independent.
+     */
+    @Override
+    public Map<Path, List<String>> importProjects(List<Path> projectRoots) {
+        Map<Path, List<String>> result = new ConcurrentHashMap<>();
+        int parallelism = Math.max(2, Runtime.getRuntime().availableProcessors());
+        ExecutorService pool = Executors.newFixedThreadPool(parallelism, r -> {
+            Thread t = new Thread(r, "groovyls-maven-import");
+            t.setDaemon(true);
+            return t;
+        });
+        try {
+            List<Future<?>> futures = new ArrayList<>();
+            for (Path root : projectRoots) {
+                futures.add(pool.submit(() -> {
+                    try {
+                        List<String> cp = importProject(root);
+                        result.put(root, cp);
+                    } catch (Exception e) {
+                        logger.error("Error importing Maven project {}: {}", root, e.getMessage(), e);
+                        result.put(root, new ArrayList<>());
+                    }
+                }));
+            }
+            for (Future<?> f : futures) {
+                try {
+                    f.get();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (ExecutionException e) {
+                    logger.error("Maven import task failed: {}", e.getCause().getMessage());
+                }
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+        // Preserve insertion order
+        Map<Path, List<String>> ordered = new LinkedHashMap<>();
+        for (Path root : projectRoots) {
+            List<String> cp = result.get(root);
+            if (cp != null) {
+                ordered.put(root, cp);
+            }
+        }
+        return ordered;
     }
 
     @Override

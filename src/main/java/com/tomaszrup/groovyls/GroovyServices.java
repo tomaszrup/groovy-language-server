@@ -222,6 +222,9 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	 * Register all build-tool projects at once with their resolved classpaths.
 	 * This allows computing proper subproject exclusions so that parent projects
 	 * don't scan source files belonging to nested subprojects.
+	 *
+	 * <p>Groovy compilation for each scope is performed in parallel to reduce
+	 * startup time in large workspaces with many projects.</p>
 	 */
 	public void addProjects(Map<Path, List<String>> projectClasspaths) {
 		stateLock.writeLock().lock();
@@ -258,12 +261,59 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			// didChangeConfiguration/updateClasspath call).
 			clearDefaultScopeDiagnostics();
 
-			// Create compilation units, compile, and visit AST for each scope
+			// Reset changed files once before compiling all scopes
+			fileContentsTracker.resetChangedFiles();
+
+			// Create compilation units for every scope first (sequential —
+			// each factory walks its own project root for Groovy files)
 			for (ProjectScope scope : projectScopes) {
 				createOrUpdateCompilationUnit(scope);
-				fileContentsTracker.resetChangedFiles();
-				compile(scope);
-				visitAST(scope);
+			}
+
+			// Compile and visit AST for each scope in parallel —
+			// each scope has its own CompilationUnit and ASTVisitor
+			if (projectScopes.size() > 1) {
+				logger.info("Compiling {} project scopes in parallel", projectScopes.size());
+				int parallelism = Math.min(projectScopes.size(),
+						Math.max(2, Runtime.getRuntime().availableProcessors()));
+				java.util.concurrent.ExecutorService compilePool =
+						java.util.concurrent.Executors.newFixedThreadPool(parallelism, r -> {
+							Thread t = new Thread(r, "groovyls-compile");
+							t.setDaemon(true);
+							return t;
+						});
+				try {
+					List<java.util.concurrent.Future<?>> futures = new ArrayList<>();
+					for (ProjectScope scope : projectScopes) {
+						futures.add(compilePool.submit(() -> {
+							try {
+								compile(scope);
+								visitAST(scope);
+							} catch (Exception e) {
+								logger.error("Error compiling scope {}: {}",
+										scope.projectRoot, e.getMessage(), e);
+							}
+						}));
+					}
+					for (java.util.concurrent.Future<?> f : futures) {
+						try {
+							f.get();
+						} catch (java.util.concurrent.ExecutionException e) {
+							logger.error("Compile task failed: {}", e.getCause().getMessage());
+						} catch (InterruptedException e) {
+							Thread.currentThread().interrupt();
+							break;
+						}
+					}
+				} finally {
+					compilePool.shutdownNow();
+				}
+			} else {
+				// Single scope — compile directly, no thread overhead
+				for (ProjectScope scope : projectScopes) {
+					compile(scope);
+					visitAST(scope);
+				}
 			}
 
 			// Replay deferred didOpen compilations for files that were opened

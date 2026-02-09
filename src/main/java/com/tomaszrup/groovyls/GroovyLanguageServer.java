@@ -40,10 +40,7 @@ import java.net.URI;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
+import java.util.concurrent.*;
 
 public class GroovyLanguageServer implements LanguageServer, LanguageClientAware {
 
@@ -99,6 +96,17 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         t.setDaemon(true);
         return t;
     });
+    /**
+     * Thread pool used inside {@link #importProjectsAsync} to import
+     * independent build roots (different Gradle roots, Maven modules) in
+     * parallel.
+     */
+    private final ExecutorService parallelImportPool = Executors.newFixedThreadPool(
+            Math.max(2, Runtime.getRuntime().availableProcessors()), r -> {
+                Thread t = new Thread(r, "groovyls-parallel-import");
+                t.setDaemon(true);
+                return t;
+            });
     /** Future for the background import task, used for cancellation on shutdown. */
     private volatile Future<?> importFuture;
 
@@ -227,12 +235,27 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     /**
      * Performs the heavy Gradle/Maven project discovery and import on a
      * background thread with progress reporting to the client.
+     *
+     * <p><b>Performance strategy:</b>
+     * <ol>
+     *   <li>Discover all projects across all importers first (fast)</li>
+     *   <li>Use {@link ProjectImporter#importProjects(List)} so that each
+     *       importer can batch subprojects that share a common build root
+     *       (e.g. Gradle multi-project builds use a single Tooling API
+     *       connection instead of one per subproject)</li>
+     *   <li>Import different importers in parallel (Gradle and Maven
+     *       concurrently)</li>
+     * </ol>
      */
     private void importProjectsAsync(List<WorkspaceFolder> folders) {
         try {
-            Map<Path, List<String>> projectClasspaths = new LinkedHashMap<>();
-            Set<Path> claimedRoots = new LinkedHashSet<>();
+            Map<Path, List<String>> projectClasspaths = new ConcurrentHashMap<>();
+            Map<Path, ProjectImporter> importerMapLocal = new ConcurrentHashMap<>();
+            Set<Path> claimedRoots = Collections.synchronizedSet(new LinkedHashSet<>());
 
+            // Phase 1: Discover all projects (fast, sequential per-folder)
+            // Map: importer → list of discovered project roots
+            Map<ProjectImporter, List<Path>> discoveredByImporter = new LinkedHashMap<>();
             for (WorkspaceFolder folder : folders) {
                 if (Thread.currentThread().isInterrupted()) {
                     logProgress("Project import cancelled");
@@ -241,33 +264,26 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                 Path folderPath = Paths.get(URI.create(folder.getUri()));
 
                 for (ProjectImporter importer : importers) {
-                    if (Thread.currentThread().isInterrupted()) {
-                        logProgress("Project import cancelled");
-                        return;
-                    }
                     try {
                         logProgress("Discovering " + importer.getName() + " projects...");
                         List<Path> projects = importer.discoverProjects(folderPath);
                         if (!projects.isEmpty()) {
                             logProgress("Found " + projects.size() + " " + importer.getName() + " project(s)");
-                        }
-                        for (Path projectRoot : projects) {
-                            if (Thread.currentThread().isInterrupted()) {
-                                logProgress("Project import cancelled");
-                                return;
+                            // Filter out roots already claimed by a higher-priority importer
+                            List<Path> unclaimed = new ArrayList<>();
+                            for (Path p : projects) {
+                                if (claimedRoots.add(p)) {
+                                    unclaimed.add(p);
+                                } else {
+                                    logger.info("Skipping {} project at {} — already claimed by another importer",
+                                            importer.getName(), p);
+                                }
                             }
-                            if (claimedRoots.contains(projectRoot)) {
-                                logger.info("Skipping {} project at {} — already claimed by another importer",
-                                        importer.getName(), projectRoot);
-                                continue;
+                            if (!unclaimed.isEmpty()) {
+                                discoveredByImporter
+                                        .computeIfAbsent(importer, k -> new ArrayList<>())
+                                        .addAll(unclaimed);
                             }
-
-                            logProgress("Importing " + importer.getName() + " project: " + projectRoot.getFileName());
-                            List<String> classpathList = importer.importProject(projectRoot);
-                            logProgress("Resolved " + classpathList.size() + " classpath entries for " + projectRoot.getFileName());
-                            projectClasspaths.put(projectRoot, classpathList);
-                            projectImporterMap.put(projectRoot, importer);
-                            claimedRoots.add(projectRoot);
                         }
                     } catch (IOException e) {
                         logger.error("Error discovering {} projects in {}: {}",
@@ -280,6 +296,62 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                 logProgress("Project import cancelled");
                 return;
             }
+
+            // Phase 2: Batch-import per importer, in parallel across importers
+            int totalProjects = discoveredByImporter.values().stream()
+                    .mapToInt(List::size).sum();
+            logProgress("Importing " + totalProjects + " project(s) across "
+                    + discoveredByImporter.size() + " build tool(s)...");
+
+            List<Future<?>> importFutures = new ArrayList<>();
+            for (Map.Entry<ProjectImporter, List<Path>> entry : discoveredByImporter.entrySet()) {
+                ProjectImporter importer = entry.getKey();
+                List<Path> roots = entry.getValue();
+
+                importFutures.add(parallelImportPool.submit(() -> {
+                    try {
+                        logProgress("Batch-importing " + roots.size() + " "
+                                + importer.getName() + " project(s)...");
+                        long start = System.currentTimeMillis();
+
+                        Map<Path, List<String>> batchResult = importer.importProjects(roots);
+
+                        long elapsed = System.currentTimeMillis() - start;
+                        logProgress(importer.getName() + " import completed in "
+                                + (elapsed / 1000) + "s (" + batchResult.size() + " projects)");
+
+                        for (Map.Entry<Path, List<String>> e : batchResult.entrySet()) {
+                            projectClasspaths.put(e.getKey(), e.getValue());
+                            importerMapLocal.put(e.getKey(), importer);
+                        }
+                    } catch (Exception e) {
+                        logger.error("Error importing {} projects: {}",
+                                importer.getName(), e.getMessage(), e);
+                        logProgress(importer.getName() + " import failed: " + e.getMessage());
+                    }
+                }));
+            }
+
+            // Wait for all importers to finish
+            for (Future<?> f : importFutures) {
+                try {
+                    f.get();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    logProgress("Project import cancelled");
+                    return;
+                } catch (ExecutionException e) {
+                    logger.error("Import task failed: {}", e.getCause().getMessage(), e.getCause());
+                }
+            }
+
+            if (Thread.currentThread().isInterrupted()) {
+                logProgress("Project import cancelled");
+                return;
+            }
+
+            // Phase 3: Register all projects with GroovyServices
+            projectImporterMap.putAll(importerMapLocal);
 
             if (!projectClasspaths.isEmpty()) {
                 logProgress("Compiling " + projectClasspaths.size() + " project(s)...");
@@ -299,6 +371,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         if (importFuture != null) {
             importFuture.cancel(true);
         }
+        parallelImportPool.shutdownNow();
         importExecutor.shutdownNow();
         return CompletableFuture.completedFuture(new Object());
     }

@@ -21,7 +21,9 @@ package com.tomaszrup.groovyls.importers;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Abstraction for build-tool-specific project discovery, classpath resolution,
@@ -47,6 +49,26 @@ public interface ProjectImporter {
      * @return list of classpath entries (absolute paths)
      */
     List<String> importProject(Path projectRoot);
+
+    /**
+     * Batch-import multiple projects at once. Implementations can override this
+     * to use a single build-tool connection for all projects that share a common
+     * root (e.g. Gradle multi-project builds), which is dramatically faster than
+     * importing each project individually.
+     *
+     * <p>The default implementation falls back to calling
+     * {@link #importProject(Path)} for each project sequentially.</p>
+     *
+     * @param projectRoots all project roots discovered for this importer
+     * @return map from project root to its classpath entries
+     */
+    default Map<Path, List<String>> importProjects(List<Path> projectRoots) {
+        Map<Path, List<String>> result = new LinkedHashMap<>();
+        for (Path root : projectRoots) {
+            result.put(root, importProject(root));
+        }
+        return result;
+    }
 
     /**
      * Recompile Java sources after file changes so that the Groovy compilation

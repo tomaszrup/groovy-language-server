@@ -88,16 +88,18 @@ function setStatusBar(
   }
   switch (state) {
     case "starting":
-      statusBarItem.text = "$(sync~spin) Groovy";
+      statusBarItem.text = "$(sync~spin) Groovy: Starting…";
       statusBarItem.tooltip = "Groovy Language Server: Starting…";
       statusBarItem.show();
       break;
-    case "importing":
-      statusBarItem.text = "$(sync~spin) Groovy";
+    case "importing": {
+      const shortDetail = detail ? shortenDetail(detail) : "Importing projects…";
+      statusBarItem.text = `$(sync~spin) Groovy: ${shortDetail}`;
       statusBarItem.tooltip =
         "Groovy Language Server: " + (detail || "Importing projects…");
       statusBarItem.show();
       break;
+    }
     case "ready":
       statusBarItem.text = "$(check) Groovy";
       statusBarItem.tooltip =
@@ -114,6 +116,19 @@ function setStatusBar(
       statusBarItem.hide();
       break;
   }
+}
+
+/**
+ * Shorten a server progress message for display in the status bar.
+ * Keeps it concise so it doesn't take too much horizontal space.
+ */
+function shortenDetail(message: string): string {
+  // Truncate overly long messages (e.g. long project names)
+  const maxLen = 60;
+  if (message.length > maxLen) {
+    return message.substring(0, maxLen - 1) + "…";
+  }
+  return message;
 }
 
 function onDidChangeConfiguration(event: vscode.ConfigurationChangeEvent) {
@@ -272,8 +287,10 @@ function startLanguageServer() {
           languageClient.onNotification("window/logMessage", (params: { type: number; message: string }) => {
             const msg = params.message;
             if (msg.startsWith("Discovering ") || msg.startsWith("Importing ") ||
+                msg.startsWith("Batch-importing ") ||
                 msg.startsWith("Found ") || msg.startsWith("Resolved ") ||
-                msg.startsWith("Compiling ")) {
+                msg.startsWith("Compiling ") ||
+                msg.startsWith("Gradle import ") || msg.startsWith("Maven import ")) {
               setStatusBar("importing", msg);
             } else if (msg === "Project import complete" || msg.startsWith("Project import failed")) {
               setStatusBar("ready");

@@ -63,6 +63,13 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 	private List<Path> excludedSubRoots = new ArrayList<>();
 
 	/**
+	 * Cached result of resolving {@link #additionalClasspathList} entries
+	 * against the filesystem (existence checks, directory expansion, etc.).
+	 * Invalidated when the classpath list itself changes.
+	 */
+	private List<String> resolvedClasspathCache = null;
+
+	/**
 	 * Cached set of .groovy file paths discovered by walking the workspace.
 	 * Populated on first compilation and reused on subsequent compilations to
 	 * avoid expensive {@code Files.walk()} on every keystroke. Invalidated
@@ -92,13 +99,23 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 				}
 			}
 		}
-		invalidateCompilationUnit();
-	}
-
-	public void invalidateCompilationUnit() {
+		// Classpath changed — full reset of config, classloader and compilation unit
+		resolvedClasspathCache = null;
 		compilationUnit = null;
 		config = null;
 		classLoader = null;
+	}
+
+	/**
+	 * Invalidate only the compilation unit so that a fresh one is created on
+	 * the next {@link #create} call. The {@link CompilerConfiguration} and
+	 * {@link GroovyClassLoader} are <em>preserved</em> because the classpath
+	 * has not changed — only the compiled output has (e.g. after a Java
+	 * recompile). This avoids expensive per-entry filesystem stat calls in
+	 * {@link #getClasspathList} on every invalidation cycle.
+	 */
+	public void invalidateCompilationUnit() {
+		compilationUnit = null;
 	}
 
 	/**
@@ -182,6 +199,14 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 			return;
 		}
 
+		// Use cached resolved classpath when available to avoid repeated
+		// filesystem stat calls (File.exists / isDirectory / isFile)
+		if (resolvedClasspathCache != null) {
+			result.addAll(resolvedClasspathCache);
+			return;
+		}
+
+		List<String> resolved = new ArrayList<>();
 		for (String entry : additionalClasspathList) {
 			boolean mustBeDirectory = false;
 			if (entry.endsWith("*")) {
@@ -196,7 +221,7 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 
             if (file.isDirectory()) {
                 // Always add directories (important for build/classes output)
-                result.add(file.getPath());
+                resolved.add(file.getPath());
 
                 // And if user used '*', include jars inside
                 if (mustBeDirectory) {
@@ -204,15 +229,18 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
                     if (children != null) {
                         for (File child : children) {
                             if (child.isFile() && child.getName().endsWith(".jar")) {
-                                result.add(child.getPath());
+                                resolved.add(child.getPath());
                             }
                         }
                     }
                 }
             } else if (!mustBeDirectory && file.isFile() && file.getName().endsWith(".jar")) {
-                result.add(entry);
+                resolved.add(entry);
             }
         }
+
+		resolvedClasspathCache = resolved;
+		result.addAll(resolved);
     }
 
 	/**
