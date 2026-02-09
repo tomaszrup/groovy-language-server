@@ -23,7 +23,7 @@ import * as path from "path";
 import * as vscode from "vscode";
 
 export default function findJava(): string | null {
-  var executableFile: string = "java";
+  let executableFile: string = "java";
   if (process["platform"] === "win32") {
     executableFile += ".exe";
   }

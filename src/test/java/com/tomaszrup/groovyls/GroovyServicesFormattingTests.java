@@ -30,7 +30,9 @@ import org.eclipse.lsp4j.DocumentFormattingParams;
 import org.eclipse.lsp4j.FormattingOptions;
 import org.eclipse.lsp4j.MessageActionItem;
 import org.eclipse.lsp4j.MessageParams;
+import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.PublishDiagnosticsParams;
+import org.eclipse.lsp4j.Range;
 import org.eclipse.lsp4j.ShowMessageRequestParams;
 import org.eclipse.lsp4j.TextDocumentIdentifier;
 import org.eclipse.lsp4j.TextDocumentItem;
@@ -88,9 +90,50 @@ class GroovyServicesFormattingTests {
 
 	@AfterEach
 	void tearDown() {
+		TestWorkspaceHelper.cleanSrcDirectory(srcRoot);
+		if (services != null) {
+			services.setWorkspaceRoot(null);
+		}
 		services = null;
 		workspaceRoot = null;
 		srcRoot = null;
+	}
+
+	/**
+	 * Apply a list of TextEdits to the original text and return the result.
+	 * Edits are applied in reverse order (bottom-to-top) to preserve positions.
+	 */
+	private String applyEdits(String original, List<? extends TextEdit> edits) {
+		// Normalize to \n for offset calculations (matches what FormattingProvider does)
+		String text = original.replace("\r\n", "\n").replace("\r", "\n");
+		// Apply edits in reverse document order to preserve earlier positions
+		List<? extends TextEdit> sorted = new java.util.ArrayList<>(edits);
+		sorted.sort((a, b) -> {
+			int lineCmp = Integer.compare(b.getRange().getStart().getLine(),
+					a.getRange().getStart().getLine());
+			if (lineCmp != 0) return lineCmp;
+			return Integer.compare(b.getRange().getStart().getCharacter(),
+					a.getRange().getStart().getCharacter());
+		});
+		for (TextEdit edit : sorted) {
+			Range range = edit.getRange();
+			int startOffset = positionToOffset(text, range.getStart());
+			int endOffset = positionToOffset(text, range.getEnd());
+			text = text.substring(0, startOffset) + edit.getNewText() + text.substring(endOffset);
+		}
+		return text;
+	}
+
+	private int positionToOffset(String text, Position pos) {
+		int line = 0;
+		int offset = 0;
+		while (line < pos.getLine() && offset < text.length()) {
+			if (text.charAt(offset) == '\n') {
+				line++;
+			}
+			offset++;
+		}
+		return offset + pos.getCharacter();
 	}
 
 	// --- Trailing whitespace ---
@@ -176,7 +219,7 @@ class GroovyServicesFormattingTests {
 		List<? extends TextEdit> edits = services.formatting(params).get();
 
 		Assertions.assertFalse(edits.isEmpty(), "Should produce formatting edits");
-		String formatted = edits.get(0).getNewText();
+		String formatted = applyEdits(contents, edits);
 		Assertions.assertTrue(formatted.endsWith("\n"), "File should end with a newline");
 		Assertions.assertFalse(formatted.endsWith("\n\n"), "File should not end with multiple newlines");
 	}
@@ -469,7 +512,7 @@ class GroovyServicesFormattingTests {
 		List<? extends TextEdit> edits = services.formatting(params).get();
 
 		Assertions.assertFalse(edits.isEmpty(), "Should produce formatting edits");
-		String formatted = edits.get(0).getNewText();
+		String formatted = applyEdits(contents.toString(), edits);
 
 		// Verify structural indentation
 		String expected = "class WrongIndent {\n"

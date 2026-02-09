@@ -26,6 +26,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.*;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -72,8 +73,8 @@ public class GradleProjectImporter implements ProjectImporter {
             try {
                 connection.newBuild()
                         .forTasks("classes", "testClasses")
-                        .setStandardOutput(System.out)
-                        .setStandardError(System.err)
+                        .setStandardOutput(newLogOutputStream())
+                        .setStandardError(newLogOutputStream())
                         .run();
             } catch (Exception buildEx) {
                 logger.warn("Could not run compile tasks for project {}: {}", projectRoot, buildEx.getMessage());
@@ -81,8 +82,8 @@ public class GradleProjectImporter implements ProjectImporter {
                 try {
                     connection.newBuild()
                             .forTasks("classes")
-                            .setStandardOutput(System.out)
-                            .setStandardError(System.err)
+                            .setStandardOutput(newLogOutputStream())
+                            .setStandardError(newLogOutputStream())
                             .run();
                 } catch (Exception ex) {
                     logger.warn("Could not run 'classes' task for project {}: {}", projectRoot, ex.getMessage());
@@ -112,8 +113,8 @@ public class GradleProjectImporter implements ProjectImporter {
             try {
                 connection.newBuild()
                         .forTasks("classes", "testClasses")
-                        .setStandardOutput(System.out)
-                        .setStandardError(System.err)
+                        .setStandardOutput(newLogOutputStream())
+                        .setStandardError(newLogOutputStream())
                         .run();
                 logger.info("Gradle recompile succeeded for {}", projectRoot);
             } catch (Exception buildEx) {
@@ -121,8 +122,8 @@ public class GradleProjectImporter implements ProjectImporter {
                 try {
                     connection.newBuild()
                             .forTasks("classes")
-                            .setStandardOutput(System.out)
-                            .setStandardError(System.err)
+                            .setStandardOutput(newLogOutputStream())
+                            .setStandardError(newLogOutputStream())
                             .run();
                 } catch (Exception ex) {
                     logger.warn("Gradle recompile fallback also failed for {}: {}", projectRoot, ex.getMessage());
@@ -179,7 +180,7 @@ public class GradleProjectImporter implements ProjectImporter {
                     .forTasks("_groovyLSResolveClasspath")
                     .withArguments("--init-script", initScript.toString())
                     .setStandardOutput(baos)
-                    .setStandardError(System.err)
+                    .setStandardError(newLogOutputStream())
                     .run();
 
             String output = baos.toString("UTF-8");
@@ -210,13 +211,59 @@ public class GradleProjectImporter implements ProjectImporter {
         List<String> classDirs = new ArrayList<>();
 
         if (Files.exists(classesRoot)) {
+            List<Path> allDirs = new ArrayList<>();
             try (Stream<Path> stream = Files.walk(classesRoot, 2)) {
-                stream
-                        .filter(Files::isDirectory)
-                        .map(Path::toString)
-                        .forEach(classDirs::add);
+                stream.filter(Files::isDirectory).forEach(allDirs::add);
+            }
+            // Only keep leaf directories — skip parents that contain subdirectories
+            for (Path dir : allDirs) {
+                boolean isLeaf = allDirs.stream()
+                        .noneMatch(other -> !other.equals(dir) && other.startsWith(dir));
+                if (isLeaf) {
+                    classDirs.add(dir.toString());
+                }
             }
         }
         return classDirs;
+    }
+
+    /**
+     * Creates an OutputStream that routes each line of output to the SLF4J
+     * logger at DEBUG level, instead of dumping to System.out/System.err.
+     */
+    private OutputStream newLogOutputStream() {
+        return new OutputStream() {
+            private final ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+
+            @Override
+            public void write(int b) {
+                if (b == '\n') {
+                    flush();
+                } else {
+                    buffer.write(b);
+                }
+            }
+
+            @Override
+            public void write(byte[] bytes, int off, int len) {
+                for (int i = off; i < off + len; i++) {
+                    write(bytes[i]);
+                }
+            }
+
+            @Override
+            public void flush() {
+                String line = buffer.toString(StandardCharsets.UTF_8).stripTrailing();
+                if (!line.isEmpty()) {
+                    logger.debug("[Gradle] {}", line);
+                }
+                buffer.reset();
+            }
+
+            @Override
+            public void close() {
+                flush();
+            }
+        };
     }
 }

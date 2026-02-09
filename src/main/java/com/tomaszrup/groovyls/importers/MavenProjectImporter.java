@@ -29,6 +29,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
 /**
@@ -217,9 +218,14 @@ public class MavenProjectImporter implements ProjectImporter {
         stdoutGobbler.start();
         stderrGobbler.start();
 
-        int exitCode = process.waitFor();
-        stdoutGobbler.join();
-        stderrGobbler.join();
+        boolean finished = process.waitFor(120, TimeUnit.SECONDS);
+        if (!finished) {
+            process.destroyForcibly();
+            throw new IOException("Maven process timed out after 120 seconds: " + command);
+        }
+        int exitCode = process.exitValue();
+        stdoutGobbler.join(5000);
+        stderrGobbler.join(5000);
 
         if (exitCode != 0) {
             String stderr = stderrGobbler.getOutput();

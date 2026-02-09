@@ -62,6 +62,14 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 	private List<String> additionalClasspathList;
 	private List<Path> excludedSubRoots = new ArrayList<>();
 
+	/**
+	 * Cached set of .groovy file paths discovered by walking the workspace.
+	 * Populated on first compilation and reused on subsequent compilations to
+	 * avoid expensive {@code Files.walk()} on every keystroke. Invalidated
+	 * explicitly when filesystem changes are detected (didChangeWatchedFiles).
+	 */
+	private Set<Path> cachedGroovyFiles = null;
+
 	public CompilationUnitFactory() {
 	}
 
@@ -91,6 +99,15 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 		compilationUnit = null;
 		config = null;
 		classLoader = null;
+	}
+
+	/**
+	 * Invalidate the cached file tree so that the next compilation will
+	 * re-walk the workspace directory. Call this when filesystem changes are
+	 * detected (e.g. files created, deleted, or renamed).
+	 */
+	public void invalidateFileCache() {
+		cachedGroovyFiles = null;
 	}
 
 	public GroovyLSCompilationUnit create(Path workspaceRoot, FileContentsTracker fileContentsTracker) {
@@ -198,13 +215,21 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
         }
     }
 
-	protected void addDirectoryToCompilationUnit(Path dirPath, GroovyLSCompilationUnit compilationUnit,
-			FileContentsTracker fileContentsTracker, Set<URI> changedUris) {
+	/**
+	 * Populate the file cache by walking the directory tree once, filtering by
+	 * extension and exclusion rules. Subsequent calls are no-ops until
+	 * {@link #invalidateFileCache()} is called.
+	 */
+	private Set<Path> getOrBuildFileCache(Path dirPath) {
+		if (cachedGroovyFiles != null) {
+			return cachedGroovyFiles;
+		}
+		cachedGroovyFiles = new HashSet<>();
 		try {
 			if (Files.exists(dirPath)) {
-				logger.info("Walking directory for .groovy sources: {}", dirPath);
-			logger.info("  excludedSubRoots: {}", excludedSubRoots);
-			Files.walk(dirPath).forEach((filePath) -> {
+				logger.info("Building file cache for .groovy sources: {}", dirPath);
+				logger.info("  excludedSubRoots: {}", excludedSubRoots);
+				Files.walk(dirPath).forEach((filePath) -> {
 					if (!filePath.toString().endsWith(FILE_EXTENSION_GROOVY)) {
 						return;
 					}
@@ -216,21 +241,29 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 						logger.info("  Excluded (subproject): {}", filePath);
 						return;
 					}
-					logger.info("  Adding source: {}", filePath);
-					URI fileURI = filePath.toUri();
-					if (!fileContentsTracker.isOpen(fileURI)) {
-						File file = filePath.toFile();
-						if (file.isFile()) {
-							if (changedUris == null || changedUris.contains(fileURI)) {
-								compilationUnit.addSource(file);
-							}
-						}
-					}
+					cachedGroovyFiles.add(filePath);
 				});
+				logger.info("File cache built: {} .groovy files", cachedGroovyFiles.size());
 			}
-
 		} catch (IOException e) {
 			logger.error("Failed to walk directory for source files: {}", dirPath, e);
+		}
+		return cachedGroovyFiles;
+	}
+
+	protected void addDirectoryToCompilationUnit(Path dirPath, GroovyLSCompilationUnit compilationUnit,
+			FileContentsTracker fileContentsTracker, Set<URI> changedUris) {
+		Set<Path> groovyFiles = getOrBuildFileCache(dirPath);
+		for (Path filePath : groovyFiles) {
+			URI fileURI = filePath.toUri();
+			if (!fileContentsTracker.isOpen(fileURI)) {
+				File file = filePath.toFile();
+				if (file.isFile()) {
+					if (changedUris == null || changedUris.contains(fileURI)) {
+						compilationUnit.addSource(file);
+					}
+				}
+			}
 		}
 		fileContentsTracker.getOpenURIs().forEach(uri -> {
 			Path openPath = Paths.get(uri);

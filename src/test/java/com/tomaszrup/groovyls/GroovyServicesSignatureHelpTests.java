@@ -96,6 +96,10 @@ class GroovyServicesSignatureHelpTests {
 
 	@AfterEach
 	void tearDown() {
+		TestWorkspaceHelper.cleanSrcDirectory(srcRoot);
+		if (services != null) {
+			services.setWorkspaceRoot(null);
+		}
 		services = null;
 		workspaceRoot = null;
 		srcRoot = null;

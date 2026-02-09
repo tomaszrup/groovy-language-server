@@ -33,6 +33,15 @@ public interface ICompilationUnitFactory {
 	 */
 	public void invalidateCompilationUnit();
 
+	/**
+	 * Invalidate the cached file tree so that the next compilation will
+	 * re-walk the workspace directory. Call this when filesystem changes are
+	 * detected (e.g. files created, deleted, or renamed).
+	 */
+	default void invalidateFileCache() {
+		// no-op by default for test implementations
+	}
+
 	public List<String> getAdditionalClasspathList();
 
 	public void setAdditionalClasspathList(List<String> classpathList);

@@ -20,6 +20,8 @@
 ////////////////////////////////////////////////////////////////////////////////
 package com.tomaszrup.groovyls;
 
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
 import com.tomaszrup.groovyls.config.CompilationUnitFactory;
 import com.tomaszrup.groovyls.config.ICompilationUnitFactory;
 import com.tomaszrup.groovyls.importers.GradleProjectImporter;
@@ -39,6 +41,9 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 public class GroovyLanguageServer implements LanguageServer, LanguageClientAware {
 
@@ -88,6 +93,14 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     private final List<ProjectImporter> importers;
     /** Maps each registered project root to the importer that owns it. */
     private final Map<Path, ProjectImporter> projectImporterMap = new LinkedHashMap<>();
+    /** Executor for background project import work (Gradle/Maven). */
+    private final ExecutorService importExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "groovyls-import");
+        t.setDaemon(true);
+        return t;
+    });
+    /** Future for the background import task, used for cancellation on shutdown. */
+    private volatile Future<?> importFuture;
 
     public GroovyLanguageServer() {
         this(new CompilationUnitFactory());
@@ -103,6 +116,31 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         this.importers = new ArrayList<>();
         this.importers.add(new GradleProjectImporter());
         this.importers.add(new MavenProjectImporter());
+
+        // Forward configuration changes to importers that need them.
+        this.groovyServices.setSettingsChangeListener(this::applyImporterSettings);
+    }
+
+    /**
+     * Push relevant VS Code settings to importers that can use them.
+     * Currently handles {@code groovy.maven.home}.
+     */
+    private void applyImporterSettings(JsonObject settings) {
+        if (!settings.has("groovy") || !settings.get("groovy").isJsonObject()) {
+            return;
+        }
+        JsonObject groovy = settings.get("groovy").getAsJsonObject();
+        if (groovy.has("maven") && groovy.get("maven").isJsonObject()) {
+            JsonObject maven = groovy.get("maven").getAsJsonObject();
+            JsonElement homeElem = maven.get("home");
+            String mavenHome = (homeElem != null && !homeElem.isJsonNull()) ? homeElem.getAsString() : null;
+
+            for (ProjectImporter importer : importers) {
+                if (importer instanceof MavenProjectImporter) {
+                    ((MavenProjectImporter) importer).setMavenHome(mavenHome);
+                }
+            }
+        }
     }
 
     /**
@@ -136,53 +174,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             groovyServices.setWorkspaceRoot(workspaceRoot);
         }
 
-        List<WorkspaceFolder> folders = params.getWorkspaceFolders();
-        if (folders != null) {
-            // Collect all projects (Gradle + Maven) and their classpaths first,
-            // then register them in batch so subproject exclusions can be computed.
-            Map<Path, List<String>> projectClasspaths = new LinkedHashMap<>();
-            Set<Path> claimedRoots = new LinkedHashSet<>();
-
-            for (WorkspaceFolder folder : folders) {
-                Path folderPath = Paths.get(URI.create(folder.getUri()));
-
-                for (ProjectImporter importer : importers) {
-                    try {
-                        logProgress("Discovering " + importer.getName() + " projects...");
-                        List<Path> projects = importer.discoverProjects(folderPath);
-                        if (!projects.isEmpty()) {
-                            logProgress("Found " + projects.size() + " " + importer.getName() + " project(s)");
-                        }
-                        for (Path projectRoot : projects) {
-                            // Skip if this directory was already claimed by a
-                            // higher-priority importer (e.g. Gradle before Maven)
-                            if (claimedRoots.contains(projectRoot)) {
-                                logger.info("Skipping {} project at {} — already claimed by another importer",
-                                        importer.getName(), projectRoot);
-                                continue;
-                            }
-
-                            logProgress("Importing " + importer.getName() + " project: " + projectRoot.getFileName());
-                            List<String> classpathList = importer.importProject(projectRoot);
-                            logProgress("Resolved " + classpathList.size() + " classpath entries for " + projectRoot.getFileName());
-                            projectClasspaths.put(projectRoot, classpathList);
-                            projectImporterMap.put(projectRoot, importer);
-                            claimedRoots.add(projectRoot);
-                        }
-                    } catch (IOException e) {
-                        logger.error("Error discovering {} projects in {}: {}",
-                                importer.getName(), folderPath, e.getMessage(), e);
-                    }
-                }
-            }
-
-            if (!projectClasspaths.isEmpty()) {
-                logProgress("Compiling " + projectClasspaths.size() + " project(s)...");
-                groovyServices.addProjects(projectClasspaths);
-                logProgress("Project import complete");
-            }
-        }
-
+        // Build capabilities immediately so the client doesn't block
         CompletionOptions completionOptions = new CompletionOptions(true, Arrays.asList("."));
         ServerCapabilities serverCapabilities = new ServerCapabilities();
         serverCapabilities.setCompletionProvider(completionOptions);
@@ -216,12 +208,98 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         serverCapabilities.setInlayHintProvider(inlayHintOptions);
         serverCapabilities.setDocumentFormattingProvider(true);
 
+        // Schedule heavy Gradle/Maven import work on a background thread so
+        // the LSP initialization response is returned immediately.
+        List<WorkspaceFolder> folders = params.getWorkspaceFolders();
+        if (folders != null && !folders.isEmpty()) {
+            final List<WorkspaceFolder> foldersSnapshot = new ArrayList<>(folders);
+            groovyServices.setImportInProgress(true);
+            importFuture = importExecutor.submit(() -> importProjectsAsync(foldersSnapshot));
+        } else {
+            // No workspace folders — nothing to import, signal completion
+            logProgress("Project import complete");
+        }
+
         InitializeResult initializeResult = new InitializeResult(serverCapabilities);
         return CompletableFuture.completedFuture(initializeResult);
     }
 
+    /**
+     * Performs the heavy Gradle/Maven project discovery and import on a
+     * background thread with progress reporting to the client.
+     */
+    private void importProjectsAsync(List<WorkspaceFolder> folders) {
+        try {
+            Map<Path, List<String>> projectClasspaths = new LinkedHashMap<>();
+            Set<Path> claimedRoots = new LinkedHashSet<>();
+
+            for (WorkspaceFolder folder : folders) {
+                if (Thread.currentThread().isInterrupted()) {
+                    logProgress("Project import cancelled");
+                    return;
+                }
+                Path folderPath = Paths.get(URI.create(folder.getUri()));
+
+                for (ProjectImporter importer : importers) {
+                    if (Thread.currentThread().isInterrupted()) {
+                        logProgress("Project import cancelled");
+                        return;
+                    }
+                    try {
+                        logProgress("Discovering " + importer.getName() + " projects...");
+                        List<Path> projects = importer.discoverProjects(folderPath);
+                        if (!projects.isEmpty()) {
+                            logProgress("Found " + projects.size() + " " + importer.getName() + " project(s)");
+                        }
+                        for (Path projectRoot : projects) {
+                            if (Thread.currentThread().isInterrupted()) {
+                                logProgress("Project import cancelled");
+                                return;
+                            }
+                            if (claimedRoots.contains(projectRoot)) {
+                                logger.info("Skipping {} project at {} — already claimed by another importer",
+                                        importer.getName(), projectRoot);
+                                continue;
+                            }
+
+                            logProgress("Importing " + importer.getName() + " project: " + projectRoot.getFileName());
+                            List<String> classpathList = importer.importProject(projectRoot);
+                            logProgress("Resolved " + classpathList.size() + " classpath entries for " + projectRoot.getFileName());
+                            projectClasspaths.put(projectRoot, classpathList);
+                            projectImporterMap.put(projectRoot, importer);
+                            claimedRoots.add(projectRoot);
+                        }
+                    } catch (IOException e) {
+                        logger.error("Error discovering {} projects in {}: {}",
+                                importer.getName(), folderPath, e.getMessage(), e);
+                    }
+                }
+            }
+
+            if (Thread.currentThread().isInterrupted()) {
+                logProgress("Project import cancelled");
+                return;
+            }
+
+            if (!projectClasspaths.isEmpty()) {
+                logProgress("Compiling " + projectClasspaths.size() + " project(s)...");
+                groovyServices.addProjects(projectClasspaths);
+            }
+            logProgress("Project import complete");
+        } catch (Exception e) {
+            logger.error("Background project import failed: {}", e.getMessage(), e);
+            logProgress("Project import failed: " + e.getMessage());
+        } finally {
+            groovyServices.onImportComplete();
+        }
+    }
+
     @Override
     public CompletableFuture<Object> shutdown() {
+        if (importFuture != null) {
+            importFuture.cancel(true);
+        }
+        importExecutor.shutdownNow();
         return CompletableFuture.completedFuture(new Object());
     }
 

@@ -20,38 +20,30 @@
 ////////////////////////////////////////////////////////////////////////////////
 package com.tomaszrup.groovyls;
 
-import java.io.File;
-import java.io.IOException;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Comparator;
-import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 
-import org.codehaus.groovy.GroovyBugError;
 import org.codehaus.groovy.ast.ASTNode;
-import org.codehaus.groovy.control.CompilationFailedException;
 import org.codehaus.groovy.control.ErrorCollector;
-import org.codehaus.groovy.control.Phases;
-import org.codehaus.groovy.control.messages.Message;
-import org.codehaus.groovy.control.messages.SyntaxErrorMessage;
-import org.codehaus.groovy.syntax.SyntaxException;
 import org.eclipse.lsp4j.*;
 import org.eclipse.lsp4j.jsonrpc.messages.Either;
 import org.eclipse.lsp4j.jsonrpc.messages.Either3;
@@ -61,11 +53,10 @@ import org.eclipse.lsp4j.services.TextDocumentService;
 import org.eclipse.lsp4j.services.WorkspaceService;
 
 import groovy.lang.GroovyClassLoader;
-import io.github.classgraph.ClassGraph;
-import io.github.classgraph.ClassGraphException;
 import io.github.classgraph.ScanResult;
+import com.tomaszrup.groovyls.compiler.CompilationOrchestrator;
+import com.tomaszrup.groovyls.compiler.DiagnosticHandler;
 import com.tomaszrup.groovyls.compiler.ast.ASTNodeVisitor;
-import com.tomaszrup.groovyls.compiler.ast.UnusedImportFinder;
 import com.tomaszrup.groovyls.compiler.control.GroovyLSCompilationUnit;
 import com.tomaszrup.groovyls.config.CompilationUnitFactory;
 import com.tomaszrup.groovyls.config.ICompilationUnitFactory;
@@ -89,13 +80,14 @@ import com.tomaszrup.groovyls.providers.WorkspaceSymbolProvider;
 import com.tomaszrup.groovyls.util.FileContentsTracker;
 import com.tomaszrup.groovyls.util.GroovyLanguageServerUtils;
 import com.tomaszrup.groovyls.util.JavaSourceLocator;
-import com.tomaszrup.lsp.utils.Positions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public class GroovyServices implements TextDocumentService, WorkspaceService, LanguageClientAware {
 	private static final Logger logger = LoggerFactory.getLogger(GroovyServices.class);
-	private static final Pattern PATTERN_CONSTRUCTOR_CALL = Pattern.compile(".*new \\w*$");
+
+	/** Debounce delay for didChange recompilation (milliseconds). */
+	private static final long DEBOUNCE_DELAY_MS = 300;
 
 	/**
 	 * Holds all per-project state: compilation unit, AST visitor, classpath, etc.
@@ -129,10 +121,25 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	private boolean semanticHighlightingEnabled = true;
 	private boolean formattingEnabled = true;
 
+	private final CompilationOrchestrator compilationOrchestrator = new CompilationOrchestrator();
+	private final DiagnosticHandler diagnosticHandler = new DiagnosticHandler();
+
+	// Debounce scheduler for didChange recompilation
+	private final ScheduledExecutorService debounceExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+		Thread t = new Thread(r, "groovyls-debounce");
+		t.setDaemon(true);
+		return t;
+	});
+	private volatile ScheduledFuture<?> pendingDebounce;
+
 	// Default scope (used when no build-tool projects are registered, e.g. in tests)
 	private ProjectScope defaultScope;
 	// Per-project scopes, sorted by path length desc for longest-prefix match
 	private List<ProjectScope> projectScopes = new ArrayList<>();
+	// True while a background project import (Gradle/Maven) is in progress.
+	// When true, didOpen/didChange/didClose skip compilation on the defaultScope
+	// to avoid wrong diagnostics (no classpath, entire workspace scanned).
+	private volatile boolean importInProgress;
 
 	/**
 	 * Guards all mutable state: projectScopes, defaultScope, fileContentsTracker,
@@ -140,13 +147,18 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	 *
 	 * <p><b>Write-lock</b> is acquired for operations that mutate state
 	 * (didOpen/didChange/didClose, compilation, AST visits, and the
-	 * placeholder-injection paths in {@code completion}/{@code signatureHelp}).</p>
+	 * placeholder-injection paths in {@code completion}/{@code signatureHelp}).
+	 * Placeholder injection uses direct {@link FileContentsTracker#setContents}
+	 * manipulation rather than the {@code didChangeInternal} pipeline, which
+	 * ensures the document is always restored even if recompilation fails.</p>
 	 *
 	 * <p><b>Read-lock</b> is acquired for LSP request handlers that only
 	 * query the AST (hover, definition, references, etc.).  These handlers
 	 * call {@link #ensureCompiledForContext(URI)} first, which briefly
 	 * upgrades to a write-lock <em>only</em> when the edit context has
-	 * actually changed and a recompilation is needed.</p>
+	 * actually changed and a recompilation is needed.  The upgrade
+	 * re-validates the scope after acquiring the write-lock to guard
+	 * against races in the lock-release window.</p>
 	 *
 	 * <p>This design allows multiple read-only requests to execute
 	 * concurrently while still serialising mutations.</p>
@@ -155,6 +167,39 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 
 	public GroovyServices(ICompilationUnitFactory factory) {
 		defaultScope = new ProjectScope(null, factory);
+	}
+
+	/**
+	 * Called by the language server to indicate that a background project
+	 * import (Gradle/Maven) is starting or has finished.
+	 */
+	public void setImportInProgress(boolean inProgress) {
+		this.importInProgress = inProgress;
+	}
+
+	/**
+	 * Called after the background project import completes (whether or not
+	 * any projects were found). If no build-tool projects were discovered,
+	 * compiles all open files with the default scope so the user gets
+	 * diagnostics.
+	 */
+	public void onImportComplete() {
+		stateLock.writeLock().lock();
+		try {
+			importInProgress = false;
+			if (projectScopes.isEmpty()) {
+				// No build-tool projects found — compile open files with defaultScope
+				Set<URI> openURIs = fileContentsTracker.getOpenURIs();
+				for (URI uri : openURIs) {
+					compileAndVisitAST(defaultScope, uri);
+				}
+				if (languageClient != null) {
+					languageClient.refreshSemanticTokens();
+				}
+			}
+		} finally {
+			stateLock.writeLock().unlock();
+		}
 	}
 
 	public void setWorkspaceRoot(Path workspaceRoot) {
@@ -208,12 +253,38 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			// Sort scopes by path length descending for longest-prefix-first matching
 			projectScopes.sort((a, b) -> b.projectRoot.toString().length() - a.projectRoot.toString().length());
 
+			// Clear any stale diagnostics from the default scope that may have
+			// been published before the import completed (e.g. from an early
+			// didChangeConfiguration/updateClasspath call).
+			clearDefaultScopeDiagnostics();
+
 			// Create compilation units, compile, and visit AST for each scope
 			for (ProjectScope scope : projectScopes) {
 				createOrUpdateCompilationUnit(scope);
 				fileContentsTracker.resetChangedFiles();
 				compile(scope);
 				visitAST(scope);
+			}
+
+			// Replay deferred didOpen compilations for files that were opened
+			// while the import was in progress.  The project-wide compile above
+			// already built the AST, but an individual compileAndVisitAST per
+			// open file ensures previousContext is set and diagnostics are
+			// published from the file's buffer (which may differ from disk).
+			Set<URI> openURIs = fileContentsTracker.getOpenURIs();
+			for (URI uri : openURIs) {
+				ProjectScope scope = findProjectScope(uri);
+				if (scope != null) {
+					compileAndVisitAST(scope, uri);
+				}
+			}
+
+			// Ask the client to re-request semantic tokens for open editors.
+			// Semantic tokens are pull-based so the client won't refresh them
+			// unless told to, and the initial request during import returned
+			// empty tokens because the AST wasn't ready yet.
+			if (languageClient != null) {
+				languageClient.refreshSemanticTokens();
 			}
 		} finally {
 			stateLock.writeLock().unlock();
@@ -268,7 +339,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			fileContentsTracker.didOpen(params);
 			URI uri = URI.create(params.getTextDocument().getUri());
 			ProjectScope scope = findProjectScope(uri);
-			if (scope != null) {
+			if (scope != null && !isImportPendingFor(scope)) {
 				compileAndVisitAST(scope, uri);
 			}
 		} finally {
@@ -276,24 +347,33 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		}
 	}
 
-	/** Internal didChange without locking — caller must hold write lock. */
-	private void didChangeInternal(DidChangeTextDocumentParams params) {
-		fileContentsTracker.didChange(params);
-		URI uri = URI.create(params.getTextDocument().getUri());
-		ProjectScope scope = findProjectScope(uri);
-		if (scope != null) {
-			compileAndVisitAST(scope, uri);
-		}
-	}
-
 	@Override
 	public void didChange(DidChangeTextDocumentParams params) {
+		// Always update the file contents immediately so the tracker is current
 		stateLock.writeLock().lock();
 		try {
-			didChangeInternal(params);
+			fileContentsTracker.didChange(params);
 		} finally {
 			stateLock.writeLock().unlock();
 		}
+
+		// Cancel any pending debounce and schedule a new recompilation
+		ScheduledFuture<?> prev = pendingDebounce;
+		if (prev != null) {
+			prev.cancel(false);
+		}
+		pendingDebounce = debounceExecutor.schedule(() -> {
+			stateLock.writeLock().lock();
+			try {
+				URI uri = URI.create(params.getTextDocument().getUri());
+				ProjectScope scope = findProjectScope(uri);
+				if (scope != null && !isImportPendingFor(scope)) {
+					compileAndVisitAST(scope, uri);
+				}
+			} finally {
+				stateLock.writeLock().unlock();
+			}
+		}, DEBOUNCE_DELAY_MS, TimeUnit.MILLISECONDS);
 	}
 
 	@Override
@@ -303,7 +383,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			fileContentsTracker.didClose(params);
 			URI uri = URI.create(params.getTextDocument().getUri());
 			ProjectScope scope = findProjectScope(uri);
-			if (scope != null) {
+			if (scope != null && !isImportPendingFor(scope)) {
 				compileAndVisitAST(scope, uri);
 			}
 		} finally {
@@ -324,10 +404,24 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		void onJavaFilesChanged(Path projectRoot);
 	}
 
+	/**
+	 * Callback interface for forwarding raw configuration settings to the
+	 * server layer (e.g. so {@code GroovyLanguageServer} can push
+	 * importer-specific settings like {@code groovy.maven.home}).
+	 */
+	public interface SettingsChangeListener {
+		void onSettingsChanged(JsonObject settings);
+	}
+
 	private JavaChangeListener javaChangeListener;
+	private SettingsChangeListener settingsChangeListener;
 
 	public void setJavaChangeListener(JavaChangeListener listener) {
 		this.javaChangeListener = listener;
+	}
+
+	public void setSettingsChangeListener(SettingsChangeListener listener) {
+		this.settingsChangeListener = listener;
 	}
 
 	@Override
@@ -392,6 +486,9 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 							.collect(Collectors.toSet());
 				}
 				if (!scopeUris.isEmpty()) {
+					// Invalidate file cache so that new/deleted .groovy files are picked up
+					scope.compilationUnitFactory.invalidateFileCache();
+
 					// After a Java recompile, invalidate + rebuild the compilation unit
 					if (projectsNeedingRecompile.contains(scope.projectRoot)) {
 						scope.compilationUnitFactory.invalidateCompilationUnit();
@@ -421,6 +518,9 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			JsonObject settings = (JsonObject) params.getSettings();
 			this.updateClasspath(settings);
 			this.updateFeatureToggles(settings);
+			if (settingsChangeListener != null) {
+				settingsChangeListener.onSettingsChanged(settings);
+			}
 		} finally {
 			stateLock.writeLock().unlock();
 		}
@@ -452,6 +552,16 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			// their own classpaths. The default scope should not override them.
 			if (!projectScopes.isEmpty()) {
 				logger.info("updateClasspath() ignored — {} project scope(s) are active", projectScopes.size());
+				return;
+			}
+			// Don't compile the default scope while a background import is in
+			// progress — it would scan the entire workspace with no classpath,
+			// causing duplicate-class and unresolved-import errors.
+			// Still store the classpath so it's available when the import
+			// finishes and onImportComplete() compiles the default scope.
+			if (importInProgress) {
+				logger.info("updateClasspath() deferred — project import in progress");
+				defaultScope.compilationUnitFactory.setAdditionalClasspathList(classpathList);
 				return;
 			}
 			if (!classpathList.equals(defaultScope.compilationUnitFactory.getAdditionalClasspathList())) {
@@ -515,39 +625,18 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			if (scope == null || scope.astVisitor == null) {
 				return CompletableFuture.completedFuture(Either.forRight(new CompletionList()));
 			}
-			recompileIfContextChanged(scope, uri);
+			// Flush any pending debounced changes before computing completions
+			if (!fileContentsTracker.getChangedURIs().isEmpty()) {
+				compileAndVisitAST(scope, uri);
+			} else {
+				recompileIfContextChanged(scope, uri);
+			}
 
 			String originalSource = null;
 			ASTNode offsetNode = scope.astVisitor.getNodeAtLineAndColumn(uri, position.getLine(),
 					position.getCharacter());
 			if (offsetNode == null) {
-				originalSource = fileContentsTracker.getContents(uri);
-				if (originalSource != null) {
-					VersionedTextDocumentIdentifier versionedTextDocument = new VersionedTextDocumentIdentifier(
-							textDocument.getUri(), 1);
-					int offset = Positions.getOffset(originalSource, position);
-					if (offset >= 0 && offset <= originalSource.length()) {
-						String lineBeforeOffset = originalSource.substring(
-								Math.max(0, offset - position.getCharacter()), offset);
-						Matcher matcher = PATTERN_CONSTRUCTOR_CALL.matcher(lineBeforeOffset);
-						TextDocumentContentChangeEvent changeEvent;
-						if (matcher.matches()) {
-							changeEvent = new TextDocumentContentChangeEvent(new Range(position, position), 0, "a()");
-						} else {
-							changeEvent = new TextDocumentContentChangeEvent(new Range(position, position), 0, "a");
-						}
-						DidChangeTextDocumentParams didChangeParams = new DidChangeTextDocumentParams(
-								versionedTextDocument, Collections.singletonList(changeEvent));
-						// Placeholder hack: inject a temporary property name to force a
-						// PropertyExpression in the AST when the cursor is after a dot
-						// with no property name yet (syntax error). Restored below.
-						didChangeInternal(didChangeParams);
-					} else {
-						logger.debug("completion: offset {} out of bounds for source length {}", offset,
-								originalSource.length());
-						originalSource = null; // nothing was injected
-					}
-				}
+				originalSource = injectCompletionPlaceholder(scope, uri, position);
 			}
 
 			CompletableFuture<Either<List<CompletionItem>, CompletionList>> result;
@@ -579,13 +668,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 				}
 			} finally {
 				if (originalSource != null) {
-					VersionedTextDocumentIdentifier versionedTextDocument = new VersionedTextDocumentIdentifier(
-							textDocument.getUri(), 1);
-					TextDocumentContentChangeEvent changeEvent = new TextDocumentContentChangeEvent(null, 0,
-							originalSource);
-					DidChangeTextDocumentParams didChangeParams = new DidChangeTextDocumentParams(
-							versionedTextDocument, Collections.singletonList(changeEvent));
-					didChangeInternal(didChangeParams);
+					restoreDocumentSource(scope, uri, originalSource);
 				}
 			}
 
@@ -626,31 +709,18 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			if (scope == null || scope.astVisitor == null) {
 				return CompletableFuture.completedFuture(new SignatureHelp());
 			}
-			recompileIfContextChanged(scope, uri);
+			// Flush any pending debounced changes before computing signature help
+			if (!fileContentsTracker.getChangedURIs().isEmpty()) {
+				compileAndVisitAST(scope, uri);
+			} else {
+				recompileIfContextChanged(scope, uri);
+			}
 
 			String originalSource = null;
 			ASTNode offsetNode = scope.astVisitor.getNodeAtLineAndColumn(uri, position.getLine(),
 					position.getCharacter());
 			if (offsetNode == null) {
-				originalSource = fileContentsTracker.getContents(uri);
-				if (originalSource != null) {
-					VersionedTextDocumentIdentifier versionedTextDocument = new VersionedTextDocumentIdentifier(
-							textDocument.getUri(), 1);
-					int offset = Positions.getOffset(originalSource, position);
-					if (offset >= 0 && offset <= originalSource.length()) {
-						TextDocumentContentChangeEvent changeEvent = new TextDocumentContentChangeEvent(
-								new Range(position, position), 0, ")");
-						DidChangeTextDocumentParams didChangeParams = new DidChangeTextDocumentParams(
-								versionedTextDocument, Collections.singletonList(changeEvent));
-						// Placeholder hack: inject a temporary ) to close an unclosed ( and
-						// create an ArgumentListExpression in the AST. Restored below.
-						didChangeInternal(didChangeParams);
-					} else {
-						logger.debug("signatureHelp: offset {} out of bounds for source length {}", offset,
-								originalSource.length());
-						originalSource = null; // nothing was injected
-					}
-				}
+				originalSource = injectSignatureHelpPlaceholder(scope, uri, position);
 			}
 
 			try {
@@ -658,13 +728,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 				return provider.provideSignatureHelp(params.getTextDocument(), params.getPosition());
 			} finally {
 				if (originalSource != null) {
-					VersionedTextDocumentIdentifier versionedTextDocument = new VersionedTextDocumentIdentifier(
-							textDocument.getUri(), 1);
-					TextDocumentContentChangeEvent changeEvent = new TextDocumentContentChangeEvent(null, 0,
-							originalSource);
-					DidChangeTextDocumentParams didChangeParams = new DidChangeTextDocumentParams(
-							versionedTextDocument, Collections.singletonList(changeEvent));
-					didChangeInternal(didChangeParams);
+					restoreDocumentSource(scope, uri, originalSource);
 				}
 			}
 		} finally {
@@ -907,67 +971,210 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 				return CompletableFuture.completedFuture(unresolved);
 			}
 
+			// Extract signature info from CompletionItem.data if available
+			String signature = null;
+			String declaringClassName = null;
+			Object data = unresolved.getData();
+			if (data instanceof com.google.gson.JsonObject) {
+				com.google.gson.JsonObject jsonData = (com.google.gson.JsonObject) data;
+				if (jsonData.has("signature")) {
+					signature = jsonData.get("signature").getAsString();
+				}
+				if (jsonData.has("declaringClass")) {
+					declaringClassName = jsonData.get("declaringClass").getAsString();
+				}
+			} else if (data instanceof com.google.gson.JsonElement) {
+				try {
+					com.google.gson.JsonObject jsonData = ((com.google.gson.JsonElement) data).getAsJsonObject();
+					if (jsonData.has("signature")) {
+						signature = jsonData.get("signature").getAsString();
+					}
+					if (jsonData.has("declaringClass")) {
+						declaringClassName = jsonData.get("declaringClass").getAsString();
+					}
+				} catch (Exception e) {
+					// not a JSON object, ignore
+				}
+			}
+
 			// Search all scopes for matching AST node to retrieve documentation
 			for (ProjectScope scope : getAllScopes()) {
 				if (scope.astVisitor == null) {
 					continue;
 				}
-				String docs = resolveDocumentation(scope, label, kind);
+				String docs = resolveDocumentation(scope, label, kind, signature, declaringClassName);
 				if (docs != null) {
 					unresolved.setDocumentation(new MarkupContent(MarkupKind.MARKDOWN, docs));
 					break;
 				}
 			}
+
+			// If still no documentation, try to load Javadoc from classpath source JARs
+			if (unresolved.getDocumentation() == null && declaringClassName != null) {
+				for (ProjectScope scope : getAllScopes()) {
+					String javadoc = resolveJavadocFromClasspath(scope, label, kind, signature, declaringClassName);
+					if (javadoc != null) {
+						unresolved.setDocumentation(new MarkupContent(MarkupKind.MARKDOWN, javadoc));
+						break;
+					}
+				}
+			}
+
 			return CompletableFuture.completedFuture(unresolved);
 		} finally {
 			stateLock.readLock().unlock();
 		}
 	}
 
-	private String resolveDocumentation(ProjectScope scope, String label, CompletionItemKind kind) {
+	/**
+	 * Build a parameter signature string from a MethodNode for comparison.
+	 * Format: comma-separated fully qualified type names, e.g. "java.lang.String,int"
+	 */
+	private static String buildMethodSignature(org.codehaus.groovy.ast.MethodNode method) {
+		org.codehaus.groovy.ast.Parameter[] params = method.getParameters();
+		StringBuilder sig = new StringBuilder();
+		for (int i = 0; i < params.length; i++) {
+			if (i > 0) {
+				sig.append(",");
+			}
+			sig.append(params[i].getType().getName());
+		}
+		return sig.toString();
+	}
+
+	private String resolveDocumentation(ProjectScope scope, String label, CompletionItemKind kind,
+			String signature, String declaringClassName) {
 		if (kind == CompletionItemKind.Method) {
-			for (org.codehaus.groovy.ast.ClassNode classNode : scope.astVisitor.getClassNodes()) {
-				for (org.codehaus.groovy.ast.MethodNode method : classNode.getMethods()) {
-					if (method.getName().equals(label)) {
-						String docs = com.tomaszrup.groovyls.compiler.util.GroovydocUtils
-								.groovydocToMarkdownDescription(method.getGroovydoc());
-						if (docs != null) {
-							return docs;
-						}
-					}
-				}
-			}
-		} else if (kind == CompletionItemKind.Property || kind == CompletionItemKind.Field) {
-			for (org.codehaus.groovy.ast.ClassNode classNode : scope.astVisitor.getClassNodes()) {
-				for (org.codehaus.groovy.ast.PropertyNode prop : classNode.getProperties()) {
-					if (prop.getName().equals(label)) {
-						String docs = com.tomaszrup.groovyls.compiler.util.GroovydocUtils
-								.groovydocToMarkdownDescription(prop.getGroovydoc());
-						if (docs != null) {
-							return docs;
-						}
-					}
-				}
-				for (org.codehaus.groovy.ast.FieldNode field : classNode.getFields()) {
-					if (field.getName().equals(label)) {
-						String docs = com.tomaszrup.groovyls.compiler.util.GroovydocUtils
-								.groovydocToMarkdownDescription(field.getGroovydoc());
-						if (docs != null) {
-							return docs;
-						}
-					}
-				}
-			}
-		} else if (kind == CompletionItemKind.Class || kind == CompletionItemKind.Interface
-				|| kind == CompletionItemKind.Enum) {
-			for (org.codehaus.groovy.ast.ClassNode classNode : scope.astVisitor.getClassNodes()) {
-				if (classNode.getNameWithoutPackage().equals(label) || classNode.getName().equals(label)) {
-					String docs = com.tomaszrup.groovyls.compiler.util.GroovydocUtils
-							.groovydocToMarkdownDescription(classNode.getGroovydoc());
+			// When declaringClassName is available, look up only that class (O(1) lookup
+			// via the AST visitor's class node map) instead of scanning all classes.
+			if (declaringClassName != null) {
+				org.codehaus.groovy.ast.ClassNode classNode = scope.astVisitor.getClassNodeByName(declaringClassName);
+				if (classNode != null) {
+					String docs = findMethodDocs(classNode, label, signature);
 					if (docs != null) {
 						return docs;
 					}
 				}
+			}
+			// Fallback: scan all class nodes
+			for (org.codehaus.groovy.ast.ClassNode classNode : scope.astVisitor.getClassNodes()) {
+				String docs = findMethodDocs(classNode, label, signature);
+				if (docs != null) {
+					return docs;
+				}
+			}
+		} else if (kind == CompletionItemKind.Property || kind == CompletionItemKind.Field) {
+			if (declaringClassName != null) {
+				org.codehaus.groovy.ast.ClassNode classNode = scope.astVisitor.getClassNodeByName(declaringClassName);
+				if (classNode != null) {
+					String docs = findFieldOrPropertyDocs(classNode, label);
+					if (docs != null) {
+						return docs;
+					}
+				}
+			}
+			for (org.codehaus.groovy.ast.ClassNode classNode : scope.astVisitor.getClassNodes()) {
+				String docs = findFieldOrPropertyDocs(classNode, label);
+				if (docs != null) {
+					return docs;
+				}
+			}
+		} else if (kind == CompletionItemKind.Class || kind == CompletionItemKind.Interface
+				|| kind == CompletionItemKind.Enum) {
+			// Direct name lookup first
+			org.codehaus.groovy.ast.ClassNode classNode = scope.astVisitor.getClassNodeByName(label);
+			if (classNode != null) {
+				String docs = com.tomaszrup.groovyls.compiler.util.GroovydocUtils
+						.groovydocToMarkdownDescription(classNode.getGroovydoc());
+				if (docs != null) {
+					return docs;
+				}
+			}
+			// Fallback: scan by simple name
+			for (org.codehaus.groovy.ast.ClassNode cn : scope.astVisitor.getClassNodes()) {
+				if (cn.getNameWithoutPackage().equals(label) || cn.getName().equals(label)) {
+					String docs = com.tomaszrup.groovyls.compiler.util.GroovydocUtils
+							.groovydocToMarkdownDescription(cn.getGroovydoc());
+					if (docs != null) {
+						return docs;
+					}
+				}
+			}
+		}
+		return null;
+	}
+
+	private static String findMethodDocs(org.codehaus.groovy.ast.ClassNode classNode,
+			String label, String signature) {
+		for (org.codehaus.groovy.ast.MethodNode method : classNode.getMethods()) {
+			if (!method.getName().equals(label)) {
+				continue;
+			}
+			if (signature != null) {
+				String methodSig = buildMethodSignature(method);
+				if (!methodSig.equals(signature)) {
+					continue;
+				}
+			}
+			String docs = com.tomaszrup.groovyls.compiler.util.GroovydocUtils
+					.groovydocToMarkdownDescription(method.getGroovydoc());
+			if (docs != null) {
+				return docs;
+			}
+		}
+		return null;
+	}
+
+	private static String findFieldOrPropertyDocs(org.codehaus.groovy.ast.ClassNode classNode, String label) {
+		for (org.codehaus.groovy.ast.PropertyNode prop : classNode.getProperties()) {
+			if (prop.getName().equals(label)) {
+				String docs = com.tomaszrup.groovyls.compiler.util.GroovydocUtils
+						.groovydocToMarkdownDescription(prop.getGroovydoc());
+				if (docs != null) {
+					return docs;
+				}
+			}
+		}
+		for (org.codehaus.groovy.ast.FieldNode field : classNode.getFields()) {
+			if (field.getName().equals(label)) {
+				String docs = com.tomaszrup.groovyls.compiler.util.GroovydocUtils
+						.groovydocToMarkdownDescription(field.getGroovydoc());
+				if (docs != null) {
+					return docs;
+				}
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Attempt to resolve Javadoc documentation from classpath source JARs.
+	 * For each JAR on the classpath, looks for a corresponding *-sources.jar
+	 * in the same directory and extracts Javadoc for the specified class/method.
+	 */
+	private String resolveJavadocFromClasspath(ProjectScope scope, String label, CompletionItemKind kind,
+			String signature, String declaringClassName) {
+		if (scope.compilationUnit == null || declaringClassName == null) {
+			return null;
+		}
+		List<String> classpathList = scope.compilationUnit.getConfiguration().getClasspath();
+		if (classpathList == null) {
+			return null;
+		}
+		for (String cpEntry : classpathList) {
+			if (!cpEntry.endsWith(".jar")) {
+				continue;
+			}
+			// Try to find a corresponding -sources.jar
+			String sourcesJarPath = cpEntry.replaceAll("\\.jar$", "-sources.jar");
+			Path sourcesJar = Paths.get(sourcesJarPath);
+			if (!Files.exists(sourcesJar)) {
+				continue;
+			}
+			String javadoc = JavadocResolver.resolveFromSourcesJar(sourcesJar, declaringClassName, label, kind,
+					signature);
+			if (javadoc != null) {
+				return javadoc;
 			}
 		}
 		return null;
@@ -991,66 +1198,57 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 
 	// --- INTERNAL
 
-	private void visitAST(ProjectScope scope) {
-		if (scope.compilationUnit == null) {
-			return;
+	/**
+	 * Returns true if a background import is in progress and the given scope
+	 * is the default (workspace-wide) scope. Compilation should be skipped in
+	 * this situation because the default scope has no classpath and scans the
+	 * entire workspace, producing incorrect diagnostics.
+	 */
+	private boolean isImportPendingFor(ProjectScope scope) {
+		return importInProgress && scope == defaultScope && projectScopes.isEmpty();
+	}
+
+	/**
+	 * Publishes empty diagnostics for every file that defaultScope previously
+	 * reported errors on, so the client clears them.
+	 */
+	private void clearDefaultScopeDiagnostics() {
+		if (defaultScope.prevDiagnosticsByFile != null && languageClient != null) {
+			for (URI uri : defaultScope.prevDiagnosticsByFile.keySet()) {
+				languageClient.publishDiagnostics(
+						new PublishDiagnosticsParams(uri.toString(), new ArrayList<>()));
+			}
+			defaultScope.prevDiagnosticsByFile = null;
 		}
-		scope.astVisitor = new ASTNodeVisitor();
-		scope.astVisitor.visitCompilationUnit(scope.compilationUnit);
+	}
+
+	private void visitAST(ProjectScope scope) {
+		ASTNodeVisitor visitor = compilationOrchestrator.visitAST(scope.compilationUnit);
+		if (visitor != null) {
+			scope.astVisitor = visitor;
+		}
 	}
 
 	private void visitAST(ProjectScope scope, Set<URI> uris) {
-		if (scope.astVisitor == null) {
-			visitAST(scope);
-			return;
-		}
-		if (scope.compilationUnit == null) {
-			return;
-		}
-		scope.astVisitor.visitCompilationUnit(scope.compilationUnit, uris);
+		scope.astVisitor = compilationOrchestrator.visitAST(
+				scope.compilationUnit, scope.astVisitor, uris);
 	}
 
 	private boolean createOrUpdateCompilationUnit(ProjectScope scope) {
-		if (scope.compilationUnit != null) {
-			File targetDirectory = scope.compilationUnit.getConfiguration().getTargetDirectory();
-			if (targetDirectory != null && targetDirectory.exists()) {
-				try {
-					Files.walk(targetDirectory.toPath()).sorted(Comparator.reverseOrder()).map(Path::toFile)
-							.forEach(File::delete);
-				} catch (IOException e) {
-					logger.error("Failed to delete target directory: {}", targetDirectory.getAbsolutePath(), e);
-					scope.compilationUnit = null;
-					return false;
-				}
-			}
-		}
+		GroovyLSCompilationUnit[] cuHolder = { scope.compilationUnit };
+		ASTNodeVisitor[] avHolder = { scope.astVisitor };
+		ScanResult[] srHolder = { scope.classGraphScanResult };
+		GroovyClassLoader[] clHolder = { scope.classLoader };
 
-		GroovyLSCompilationUnit oldCompilationUnit = scope.compilationUnit;
-		scope.compilationUnit = scope.compilationUnitFactory.create(scope.projectRoot, fileContentsTracker);
+		boolean result = compilationOrchestrator.createOrUpdateCompilationUnit(
+				cuHolder, avHolder, scope.projectRoot,
+				scope.compilationUnitFactory, fileContentsTracker,
+				srHolder, clHolder);
 
-		if (scope.compilationUnit != null) {
-			File targetDirectory = scope.compilationUnit.getConfiguration().getTargetDirectory();
-			if (targetDirectory != null && !targetDirectory.exists() && !targetDirectory.mkdirs()) {
-				logger.error("Failed to create target directory: {}", targetDirectory.getAbsolutePath());
-			}
-			GroovyClassLoader newClassLoader = scope.compilationUnit.getClassLoader();
-			if (!newClassLoader.equals(scope.classLoader)) {
-				scope.classLoader = newClassLoader;
-
-				try {
-					scope.classGraphScanResult = new ClassGraph().overrideClassLoaders(scope.classLoader)
-							.enableClassInfo()
-							.enableSystemJarsAndModules()
-							.scan();
-				} catch (ClassGraphException e) {
-					scope.classGraphScanResult = null;
-				}
-			}
-		} else {
-			scope.classGraphScanResult = null;
-		}
-
-		return scope.compilationUnit != null && scope.compilationUnit.equals(oldCompilationUnit);
+		scope.compilationUnit = cuHolder[0];
+		scope.classGraphScanResult = srHolder[0];
+		scope.classLoader = clHolder[0];
+		return result;
 	}
 
 	/**
@@ -1058,6 +1256,12 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	 * compilation for that context.  A brief <em>read-lock</em> check is
 	 * performed first; the write-lock is only acquired when the context has
 	 * actually changed and a recompilation is needed.
+	 *
+	 * <p>After upgrading to the write-lock, the scope is re-validated via
+	 * {@link #findProjectScope(URI)} to guard against races during the
+	 * window between releasing the read-lock and acquiring the write-lock
+	 * (another thread may have invalidated the scope or already performed
+	 * the recompilation).</p>
 	 *
 	 * <p><b>Important:</b> the caller must <em>not</em> hold any lock when
 	 * calling this method.</p>
@@ -1073,7 +1277,10 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			if (scope == null || scope.astVisitor == null) {
 				return scope;
 			}
-			needsRecompile = scope.previousContext != null && !scope.previousContext.equals(uri);
+			// Recompile if the context changed OR there are pending changes
+			// (e.g. from a debounced didChange that hasn't compiled yet)
+			needsRecompile = (scope.previousContext != null && !scope.previousContext.equals(uri))
+					|| !fileContentsTracker.getChangedURIs().isEmpty();
 		} finally {
 			stateLock.readLock().unlock();
 		}
@@ -1081,8 +1288,16 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		if (needsRecompile) {
 			stateLock.writeLock().lock();
 			try {
-				// Double-check: another thread may have already recompiled
-				recompileIfContextChanged(scope, uri);
+				scope = findProjectScope(uri);
+				if (scope == null || scope.astVisitor == null) {
+					return scope;
+				}
+				// Re-check for pending changes under write lock
+				if (!fileContentsTracker.getChangedURIs().isEmpty()) {
+					compileAndVisitAST(scope, uri);
+				} else if (scope.previousContext != null && !scope.previousContext.equals(uri)) {
+					recompileIfContextChanged(scope, uri);
+				}
 			} finally {
 				stateLock.writeLock().unlock();
 			}
@@ -1095,8 +1310,15 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		if (scope.previousContext == null || scope.previousContext.equals(newContext)) {
 			return;
 		}
-		fileContentsTracker.forceChanged(newContext);
-		compileAndVisitAST(scope, newContext);
+		// Only recompile if there are actual pending changes. Simply switching
+		// to a different file should not trigger a full recompilation — the AST
+		// is still valid from the previous compilation.
+		if (!fileContentsTracker.getChangedURIs().isEmpty()) {
+			compileAndVisitAST(scope, newContext);
+		} else {
+			// No changes pending — just update the context pointer
+			scope.previousContext = newContext;
+		}
 	}
 
 	private void compileAndVisitAST(ProjectScope scope, URI contextURI) {
@@ -1112,97 +1334,66 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		scope.previousContext = contextURI;
 	}
 
-	private void compile(ProjectScope scope) {
-		if (scope.compilationUnit == null) {
-			logger.warn("compile() called but compilationUnit is null for scope {}", scope.projectRoot);
-			return;
+	// --- PLACEHOLDER INJECTION HELPERS
+
+	/**
+	 * Injects a placeholder into the document source to force AST node creation
+	 * at the cursor position for completion.
+	 *
+	 * <p><b>Caller must hold the write lock.</b></p>
+	 *
+	 * @return the original source text before injection, or {@code null} if no
+	 *         injection was performed
+	 */
+	private String injectCompletionPlaceholder(ProjectScope scope, URI uri, Position position) {
+		String originalSource = compilationOrchestrator.injectCompletionPlaceholder(
+				scope.astVisitor, fileContentsTracker, uri, position);
+		if (originalSource != null) {
+			compileAndVisitAST(scope, uri);
 		}
-		logger.info("Compiling scope: {}, classpath entries: {}", scope.projectRoot,
-				scope.compilationUnit.getConfiguration().getClasspath().size());
-		try {
-			// AST is completely built after the canonicalization phase
-			// for code intelligence, we shouldn't need to go further
-			// http://groovy-lang.org/metaprogramming.html#_compilation_phases_guide
-			scope.compilationUnit.compile(Phases.CANONICALIZATION);
-		} catch (CompilationFailedException e) {
-			logger.info("Compilation failed (expected for incomplete code) for scope {}: {}", scope.projectRoot, e.getMessage());
-		} catch (GroovyBugError e) {
-			logger.warn("Groovy compiler bug during compilation for scope {} (this is usually harmless for code intelligence): {}",
-					scope.projectRoot, e.getMessage());
-			logger.debug("GroovyBugError details", e);
-		} catch (Exception e) {
-			logger.warn("Unexpected exception during compilation for scope {}: {}",
-					scope.projectRoot, e.getMessage());
-			logger.debug("Compilation exception details", e);
-		}
-		Set<PublishDiagnosticsParams> diagnostics = handleErrorCollector(scope,
-				scope.compilationUnit.getErrorCollector());
-		diagnostics.stream().forEach(languageClient::publishDiagnostics);
+		return originalSource;
 	}
 
-	private Set<PublishDiagnosticsParams> handleErrorCollector(ProjectScope scope, ErrorCollector collector) {
-		Map<URI, List<Diagnostic>> diagnosticsByFile = new HashMap<>();
-
-		// Find unused imports and add them as diagnostics with the Unnecessary tag
-		UnusedImportFinder unusedImportFinder = new UnusedImportFinder();
-		Map<URI, List<org.codehaus.groovy.ast.ImportNode>> unusedImportsByFile = unusedImportFinder
-				.findUnusedImports(scope.compilationUnit);
-		for (Map.Entry<URI, List<org.codehaus.groovy.ast.ImportNode>> entry : unusedImportsByFile.entrySet()) {
-			URI uri = entry.getKey();
-			for (org.codehaus.groovy.ast.ImportNode importNode : entry.getValue()) {
-				Range range = GroovyLanguageServerUtils.astNodeToRange(importNode);
-				if (range == null) {
-					continue;
-				}
-				Diagnostic diagnostic = new Diagnostic();
-				diagnostic.setRange(range);
-				diagnostic.setSeverity(DiagnosticSeverity.Hint);
-				diagnostic.setMessage("Unused import");
-				diagnostic.setTags(Collections.singletonList(DiagnosticTag.Unnecessary));
-				diagnostic.setSource("groovy");
-				diagnosticsByFile.computeIfAbsent(uri, (key) -> new ArrayList<>()).add(diagnostic);
-			}
+	/**
+	 * Injects a closing parenthesis placeholder into the document source to force
+	 * {@code ArgumentListExpression} creation in the AST for signature help.
+	 *
+	 * <p><b>Caller must hold the write lock.</b></p>
+	 *
+	 * @return the original source text before injection, or {@code null} if no
+	 *         injection was performed
+	 */
+	private String injectSignatureHelpPlaceholder(ProjectScope scope, URI uri, Position position) {
+		String originalSource = compilationOrchestrator.injectSignatureHelpPlaceholder(
+				fileContentsTracker, uri, position);
+		if (originalSource != null) {
+			compileAndVisitAST(scope, uri);
 		}
+		return originalSource;
+	}
 
-		List<? extends Message> errors = collector.getErrors();
-		if (errors != null && !errors.isEmpty()) {
-			logger.info("Scope {} has {} compilation errors", scope.projectRoot, errors.size());
+	/**
+	 * Restores the original document source after placeholder injection.
+	 *
+	 * <p><b>Caller must hold the write lock.</b></p>
+	 */
+	private void restoreDocumentSource(ProjectScope scope, URI uri, String originalSource) {
+		compilationOrchestrator.restoreDocumentSource(fileContentsTracker, uri, originalSource);
+		try {
+			compileAndVisitAST(scope, uri);
+		} catch (Exception e) {
+			logger.error("Failed to recompile after restoring document {}: {}", uri, e.getMessage());
 		}
-		if (errors != null) {
-			errors.stream().filter((Object message) -> message instanceof SyntaxErrorMessage)
-					.forEach((Object message) -> {
-						SyntaxErrorMessage syntaxErrorMessage = (SyntaxErrorMessage) message;
-						SyntaxException cause = syntaxErrorMessage.getCause();
-						Range range = GroovyLanguageServerUtils.syntaxExceptionToRange(cause);
-						if (range == null) {
-							// range can't be null in a Diagnostic, so we need
-							// a fallback
-							range = new Range(new Position(0, 0), new Position(0, 0));
-						}
-						Diagnostic diagnostic = new Diagnostic();
-						diagnostic.setRange(range);
-						diagnostic.setSeverity(cause.isFatal() ? DiagnosticSeverity.Error : DiagnosticSeverity.Warning);
-						diagnostic.setMessage(cause.getMessage());
-						URI uri = Paths.get(cause.getSourceLocator()).toUri();
-						logger.info("  Diagnostic [{}] in {}: {}", scope.projectRoot, uri, cause.getMessage());
-						diagnosticsByFile.computeIfAbsent(uri, (key) -> new ArrayList<>()).add(diagnostic);
-					});
-		}
+	}
 
-		Set<PublishDiagnosticsParams> result = diagnosticsByFile.entrySet().stream()
-				.map(entry -> new PublishDiagnosticsParams(entry.getKey().toString(), entry.getValue()))
-				.collect(Collectors.toSet());
-
-		if (scope.prevDiagnosticsByFile != null) {
-			for (URI key : scope.prevDiagnosticsByFile.keySet()) {
-				if (!diagnosticsByFile.containsKey(key)) {
-					// send an empty list of diagnostics for files that had
-					// diagnostics previously or they won't be cleared
-					result.add(new PublishDiagnosticsParams(key.toString(), new ArrayList<>()));
-				}
-			}
+	private void compile(ProjectScope scope) {
+		ErrorCollector collector = compilationOrchestrator.compile(
+				scope.compilationUnit, scope.projectRoot);
+		if (collector != null) {
+			DiagnosticHandler.DiagnosticResult result = diagnosticHandler.handleErrorCollector(
+					scope.compilationUnit, collector, scope.projectRoot, scope.prevDiagnosticsByFile);
+			scope.prevDiagnosticsByFile = result.getDiagnosticsByFile();
+			result.getDiagnosticsToPublish().forEach(languageClient::publishDiagnostics);
 		}
-		scope.prevDiagnosticsByFile = diagnosticsByFile;
-		return result;
 	}
 }

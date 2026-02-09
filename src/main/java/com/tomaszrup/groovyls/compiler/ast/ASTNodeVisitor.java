@@ -138,6 +138,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 	private Stack<ASTNode> stack = new Stack<>();
 	private Map<URI, List<ASTNode>> nodesByURI = new HashMap<>();
 	private Map<URI, List<ClassNode>> classNodesByURI = new HashMap<>();
+	private Map<String, ClassNode> classNodesByName = new HashMap<>();
 	private Map<ASTLookupKey, ASTNodeLookupData> lookup = new HashMap<>();
 
 	private void pushASTNode(ASTNode node) {
@@ -171,6 +172,14 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 			result.addAll(nodes);
 		}
 		return result;
+	}
+
+	/**
+	 * Looks up a class node by its fully-qualified name in O(1) time.
+	 * Returns {@code null} if no class with that name is in the AST.
+	 */
+	public ClassNode getClassNodeByName(String name) {
+		return classNodesByName.get(name);
 	}
 
 	public List<ASTNode> getNodes() {
@@ -276,6 +285,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 	public void visitCompilationUnit(CompilationUnit unit) {
 		nodesByURI.clear();
 		classNodesByURI.clear();
+		classNodesByName.clear();
 		lookup.clear();
 		unit.iterator().forEachRemaining(sourceUnit -> {
 			visitSourceUnit(sourceUnit);
@@ -291,7 +301,10 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 					lookup.remove(new ASTLookupKey(node));
 				});
 			}
-			classNodesByURI.remove(uri);
+			List<ClassNode> oldClassNodes = classNodesByURI.remove(uri);
+			if (oldClassNodes != null) {
+				oldClassNodes.forEach(cn -> classNodesByName.remove(cn.getName()));
+			}
 		});
 		unit.iterator().forEachRemaining(sourceUnit -> {
 			URI uri = sourceUnit.getSource().getURI();
@@ -332,6 +345,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 	public void visitClass(ClassNode node) {
 		URI uri = sourceUnit.getSource().getURI();
 		classNodesByURI.get(uri).add(node);
+		classNodesByName.put(node.getName(), node);
 		pushASTNode(node);
 		try {
 			ClassNode unresolvedSuperClass = node.getUnresolvedSuperClass();

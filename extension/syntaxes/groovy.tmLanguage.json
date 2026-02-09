@@ -12,8 +12,8 @@
     { "include": "#constants" },
     { "include": "#numbers" },
     { "include": "#types" },
-    { "include": "#storage" },
     { "include": "#class-declaration" },
+    { "include": "#storage" },
     { "include": "#method-declaration" },
     { "include": "#closure-params" },
     { "include": "#method-call" },
@@ -168,8 +168,27 @@
     "regexp": {
       "patterns": [
         {
+          "comment": "Tilde-prefixed slashy regex: ~/pattern/ — unambiguous",
           "name": "string.regexp.groovy",
-          "begin": "~?/(?![/*+{}?])",
+          "begin": "~/(?![/*+{}?])",
+          "end": "/([gimsxUd]*)",
+          "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.groovy" } },
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.string.end.groovy" },
+            "1": { "name": "keyword.other.regexp.flags.groovy" }
+          },
+          "patterns": [
+            {
+              "name": "constant.character.escape.groovy",
+              "match": "\\\\/"
+            },
+            { "include": "#gstring-interpolation" }
+          ]
+        },
+        {
+          "comment": "Bare slashy regex: /pattern/ — lookbehind rejects division (after \\w, ), ])",
+          "name": "string.regexp.groovy",
+          "begin": "(?<![\\w)\\]])/(?![/*+{}?\\s])",
           "end": "/([gimsxUd]*)",
           "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.groovy" } },
           "endCaptures": {
@@ -190,7 +209,7 @@
       "patterns": [
         {
           "name": "keyword.control.groovy",
-          "match": "\\b(if|else|for|while|do|switch|case|default|break|continue|return|try|catch|finally|throw|assert|in|yield)\\b"
+          "match": "\\b(if|else|for|while|do|switch|case|default|break|continue|return|assert|in|yield)\\b"
         },
         {
           "name": "keyword.control.exception.groovy",
@@ -210,7 +229,7 @@
         },
         {
           "name": "keyword.other.groovy",
-          "match": "\\b(def|var|it|this|super|with|trait|implements|extends)\\b"
+          "match": "\\b(def|var|it|this|super|with|implements|extends)\\b"
         }
       ]
     },
@@ -254,16 +273,16 @@
       "patterns": [
         {
           "name": "storage.modifier.groovy",
-          "match": "\\b(public|protected|private|static|final|abstract|native|synchronized|transient|volatile|strictfp)\\b"
+          "match": "\\b(public|protected|private|static|final|abstract|native|synchronized|transient|volatile|strictfp|sealed|non-sealed|permits)\\b"
         },
         {
           "name": "storage.type.groovy",
-          "match": "\\b(class|interface|enum|trait)\\b"
+          "match": "\\b(class|interface|enum|trait|record)\\b"
         }
       ]
     },
     "class-declaration": {
-      "match": "\\b(class|interface|enum|trait)\\s+([A-Za-z_]\\w*)",
+      "match": "\\b(class|interface|enum|trait|record)\\s+([A-Za-z_]\\w*)",
       "captures": {
         "1": { "name": "storage.type.groovy" },
         "2": { "name": "entity.name.type.class.groovy" }

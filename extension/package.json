@@ -14,7 +14,6 @@
   },
   "license": "Apache-2.0",
   "icon": "./images/groovy.png",
-  "private": true,
   "categories": [
     "Programming Languages"
   ],
@@ -29,9 +28,13 @@
   "engines": {
     "vscode": "^1.99.0"
   },
+  "scripts": {
+    "test": "vitest run"
+  },
   "devDependencies": {
     "@types/node": "^20.17.50",
     "@types/vscode": "^1.99.0",
+    "vitest": "^3.0.0",
     "ts-loader": "^9.5.2",
     "typescript": "^5.8.3",
     "@vscode/vsce": "^3.4.2",

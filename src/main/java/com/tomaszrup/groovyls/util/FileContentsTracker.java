@@ -20,7 +20,6 @@
 ////////////////////////////////////////////////////////////////////////////////
 package com.tomaszrup.groovyls.util;
 
-import java.io.BufferedReader;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.file.Files;
@@ -100,24 +99,10 @@ public class FileContentsTracker {
 
 	public String getContents(URI uri) {
 		if (!openFiles.containsKey(uri)) {
-			BufferedReader reader = null;
 			try {
-				reader = Files.newBufferedReader(Paths.get(uri));
-				StringBuilder builder = new StringBuilder();
-				int next = -1;
-				while ((next = reader.read()) != -1) {
-					builder.append((char) next);
-				}
-				return builder.toString();
+				return Files.readString(Paths.get(uri));
 			} catch (IOException e) {
 				return null;
-			} finally {
-				if (reader != null) {
-					try {
-						reader.close();
-					} catch (IOException e) {
-					}
-				}
 			}
 		}
 		return openFiles.get(uri);

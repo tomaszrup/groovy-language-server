@@ -61,6 +61,8 @@ import org.eclipse.lsp4j.TextDocumentIdentifier;
 import org.eclipse.lsp4j.TextEdit;
 import org.eclipse.lsp4j.jsonrpc.messages.Either;
 
+import com.google.gson.JsonObject;
+
 import io.github.classgraph.ClassInfo;
 import io.github.classgraph.PackageInfo;
 import io.github.classgraph.ScanResult;
@@ -336,6 +338,7 @@ public class CompletionProvider {
 			item.setLabelDetails(labelDetails);
 			item.setDetail(method.getReturnType().getNameWithoutPackage());
 			item.setDocumentation(buildMethodDocumentation(method));
+			item.setData(buildMethodData(method));
 			return item;
 		}).collect(Collectors.toList());
 		items.addAll(methodItems);
@@ -540,6 +543,30 @@ public class CompletionProvider {
 
 	private String escapeSnippetText(String text) {
 		return text.replace("\\", "\\\\").replace("$", "\\$").replace("}", "\\}");
+	}
+
+	/**
+	 * Build a JSON data object that uniquely identifies this method by its
+	 * signature (name + parameter types). This is stored in CompletionItem.data
+	 * and used during completionItem/resolve to match the correct overload.
+	 */
+	private JsonObject buildMethodData(MethodNode method) {
+		JsonObject data = new JsonObject();
+		data.addProperty("name", method.getName());
+		StringBuilder sig = new StringBuilder();
+		Parameter[] params = method.getParameters();
+		for (int i = 0; i < params.length; i++) {
+			if (i > 0) {
+				sig.append(",");
+			}
+			sig.append(params[i].getType().getName());
+		}
+		data.addProperty("signature", sig.toString());
+		ClassNode declaringClass = method.getDeclaringClass();
+		if (declaringClass != null) {
+			data.addProperty("declaringClass", declaringClass.getName());
+		}
+		return data;
 	}
 
 	private MarkupContent buildMethodDocumentation(MethodNode method) {
