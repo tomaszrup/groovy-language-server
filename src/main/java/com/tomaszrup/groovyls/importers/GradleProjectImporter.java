@@ -213,6 +213,11 @@ public class GradleProjectImporter implements ProjectImporter {
                     logger.warn("Could not discover class dirs for {}: {}", subproject, e.getMessage());
                 }
 
+                // Deduplicate (preserving order) — init-script results and
+                // discoverClassDirs may overlap, and Windows path casing can
+                // cause string-equal misses.
+                cp = new ArrayList<>(new LinkedHashSet<>(cp));
+
                 logger.info("Classpath for project {}: {} entries", subproject, cp.size());
                 result.put(subproject, cp);
             }
@@ -337,7 +342,9 @@ public class GradleProjectImporter implements ProjectImporter {
      * <p>Output format: {@code GROOVYLS_CP:<projectDir>:<classpathEntry>}</p>
      */
     private Map<String, List<String>> resolveAllClasspathsViaInitScript(ProjectConnection connection) {
-        Map<String, List<String>> classpathsByProject = new LinkedHashMap<>();
+        // Use LinkedHashSet per project to deduplicate entries from overlapping
+        // Gradle configurations (compileClasspath, runtimeClasspath, etc.)
+        Map<String, Set<String>> dedupByProject = new LinkedHashMap<>();
         Path initScript = null;
         try {
             initScript = Files.createTempFile("groovyls-init", ".gradle");
@@ -385,15 +392,21 @@ public class GradleProjectImporter implements ProjectImporter {
                     String projectDir = normalise(rest.substring(0, separatorIdx));
                     String cpEntry = rest.substring(separatorIdx + 1);
                     if (new File(cpEntry).exists()) {
-                        classpathsByProject
-                                .computeIfAbsent(projectDir, k -> new ArrayList<>())
+                        // Canonicalize to handle Windows drive-letter casing (C:\ vs c:\)
+                        try {
+                            cpEntry = new File(cpEntry).getCanonicalPath();
+                        } catch (IOException ignored) {
+                            // fall back to original string
+                        }
+                        dedupByProject
+                                .computeIfAbsent(projectDir, k -> new LinkedHashSet<>())
                                 .add(cpEntry);
                     }
                 }
             }
 
             logger.info("Resolved classpaths for {} project(s) via batch init script",
-                    classpathsByProject.size());
+                    dedupByProject.size());
         } catch (Exception e) {
             logger.warn("Could not resolve classpaths via batch init script: {}", e.getMessage());
         } finally {
@@ -403,6 +416,11 @@ public class GradleProjectImporter implements ProjectImporter {
                 } catch (IOException ignored) {
                 }
             }
+        }
+        // Convert sets to lists for the public API
+        Map<String, List<String>> classpathsByProject = new LinkedHashMap<>();
+        for (Map.Entry<String, Set<String>> entry : dedupByProject.entrySet()) {
+            classpathsByProject.put(entry.getKey(), new ArrayList<>(entry.getValue()));
         }
         return classpathsByProject;
     }

@@ -147,13 +147,29 @@ public class FileChangeHandler {
 		}
 
 		// Process each non-recompile scope independently under its own lock.
-		for (ProjectScope scope : scopeManager.getAllScopes()) {
+		// Use the SAME scope list captured above to avoid a race where
+		// registerDiscoveredProjects() populates projectScopes between the
+		// isEmpty() check and the iteration, causing all changed URIs to be
+		// assigned to every newly-registered scope.
+		List<ProjectScope> scopesToProcess = scopes.isEmpty()
+				? scopeManager.getAllScopes()
+				: scopes;
+		boolean noProjectScopes = scopes.isEmpty();
+
+		for (ProjectScope scope : scopesToProcess) {
 			if (projectsNeedingRecompile.contains(scope.projectRoot)) {
 				continue; // handled by scheduleJavaRecompile
 			}
+			// Skip scopes whose classpath hasn't been resolved yet — compiling
+			// them would produce thousands of false-positive diagnostics.
+			if (!scope.classpathResolved && scope.projectRoot != null) {
+				logger.debug("Skipping watcher-triggered compile for {} — classpath not yet resolved",
+						scope.projectRoot);
+				continue;
+			}
 
 			Set<URI> scopeUris;
-			if (scopes.isEmpty()) {
+			if (noProjectScopes) {
 				scopeUris = allChangedUris;
 			} else {
 				scopeUris = allChangedUris.stream()
@@ -189,16 +205,20 @@ public class FileChangeHandler {
 							}
 						}
 					}
-					compilationService.ensureScopeCompiled(scope);
-					boolean isSameUnit = compilationService.createOrUpdateCompilationUnit(scope);
-					compilationService.resetChangedFilesForScope(scope);
-					compilationService.compile(scope);
-					if (isSameUnit) {
-						compilationService.visitAST(scope, scopeUris);
-					} else {
-						compilationService.visitAST(scope);
+					// If the scope hasn't been compiled yet, do a full compile.
+					// Otherwise, update the compilation unit and recompile.
+					boolean didFullCompile = compilationService.ensureScopeCompiled(scope);
+					if (!didFullCompile) {
+						boolean isSameUnit = compilationService.createOrUpdateCompilationUnit(scope);
+						compilationService.resetChangedFilesForScope(scope);
+						compilationService.compile(scope);
+						if (isSameUnit) {
+							compilationService.visitAST(scope, scopeUris);
+						} else {
+							compilationService.visitAST(scope);
+						}
+						compilationService.updateDependencyGraph(scope, scopeUris);
 					}
-					compilationService.updateDependencyGraph(scope, scopeUris);
 				} finally {
 					scope.lock.writeLock().unlock();
 				}

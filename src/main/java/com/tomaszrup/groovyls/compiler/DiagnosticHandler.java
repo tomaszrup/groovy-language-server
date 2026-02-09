@@ -97,7 +97,7 @@ public class DiagnosticHandler {
 
 		List<? extends Message> errors = collector.getErrors();
 		if (errors != null && !errors.isEmpty()) {
-			logger.info("Scope {} has {} compilation errors", projectRoot, errors.size());
+			logger.debug("Scope {} has {} compilation errors", projectRoot, errors.size());
 		}
 		if (errors != null) {
 			errors.stream().filter((Object message) -> message instanceof SyntaxErrorMessage)
@@ -124,7 +124,7 @@ public class DiagnosticHandler {
 							logger.debug("Skipping diagnostic with invalid source locator '{}': {}", sourceLocator, cause.getMessage());
 							return;
 						}
-						logger.info("  Diagnostic [{}] in {}: {}", projectRoot, uri, cause.getMessage());
+						logger.debug("  Diagnostic [{}] in {}: {}", projectRoot, uri, cause.getMessage());
 						diagnosticsByFile.computeIfAbsent(uri, (key) -> new ArrayList<>()).add(diagnostic);
 					});
 		}

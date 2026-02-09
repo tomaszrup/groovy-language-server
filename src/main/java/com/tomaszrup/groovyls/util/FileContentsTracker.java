@@ -193,7 +193,8 @@ public class FileContentsTracker {
 		if (lastContent != null) {
 			closedFileCache.put(uri, new CachedContent(lastContent));
 		}
-		changedFiles.add(uri);
+		// Closing a file is NOT a content change — the disk version has not
+		// been modified. Avoids unnecessary recompilation of the scope.
 	}
 
 	/**

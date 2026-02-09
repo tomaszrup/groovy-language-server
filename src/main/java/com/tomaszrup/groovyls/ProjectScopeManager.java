@@ -82,6 +82,9 @@ public class ProjectScopeManager {
 	public ProjectScopeManager(ICompilationUnitFactory defaultFactory, FileContentsTracker fileContentsTracker) {
 		this.fileContentsTracker = fileContentsTracker;
 		this.defaultScope = new ProjectScope(null, defaultFactory);
+		// The default scope is not managed by a build tool, so its classpath
+		// is always "resolved" (user-configured or empty).
+		this.defaultScope.classpathResolved = true;
 	}
 
 	// --- Accessors ---
@@ -95,6 +98,7 @@ public class ProjectScopeManager {
 			this.workspaceRoot = workspaceRoot;
 			ProjectScope ds = new ProjectScope(workspaceRoot, defaultScope.compilationUnitFactory);
 			ds.compiled = false;
+			ds.classpathResolved = true;
 			this.defaultScope = ds;
 		}
 	}
@@ -175,10 +179,26 @@ public class ProjectScopeManager {
 
 	/**
 	 * Returns true if a background import is in progress and the given scope
-	 * is the default (workspace-wide) scope.
+	 * should not yet be compiled:
+	 * <ul>
+	 *   <li>The default scope before any project scopes are registered.</li>
+	 *   <li>Any project scope whose classpath has not been resolved yet
+	 *       (scopes are registered early with empty classpaths).</li>
+	 * </ul>
 	 */
 	public boolean isImportPendingFor(ProjectScope scope) {
-		return importInProgress && scope == defaultScope && projectScopes.isEmpty();
+		if (!importInProgress) {
+			return false;
+		}
+		// Pre-discovery phase: only the default scope exists
+		if (scope == defaultScope && projectScopes.isEmpty()) {
+			return true;
+		}
+		// Post-discovery, pre-classpath-resolution: scope exists but has no classpath
+		if (scope != null && scope != defaultScope && !scope.classpathResolved) {
+			return true;
+		}
+		return false;
 	}
 
 	// --- Project registration ---
@@ -217,22 +237,12 @@ public class ProjectScopeManager {
 	/**
 	 * Update existing project scopes with their resolved classpaths.
 	 * Called after background classpath resolution completes.
-	 *
-	 * @return set of scopes that have open files and need recompilation
+	 * Compilation is NOT triggered here &mdash; scopes compile lazily on
+	 * first user interaction.
 	 */
-	public Set<ProjectScope> updateProjectClasspaths(Map<Path, List<String>> projectClasspaths) {
+	public void updateProjectClasspaths(Map<Path, List<String>> projectClasspaths) {
 		logger.info("updateProjectClasspaths called with {} projects", projectClasspaths.size());
 		List<ProjectScope> scopes = projectScopes;
-
-		Set<URI> openURIs = fileContentsTracker.getOpenURIs();
-
-		Set<ProjectScope> scopesWithOpenFiles = new HashSet<>();
-		for (URI uri : openURIs) {
-			ProjectScope owning = findProjectScope(uri);
-			if (owning != null) {
-				scopesWithOpenFiles.add(owning);
-			}
-		}
 
 		for (ProjectScope scope : scopes) {
 			List<String> classpath = projectClasspaths.get(scope.projectRoot);
@@ -257,8 +267,6 @@ public class ProjectScopeManager {
 				}
 			}
 		}
-
-		return scopesWithOpenFiles;
 	}
 
 	/**
@@ -349,7 +357,7 @@ public class ProjectScopeManager {
 	 */
 	public void updateClasspath(List<String> classpathList) {
 		if (!projectScopes.isEmpty()) {
-			logger.info("updateClasspath() ignored — {} project scope(s) are active", projectScopes.size());
+			logger.debug("updateClasspath() ignored — {} project scope(s) are active", projectScopes.size());
 			return;
 		}
 		if (importInProgress) {

@@ -197,6 +197,53 @@ public class ClasspathCache {
     }
 
     /**
+     * Verify that the classpath entries stored in the cache still exist on disk.
+     * <p>This catches scenarios where {@code gradle clean} was run or the Gradle
+     * cache was wiped — the build files haven't changed so stamp-based
+     * validation passes, but the resolved JARs and {@code build/classes}
+     * directories are gone, leading to unresolved-import diagnostics.</p>
+     *
+     * <p>For performance, we sample up to {@code sampleSize} entries from the
+     * first project that has classpath data rather than checking every entry
+     * in every project.</p>
+     *
+     * @param cached     the cached data to validate
+     * @param sampleSize maximum number of entries to spot-check (0 = check all)
+     * @return {@code true} if the sampled entries exist, {@code false} if any
+     *         are missing
+     */
+    public static boolean areClasspathEntriesPresent(CacheData cached, int sampleSize) {
+        if (cached.classpaths == null || cached.classpaths.isEmpty()) {
+            return true; // nothing to validate
+        }
+
+        for (Map.Entry<String, List<String>> entry : cached.classpaths.entrySet()) {
+            List<String> cpEntries = entry.getValue();
+            if (cpEntries == null || cpEntries.isEmpty()) {
+                continue;
+            }
+            int toCheck = sampleSize > 0 ? Math.min(sampleSize, cpEntries.size()) : cpEntries.size();
+            int missing = 0;
+            for (int i = 0; i < toCheck; i++) {
+                Path p = Paths.get(cpEntries.get(i));
+                if (!Files.exists(p)) {
+                    missing++;
+                }
+            }
+            // If more than half the sampled entries are missing, the cache
+            // is almost certainly stale (e.g. after `gradle clean`).
+            if (missing > 0 && missing > toCheck / 2) {
+                logger.info("Classpath cache stale: {}/{} sampled entries missing in project {}",
+                        missing, toCheck, entry.getKey());
+                return false;
+            }
+            // Only need to check the first project with classpath data
+            break;
+        }
+        return true;
+    }
+
+    /**
      * Compute lightweight file stamps ({@code "<lastModified>:<size>"}) for all
      * relevant build files found under the given project roots.  This replaces
      * the previous SHA-256 content hashing approach: no file I/O is needed

@@ -220,15 +220,15 @@ public class CompilationOrchestrator {
 			logger.warn("compile() called but compilationUnit is null for scope {}", projectRoot);
 			return null;
 		}
-		logger.info("Compiling scope: {}, classpath entries: {}", projectRoot,
+		logger.debug("Compiling scope: {}, classpath entries: {}", projectRoot,
 				compilationUnit.getConfiguration().getClasspath().size());
 		try {
 			compilationUnit.compile(Phases.CANONICALIZATION);
 		} catch (CompilationFailedException e) {
-			logger.info("Compilation failed (expected for incomplete code) for scope {}: {}", projectRoot,
+			logger.debug("Compilation failed (expected for incomplete code) for scope {}: {}", projectRoot,
 					e.getMessage());
 		} catch (GroovyBugError e) {
-			logger.warn(
+			logger.debug(
 					"Groovy compiler bug during compilation for scope {} (this is usually harmless for code intelligence): {}",
 					projectRoot, e.getMessage());
 			logger.debug("GroovyBugError details", e);
@@ -261,13 +261,13 @@ public class CompilationOrchestrator {
 			iter.next();
 			sourceCount++;
 		}
-		logger.info("Incremental compile for scope: {}, {} sources", projectRoot, sourceCount);
+		logger.debug("Incremental compile for scope: {}, {} sources", projectRoot, sourceCount);
 		try {
 			incrementalUnit.compile(Phases.CANONICALIZATION);
 		} catch (CompilationFailedException e) {
-			logger.info("Incremental compilation failed for {}: {}", projectRoot, e.getMessage());
+			logger.debug("Incremental compilation failed for {}: {}", projectRoot, e.getMessage());
 		} catch (GroovyBugError e) {
-			logger.warn("Groovy compiler bug during incremental compile for {}: {}", projectRoot, e.getMessage());
+			logger.debug("Groovy compiler bug during incremental compile for {}: {}", projectRoot, e.getMessage());
 		} catch (Exception e) {
 			logger.warn("Unexpected exception during incremental compile for {}: {}", projectRoot, e.getMessage());
 		}

@@ -313,6 +313,9 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             Map<Path, List<String>> projectClasspaths = new ConcurrentHashMap<>();
             Map<Path, ProjectImporter> importerMapLocal = new ConcurrentHashMap<>();
             Set<Path> claimedRoots = Collections.synchronizedSet(new LinkedHashSet<>());
+            // Tracks project roots discovered AFTER a cache hit — these need
+            // classpath resolution even when the cache is valid for other roots.
+            List<Path> newUncachedRoots = new ArrayList<>();
 
             // ── Phase 0: Try cache-first ──────────────────────────────────
             // Load the on-disk cache ONCE.  This single load is used for
@@ -334,7 +337,8 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                     if (cachedRoots.isPresent()) {
                         Map<String, String> currentStamps =
                                 ClasspathCache.computeBuildFileStamps(cachedRoots.get());
-                        if (ClasspathCache.isValid(cachedData, currentStamps)) {
+                        if (ClasspathCache.isValid(cachedData, currentStamps)
+                                && ClasspathCache.areClasspathEntriesPresent(cachedData, 5)) {
                             cachedDiscoveredRoots = cachedRoots.get();
                             Map<Path, List<String>> cachedClasspaths =
                                     ClasspathCache.toClasspathMap(cachedData);
@@ -346,7 +350,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                                     + cachedDiscoveredRoots.size() + " projects, "
                                     + cacheElapsed + "ms)");
                         } else {
-                            logger.info("Classpath cache stamp mismatch — will re-discover and resolve");
+                            logger.info("Classpath cache stamp mismatch or stale entries — will re-discover and resolve");
                         }
                     } else {
                         logger.info("Classpath cache has no discovered-projects list — will discover");
@@ -360,8 +364,8 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             List<Path> allDiscoveredRoots;
 
             if (cacheHit && cachedDiscoveredRoots != null) {
-                // Use the cached project list — skip Files.walk() entirely.
-                allDiscoveredRoots = cachedDiscoveredRoots;
+                // Start with the cached project list.
+                allDiscoveredRoots = new ArrayList<>(cachedDiscoveredRoots);
                 logProgress("Using cached project list (" + allDiscoveredRoots.size() + " projects)");
 
                 // We still need to populate importerMapLocal so that
@@ -378,6 +382,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                             discoveredByImporter
                                     .computeIfAbsent(importer, k -> new ArrayList<>())
                                     .add(root);
+                            claimedRoots.add(root);
                             break;
                         } else if (importer instanceof MavenProjectImporter
                                 && root.resolve("pom.xml").toFile().exists()) {
@@ -385,9 +390,71 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                             discoveredByImporter
                                     .computeIfAbsent(importer, k -> new ArrayList<>())
                                     .add(root);
+                            claimedRoots.add(root);
                             break;
                         }
                     }
+                }
+
+                // ── Detect NEW projects not in the cache ──────────────────
+                // Run a fast discovery pass to find projects that were added
+                // to the workspace since the cache was built.  Discovery uses
+                // directory pruning so it's very quick.
+                Set<String> enabledNames = enabledImporters;
+                List<Path> freshGradleRoots = new ArrayList<>();
+                List<Path> freshMavenRoots = new ArrayList<>();
+                for (WorkspaceFolder folder : folders) {
+                    Path folderPath = Paths.get(URI.create(folder.getUri()));
+                    try {
+                        ProjectDiscovery.DiscoveryResult result =
+                                ProjectDiscovery.discoverAll(folderPath, enabledNames);
+                        freshGradleRoots.addAll(result.gradleProjects);
+                        freshMavenRoots.addAll(result.mavenProjects);
+                    } catch (IOException e) {
+                        logger.error("Error discovering new projects in {}: {}",
+                                folderPath, e.getMessage(), e);
+                    }
+                }
+
+                // Find roots that are freshly discovered but NOT in the cache
+                ProjectImporter gradleImp = null;
+                ProjectImporter mavenImp = null;
+                for (ProjectImporter importer : importers) {
+                    if (importer instanceof GradleProjectImporter) gradleImp = importer;
+                    if (importer instanceof MavenProjectImporter) mavenImp = importer;
+                }
+
+                List<Path> newRoots = newUncachedRoots;
+                if (gradleImp != null) {
+                    for (Path p : freshGradleRoots) {
+                        if (claimedRoots.add(p)) {
+                            newRoots.add(p);
+                            importerMapLocal.put(p, gradleImp);
+                            discoveredByImporter
+                                    .computeIfAbsent(gradleImp, k -> new ArrayList<>())
+                                    .add(p);
+                        }
+                    }
+                }
+                if (mavenImp != null) {
+                    for (Path p : freshMavenRoots) {
+                        if (claimedRoots.add(p)) {
+                            newRoots.add(p);
+                            importerMapLocal.put(p, mavenImp);
+                            discoveredByImporter
+                                    .computeIfAbsent(mavenImp, k -> new ArrayList<>())
+                                    .add(p);
+                        }
+                    }
+                }
+
+                if (!newRoots.isEmpty()) {
+                    logProgress("Detected " + newRoots.size()
+                            + " new project(s) not in cache: " + newRoots);
+                    allDiscoveredRoots.addAll(newRoots);
+                    // We keep cacheHit=true so Phase 2 doesn't re-resolve
+                    // the cached projects.  New projects will be resolved
+                    // separately after Phase 1a registration.
                 }
             } else {
                 // No usable cache — discover from scratch using a SINGLE
@@ -499,7 +566,8 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             if (!cacheHit && cachedData != null && !allDiscoveredRoots.isEmpty()) {
                 Map<String, String> currentStamps =
                         ClasspathCache.computeBuildFileStamps(allDiscoveredRoots);
-                if (ClasspathCache.isValid(cachedData, currentStamps)) {
+                if (ClasspathCache.isValid(cachedData, currentStamps)
+                        && ClasspathCache.areClasspathEntriesPresent(cachedData, 5)) {
                     logProgress("Using cached classpath (build files unchanged)");
                     Map<Path, List<String>> cachedClasspaths =
                             ClasspathCache.toClasspathMap(cachedData);
@@ -577,14 +645,66 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                     }
                 }
             } else {
-                // Cache hit — re-save with discoveredProjects if the cache
-                // didn't contain them (upgrade from v1 format)
-                if (cachedData != null && cachedData.discoveredProjects == null
-                        && classpathCacheEnabled && workspaceRoot != null
-                        && !projectClasspaths.isEmpty() && !allDiscoveredRoots.isEmpty()) {
-                    Map<String, String> stamps =
-                            ClasspathCache.computeBuildFileStamps(allDiscoveredRoots);
-                    ClasspathCache.save(workspaceRoot, projectClasspaths, stamps, allDiscoveredRoots);
+                // Cache hit — resolve classpaths only for newly discovered
+                // projects and re-save the cache with the updated project list.
+                boolean cacheNeedsUpdate = false;
+
+                if (!newUncachedRoots.isEmpty()) {
+                    logProgress("Resolving classpaths for " + newUncachedRoots.size()
+                            + " new project(s) not in cache...");
+
+                    // Group new roots by importer
+                    Map<ProjectImporter, List<Path>> newByImporter = new LinkedHashMap<>();
+                    for (Path root : newUncachedRoots) {
+                        ProjectImporter imp = importerMapLocal.get(root);
+                        if (imp != null) {
+                            newByImporter.computeIfAbsent(imp, k -> new ArrayList<>()).add(root);
+                        }
+                    }
+
+                    long resolveStart = System.currentTimeMillis();
+                    List<Future<?>> newImportFutures = new ArrayList<>();
+                    for (Map.Entry<ProjectImporter, List<Path>> entry : newByImporter.entrySet()) {
+                        ProjectImporter importer = entry.getKey();
+                        List<Path> roots = entry.getValue();
+                        newImportFutures.add(parallelImportPool.submit(() -> {
+                            try {
+                                Map<Path, List<String>> batchResult = importer.resolveClasspaths(roots);
+                                for (Map.Entry<Path, List<String>> e : batchResult.entrySet()) {
+                                    projectClasspaths.put(e.getKey(), e.getValue());
+                                }
+                            } catch (Exception e) {
+                                logger.error("Error resolving {} classpaths for new projects: {}",
+                                        importer.getName(), e.getMessage(), e);
+                            }
+                        }));
+                    }
+                    for (Future<?> f : newImportFutures) {
+                        try {
+                            f.get();
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        } catch (ExecutionException e) {
+                            logger.error("New project import failed: {}", e.getCause().getMessage());
+                        }
+                    }
+                    long resolveElapsed = System.currentTimeMillis() - resolveStart;
+                    logProgress("New project classpath resolution completed in "
+                            + (resolveElapsed / 1000) + "s");
+                    cacheNeedsUpdate = true;
+                }
+
+                // Re-save with discoveredProjects if the cache didn't contain
+                // them (upgrade from v1 format) or if new projects were added
+                if (cacheNeedsUpdate
+                        || (cachedData != null && cachedData.discoveredProjects == null)) {
+                    if (classpathCacheEnabled && workspaceRoot != null
+                            && !projectClasspaths.isEmpty() && !allDiscoveredRoots.isEmpty()) {
+                        Map<String, String> stamps =
+                                ClasspathCache.computeBuildFileStamps(allDiscoveredRoots);
+                        ClasspathCache.save(workspaceRoot, projectClasspaths, stamps, allDiscoveredRoots);
+                    }
                 }
             }
 

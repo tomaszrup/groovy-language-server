@@ -117,13 +117,13 @@ public class SharedClassGraphCache {
 		CacheEntry entry = cache.get(key);
 		if (entry != null) {
 			entry.refCount++;
-			logger.info("SharedClassGraphCache HIT for key {}… (refCount={}), cache size={}",
+			logger.debug("SharedClassGraphCache HIT for key {}… (refCount={}), cache size={}",
 					key.substring(0, Math.min(12, key.length())), entry.refCount, cache.size());
 			return entry.scanResult;
 		}
 
 		// Cache miss — perform scan
-		logger.info("SharedClassGraphCache MISS for key {}… — scanning classpath ({} URLs)",
+		logger.debug("SharedClassGraphCache MISS for key {}… — scanning classpath ({} URLs)",
 				key.substring(0, Math.min(12, key.length())), classLoader.getURLs().length);
 		try {
 			ScanResult scanResult = new ClassGraph()
@@ -134,7 +134,7 @@ public class SharedClassGraphCache {
 			entry = new CacheEntry(scanResult, key);
 			cache.put(key, entry);
 			reverseIndex.put(scanResult, key);
-			logger.info("SharedClassGraphCache stored new entry, cache size={}", cache.size());
+			logger.debug("SharedClassGraphCache stored new entry, cache size={}", cache.size());
 			return scanResult;
 		} catch (ClassGraphException e) {
 			logger.warn("ClassGraph scan failed: {}", e.getMessage());
@@ -176,7 +176,7 @@ public class SharedClassGraphCache {
 			cache.remove(key);
 			reverseIndex.remove(scanResult);
 			scanResult.close();
-			logger.info("SharedClassGraphCache evicted entry for key {}…, cache size={}",
+			logger.debug("SharedClassGraphCache evicted entry for key {}…, cache size={}",
 					key.substring(0, Math.min(12, key.length())), cache.size());
 		}
 	}

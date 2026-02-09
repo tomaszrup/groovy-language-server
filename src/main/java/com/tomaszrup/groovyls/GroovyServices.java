@@ -190,6 +190,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		scopeManager.setImportInProgress(false);
 		List<ProjectScope> scopes = scopeManager.getProjectScopes();
 		if (scopes.isEmpty()) {
+			// No build-tool projects found — compile the default scope
 			ProjectScope ds = scopeManager.getDefaultScope();
 			ds.lock.writeLock().lock();
 			try {
@@ -202,6 +203,44 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			}
 			if (languageClient != null) {
 				languageClient.refreshSemanticTokens();
+			}
+			return;
+		}
+
+		// Build-tool projects exist — schedule background compilation for
+		// scopes that have open files.  This provides diagnostics for files
+		// the user is looking at without blocking the import thread or
+		// compiling ALL scopes eagerly (which caused log spam in large
+		// workspaces).
+		Set<URI> openURIs = fileContentsTracker.getOpenURIs();
+		if (!openURIs.isEmpty()) {
+			// Deduplicate: only compile each scope once, even if multiple
+			// files are open in the same project.
+			Map<ProjectScope, URI> scopeToURI = new java.util.LinkedHashMap<>();
+			for (URI uri : openURIs) {
+				ProjectScope scope = scopeManager.findProjectScope(uri);
+				if (scope != null && scope.classpathResolved) {
+					scopeToURI.putIfAbsent(scope, uri);
+				}
+			}
+
+			if (!scopeToURI.isEmpty()) {
+				logger.info("Scheduling background compilation for {} scope(s) with open files",
+						scopeToURI.size());
+				backgroundCompiler.submit(() -> {
+					for (Map.Entry<ProjectScope, URI> entry : scopeToURI.entrySet()) {
+						ProjectScope scope = entry.getKey();
+						scope.lock.writeLock().lock();
+						try {
+							compilationService.ensureScopeCompiled(scope);
+						} finally {
+							scope.lock.writeLock().unlock();
+						}
+					}
+					if (languageClient != null) {
+						languageClient.refreshSemanticTokens();
+					}
+				});
 			}
 		}
 	}
@@ -221,40 +260,37 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	}
 
 	public void updateProjectClasspaths(Map<Path, List<String>> projectClasspaths) {
-		Set<ProjectScope> scopesWithOpenFiles = scopeManager.updateProjectClasspaths(projectClasspaths);
-
-		Set<URI> openURIs = fileContentsTracker.getOpenURIs();
-		for (URI uri : openURIs) {
-			ProjectScope scope = scopeManager.findProjectScope(uri);
-			if (scope != null && scope.classpathResolved) {
-				scope.lock.writeLock().lock();
-				try {
-					compilationService.ensureScopeCompiled(scope);
-					compilationService.compileAndVisitAST(scope, uri);
-				} finally {
-					scope.lock.writeLock().unlock();
-				}
-			}
-		}
-
-		if (languageClient != null) {
-			languageClient.refreshSemanticTokens();
-		}
+		scopeManager.updateProjectClasspaths(projectClasspaths);
+		// Compilation is NOT done here — scopes compile lazily on first
+		// interaction (didOpen, didChange, hover, etc.) or via background
+		// compilation submitted by onImportComplete().  This avoids the
+		// expensive O(open-tabs × projects) synchronous compilation that
+		// caused log spam and long import times in large workspaces.
 	}
 
 	public void addProjects(Map<Path, List<String>> projectClasspaths) {
 		Set<URI> openURIs = scopeManager.addProjects(projectClasspaths);
 
+		// Deduplicate by scope to avoid compiling the same project multiple times
+		Map<ProjectScope, URI> scopeToRepresentativeURI = new java.util.LinkedHashMap<>();
 		for (URI uri : openURIs) {
 			ProjectScope scope = scopeManager.findProjectScope(uri);
 			if (scope != null) {
-				scope.lock.writeLock().lock();
-				try {
-					compilationService.ensureScopeCompiled(scope);
+				scopeToRepresentativeURI.putIfAbsent(scope, uri);
+			}
+		}
+
+		for (Map.Entry<ProjectScope, URI> entry : scopeToRepresentativeURI.entrySet()) {
+			ProjectScope scope = entry.getKey();
+			URI uri = entry.getValue();
+			scope.lock.writeLock().lock();
+			try {
+				boolean didFullCompile = compilationService.ensureScopeCompiled(scope);
+				if (!didFullCompile) {
 					compilationService.compileAndVisitAST(scope, uri);
-				} finally {
-					scope.lock.writeLock().unlock();
 				}
+			} finally {
+				scope.lock.writeLock().unlock();
 			}
 		}
 
@@ -279,8 +315,13 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		if (scope != null && !scopeManager.isImportPendingFor(scope)) {
 			scope.lock.writeLock().lock();
 			try {
+				// Ensure the scope is compiled at least once (lazy first compile).
+				// Do NOT trigger compileAndVisitAST here — opening a file is not
+				// a content change. The AST from initial compilation (disk-based)
+				// is correct. Actual edits trigger recompilation via didChange().
+				// Code-intelligence requests (hover, completion) also lazily
+				// recompile if changes are pending via ensureCompiledForContext().
 				compilationService.ensureScopeCompiled(scope);
-				compilationService.compileAndVisitAST(scope, uri);
 			} finally {
 				scope.lock.writeLock().unlock();
 			}
@@ -303,8 +344,10 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			if (scope != null && !scopeManager.isImportPendingFor(scope)) {
 				scope.lock.writeLock().lock();
 				try {
-					compilationService.ensureScopeCompiled(scope);
-					compilationService.compileAndVisitAST(scope, uri);
+					boolean didFullCompile = compilationService.ensureScopeCompiled(scope);
+					if (!didFullCompile) {
+						compilationService.compileAndVisitAST(scope, uri);
+					}
 				} finally {
 					scope.lock.writeLock().unlock();
 				}
@@ -315,19 +358,9 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	@Override
 	public void didClose(DidCloseTextDocumentParams params) {
 		fileContentsTracker.didClose(params);
-		URI uri = URI.create(params.getTextDocument().getUri());
-		ProjectScope scope = scopeManager.findProjectScope(uri);
-		if (scope != null && !scopeManager.isImportPendingFor(scope)) {
-			backgroundCompiler.submit(() -> {
-				scope.lock.writeLock().lock();
-				try {
-					compilationService.ensureScopeCompiled(scope);
-					compilationService.compileAndVisitAST(scope, uri);
-				} finally {
-					scope.lock.writeLock().unlock();
-				}
-			});
-		}
+		// Closing a file does not change its content — no recompilation needed.
+		// The AST remains valid. The next interaction (hover, edit, etc.) will
+		// lazily recompile if actual changes are pending.
 	}
 
 	@Override
@@ -359,7 +392,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 
 	void updateClasspath(List<String> classpathList) {
 		if (!scopeManager.getProjectScopes().isEmpty()) {
-			logger.info("updateClasspath() ignored — {} project scope(s) are active",
+			logger.debug("updateClasspath() ignored — {} project scope(s) are active",
 					scopeManager.getProjectScopes().size());
 			return;
 		}
@@ -607,6 +640,26 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	@Override
 	public CompletableFuture<Either<List<? extends SymbolInformation>, List<? extends WorkspaceSymbol>>> symbol(
 			WorkspaceSymbolParams params) {
+		// Ensure all scopes are compiled and up-to-date before querying —
+		// workspace symbol is a cross-scope request with no single context URI.
+		for (ProjectScope scope : scopeManager.getAllScopes()) {
+			if (!scope.compiled || fileContentsTracker.hasChangedURIsUnder(scope.projectRoot)) {
+				scope.lock.writeLock().lock();
+				try {
+					boolean didFull = compilationService.ensureScopeCompiled(scope);
+					if (!didFull && fileContentsTracker.hasChangedURIsUnder(scope.projectRoot)) {
+						Set<URI> pending = fileContentsTracker.getChangedURIs();
+						URI representative = pending.isEmpty() ? null : pending.iterator().next();
+						if (representative != null) {
+							compilationService.compileAndVisitAST(scope, representative);
+						}
+					}
+				} finally {
+					scope.lock.writeLock().unlock();
+				}
+			}
+		}
+
 		List<CompletableFuture<List<? extends SymbolInformation>>> futures = new ArrayList<>();
 		for (ProjectScope scope : scopeManager.getAllScopes()) {
 			ASTNodeVisitor visitor = scope.astVisitor;

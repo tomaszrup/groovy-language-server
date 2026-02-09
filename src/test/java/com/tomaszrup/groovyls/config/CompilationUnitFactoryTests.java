@@ -256,6 +256,66 @@ class CompilationUnitFactoryTests {
 		// Should not throw
 	}
 
+	// --- Separate sub-project detection ---
+
+	@Test
+	void testSiblingProjectsAreExcludedFromFileCache() throws Exception {
+		// Simulate a workspace root containing two separate projects
+		// (each with its own build file and src dirs). When the factory
+		// is rooted at the parent, files from the sub-projects should
+		// be excluded to prevent duplicate-class errors.
+
+		// Sub-project A (Gradle)
+		Path projectA = tempDir.resolve("project-a");
+		Files.createDirectories(projectA.resolve("src/test/groovy/com/example"));
+		Files.writeString(projectA.resolve("build.gradle"), "// gradle build");
+		Files.writeString(projectA.resolve("src/test/groovy/com/example/Spec.groovy"),
+				"class Spec {}");
+
+		// Sub-project B (Maven)
+		Path projectB = tempDir.resolve("project-b");
+		Files.createDirectories(projectB.resolve("src/test/groovy/com/example"));
+		Files.writeString(projectB.resolve("pom.xml"), "<project/>");
+		Files.writeString(projectB.resolve("src/test/groovy/com/example/Spec.groovy"),
+				"class Spec {}");
+
+		// A top-level groovy file that is NOT inside either sub-project
+		Path topLevel = tempDir.resolve("src/main/groovy");
+		Files.createDirectories(topLevel);
+		Files.writeString(topLevel.resolve("TopLevel.groovy"), "class TopLevel {}");
+
+		FileContentsTracker tracker = new FileContentsTracker();
+		GroovyLSCompilationUnit cu = factory.create(tempDir, tracker);
+		Assertions.assertNotNull(cu);
+
+		// Compile to move queued sources into the resolved sources map
+		try { cu.compile(Phases.CONVERSION); } catch (Exception e) { /* ignore */ }
+
+		boolean foundProjectA = false;
+		boolean foundProjectB = false;
+		boolean foundTopLevel = false;
+		var iter = cu.iterator();
+		while (iter.hasNext()) {
+			SourceUnit su = iter.next();
+			String name = su.getName();
+			if (name.contains("project-a")) {
+				foundProjectA = true;
+			}
+			if (name.contains("project-b")) {
+				foundProjectB = true;
+			}
+			if (name.contains("TopLevel")) {
+				foundTopLevel = true;
+			}
+		}
+		Assertions.assertFalse(foundProjectA,
+				"Files inside sub-project A should be excluded from the parent scope");
+		Assertions.assertFalse(foundProjectB,
+				"Files inside sub-project B should be excluded from the parent scope");
+		Assertions.assertTrue(foundTopLevel,
+				"Top-level file should still be included");
+	}
+
 	// --- Open files take priority ---
 
 	@Test

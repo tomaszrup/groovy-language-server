@@ -23,9 +23,12 @@ package com.tomaszrup.groovyls.config;
 import java.io.File;
 import java.io.IOException;
 import java.net.URI;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -57,6 +60,16 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 	private static final Set<String> EXCLUDED_DIR_NAMES = new HashSet<>(Arrays.asList(
 			"bin", "build", "out", ".gradle", ".settings", ".metadata"));
 
+	/**
+	 * Build-file names used to detect separate sub-projects during the file
+	 * walk.  When a directory (other than the walk root) contains one of these
+	 * files AND has JVM source directories, it is treated as an independent
+	 * project and its subtree is skipped.  This prevents duplicate-class
+	 * errors when multiple sibling projects live under a common workspace root.
+	 */
+	private static final Set<String> BUILD_FILE_NAMES = Set.of(
+			"build.gradle", "build.gradle.kts", "pom.xml");
+
 	private GroovyLSCompilationUnit compilationUnit;
 	private CompilerConfiguration config;
 	private GroovyClassLoader classLoader;
@@ -83,7 +96,7 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 
 	public void setExcludedSubRoots(List<Path> excludedSubRoots) {
 		this.excludedSubRoots = excludedSubRoots != null ? excludedSubRoots : new ArrayList<>();
-		logger.info("Set excludedSubRoots: {}", this.excludedSubRoots);
+		logger.debug("Set excludedSubRoots: {}", this.excludedSubRoots);
 	}
 
 	public List<String> getAdditionalClasspathList() {
@@ -92,11 +105,11 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 
 	public void setAdditionalClasspathList(List<String> additionalClasspathList) {
 		this.additionalClasspathList = additionalClasspathList;
-		logger.info("Set additionalClasspathList ({} entries)", additionalClasspathList != null ? additionalClasspathList.size() : 0);
+		logger.debug("Set additionalClasspathList ({} entries)", additionalClasspathList != null ? additionalClasspathList.size() : 0);
 		if (additionalClasspathList != null) {
 			for (String cp : additionalClasspathList) {
 				if (cp.toLowerCase().contains("spock")) {
-					logger.info("  [SPOCK] classpath entry: {}", cp);
+					logger.debug("  [SPOCK] classpath entry: {}", cp);
 				}
 			}
 		}
@@ -237,10 +250,10 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 
 		List<String> classpathList = new ArrayList<>();
 		getClasspathList(classpathList);
-		logger.info("CompilerConfiguration classpath ({} entries)", classpathList.size());
+		logger.debug("CompilerConfiguration classpath ({} entries)", classpathList.size());
 		for (String cp : classpathList) {
 			if (cp.toLowerCase().contains("spock")) {
-				logger.info("  [SPOCK] effective classpath entry: {}", cp);
+				logger.debug("  [SPOCK] effective classpath entry: {}", cp);
 			}
 		}
 		config.setClasspathList(classpathList);
@@ -260,6 +273,7 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 			return;
 		}
 
+		Set<String> seen = new HashSet<>();
 		List<String> resolved = new ArrayList<>();
 		for (String entry : additionalClasspathList) {
 			boolean mustBeDirectory = false;
@@ -273,9 +287,20 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
                 continue;
             }
 
+            // Use canonical path for dedup to handle Windows drive-letter
+            // casing differences (C:\ vs c:\)
+            String canonicalPath;
+            try {
+                canonicalPath = file.getCanonicalPath();
+            } catch (IOException e) {
+                canonicalPath = file.getPath();
+            }
+
             if (file.isDirectory()) {
                 // Always add directories (important for build/classes output)
-                resolved.add(file.getPath());
+                if (seen.add(canonicalPath)) {
+                    resolved.add(canonicalPath);
+                }
 
                 // And if user used '*', include jars inside
                 if (mustBeDirectory) {
@@ -283,13 +308,22 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
                     if (children != null) {
                         for (File child : children) {
                             if (child.isFile() && child.getName().endsWith(".jar")) {
-                                resolved.add(child.getPath());
+                                String childCanonical;
+                                try {
+                                    childCanonical = child.getCanonicalPath();
+                                } catch (IOException e) {
+                                    childCanonical = child.getPath();
+                                }
+                                if (seen.add(childCanonical)) {
+                                    resolved.add(childCanonical);
+                                }
                             }
                         }
                     }
                 }
-            } else if (!mustBeDirectory && file.isFile() && file.getName().endsWith(".jar")) {
-                resolved.add(entry);
+            } else if (!mustBeDirectory && file.isFile() && file.getName().endsWith(".jar")
+                    && seen.add(canonicalPath)) {
+                resolved.add(canonicalPath);
             }
         }
 
@@ -301,6 +335,13 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 	 * Populate the file cache by walking the directory tree once, filtering by
 	 * extension and exclusion rules. Subsequent calls are no-ops until
 	 * {@link #invalidateFileCache()} is called.
+	 *
+	 * <p>Uses {@link Files#walkFileTree} so that entire subtrees can be
+	 * pruned via {@link FileVisitResult#SKIP_SUBTREE}.  In particular,
+	 * directories that look like separate projects (contain a build file
+	 * <b>and</b> JVM source directories) are skipped when they are not the
+	 * walk root &mdash; this prevents duplicate-class errors when multiple
+	 * sibling projects live under a common workspace root.</p>
 	 */
 	private Set<Path> getOrBuildFileCache(Path dirPath) {
 		if (cachedGroovyFiles != null) {
@@ -309,25 +350,57 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 		cachedGroovyFiles = new HashSet<>();
 		try {
 			if (Files.exists(dirPath)) {
-				logger.info("Building file cache for .groovy sources: {}", dirPath);
-				logger.info("  excludedSubRoots: {}", excludedSubRoots);
-				try (java.util.stream.Stream<Path> stream = Files.walk(dirPath)) {
-					stream.forEach((filePath) -> {
-						if (!filePath.toString().endsWith(FILE_EXTENSION_GROOVY)) {
-							return;
+				logger.debug("Building file cache for .groovy sources: {}", dirPath);
+				logger.debug("  excludedSubRoots: {}", excludedSubRoots);
+				Path normalizedRoot = dirPath.normalize();
+
+				Files.walkFileTree(normalizedRoot, new SimpleFileVisitor<>() {
+					@Override
+					public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
+						// Never prune the root itself
+						if (dir.equals(normalizedRoot)) {
+							return FileVisitResult.CONTINUE;
 						}
-						if (isInsideExcludedDirectory(filePath, dirPath)) {
-							logger.debug("  Excluded (dir): {}", filePath);
-							return;
+						String dirName = dir.getFileName().toString();
+						// Skip excluded directory names (build output, etc.)
+						if (EXCLUDED_DIR_NAMES.contains(dirName)) {
+							return FileVisitResult.SKIP_SUBTREE;
 						}
-						if (isInsideExcludedSubRoot(filePath)) {
-							logger.info("  Excluded (subproject): {}", filePath);
-							return;
+						// Skip hidden directories
+						if (dirName.startsWith(".")) {
+							return FileVisitResult.SKIP_SUBTREE;
 						}
-						cachedGroovyFiles.add(filePath);
-					});
-				}
-				logger.info("File cache built: {} .groovy files", cachedGroovyFiles.size());
+						// Skip explicitly excluded sub-project roots
+						if (isInsideExcludedSubRoot(dir)) {
+							logger.debug("  Skipping subtree (subproject root): {}", dir);
+							return FileVisitResult.SKIP_SUBTREE;
+						}
+						// Skip directories that look like separate projects
+						// (have their own build file + JVM source dirs)
+						if (isSeparateProject(dir)) {
+							logger.debug("  Skipping subtree (separate project): {}", dir);
+							return FileVisitResult.SKIP_SUBTREE;
+						}
+						return FileVisitResult.CONTINUE;
+					}
+
+					@Override
+					public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+						if (attrs.isRegularFile()
+								&& file.toString().endsWith(FILE_EXTENSION_GROOVY)) {
+							cachedGroovyFiles.add(file);
+						}
+						return FileVisitResult.CONTINUE;
+					}
+
+					@Override
+					public FileVisitResult visitFileFailed(Path file, IOException exc) {
+						logger.debug("Cannot access {}: {}", file, exc.getMessage());
+						return FileVisitResult.CONTINUE;
+					}
+				});
+
+				logger.debug("File cache built: {} .groovy files", cachedGroovyFiles.size());
 			}
 		} catch (IOException e) {
 			logger.error("Failed to walk directory for source files: {}", dirPath, e);
@@ -349,9 +422,10 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 				}
 			}
 		}
+		Path normalizedDir = dirPath.normalize();
 		fileContentsTracker.getOpenURIs().forEach(uri -> {
 			Path openPath = Paths.get(uri);
-			if (!openPath.normalize().startsWith(dirPath.normalize())) {
+			if (!openPath.normalize().startsWith(normalizedDir)) {
 				return;
 			}
 			if (isInsideExcludedDirectory(openPath, dirPath)) {
@@ -359,7 +433,11 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 				return;
 			}
 			if (isInsideExcludedSubRoot(openPath)) {
-				logger.info("  Excluded open file (subproject): {}", openPath);
+				logger.debug("  Excluded open file (subproject): {}", openPath);
+				return;
+			}
+			if (isInsideSeparateProject(openPath, normalizedDir)) {
+				logger.debug("  Excluded open file (separate project): {}", openPath);
 				return;
 			}
 			if (changedUris != null && !changedUris.contains(uri)) {
@@ -392,6 +470,50 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 	private boolean isInsideExcludedSubRoot(Path filePath) {
 		for (Path subRoot : excludedSubRoots) {
 			if (filePath.startsWith(subRoot)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Checks whether the given directory looks like a separate build-tool
+	 * project: it contains a recognised build file <b>and</b> has at least
+	 * one standard JVM source directory ({@code src/main/java},
+	 * {@code src/main/groovy}, {@code src/test/java}, or
+	 * {@code src/test/groovy}).  Used during the file walk to prune
+	 * subtrees that belong to independent sibling projects.
+	 */
+	private static boolean isSeparateProject(Path dir) {
+		boolean hasBuildFile = false;
+		for (String buildFile : BUILD_FILE_NAMES) {
+			if (Files.isRegularFile(dir.resolve(buildFile))) {
+				hasBuildFile = true;
+				break;
+			}
+		}
+		if (!hasBuildFile) {
+			return false;
+		}
+		return Files.isDirectory(dir.resolve("src/main/java"))
+				|| Files.isDirectory(dir.resolve("src/main/groovy"))
+				|| Files.isDirectory(dir.resolve("src/test/java"))
+				|| Files.isDirectory(dir.resolve("src/test/groovy"));
+	}
+
+	/**
+	 * Checks whether the given file is inside a sub-directory of
+	 * {@code rootPath} that is a separate project.  Walks the path
+	 * segments between the root and the file looking for the first
+	 * directory that passes {@link #isSeparateProject(Path)}.
+	 */
+	private static boolean isInsideSeparateProject(Path filePath, Path rootPath) {
+		Path relative = rootPath.relativize(filePath.normalize());
+		// Walk intermediate directories (skip the file name itself)
+		Path current = rootPath;
+		for (int i = 0; i < relative.getNameCount() - 1; i++) {
+			current = current.resolve(relative.getName(i));
+			if (Files.isDirectory(current) && isSeparateProject(current)) {
 				return true;
 			}
 		}

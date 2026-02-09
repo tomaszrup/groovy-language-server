@@ -141,23 +141,35 @@ public class CompilationService {
 	/**
 	 * Performs the initial (deferred) compilation of a scope if it hasn't
 	 * been compiled yet.  Called under the scope's write lock.
+	 *
+	 * @return {@code true} if a full compilation was actually performed,
+	 *         {@code false} if the scope was already compiled or could not
+	 *         be compiled (e.g. classpath not yet resolved)
 	 */
-	public void ensureScopeCompiled(ProjectScope scope) {
-		if (!scope.compiled) {
-			createOrUpdateCompilationUnit(scope);
-			resetChangedFilesForScope(scope);
-			compile(scope);
-			visitAST(scope);
-			// Build the full dependency graph after initial compilation
-			if (scope.astVisitor != null) {
-				scope.dependencyGraph.clear();
-				for (URI uri : scope.astVisitor.getDependenciesByURI().keySet()) {
-					Set<URI> deps = scope.astVisitor.resolveSourceDependencies(uri);
-					scope.dependencyGraph.updateDependencies(uri, deps);
-				}
-			}
-			scope.compiled = true;
+	public boolean ensureScopeCompiled(ProjectScope scope) {
+		if (scope.compiled) {
+			return false;
 		}
+		// Guard: do not compile a scope whose classpath hasn't been resolved
+		// yet — this would produce thousands of false-positive diagnostics.
+		if (!scope.classpathResolved && scope.projectRoot != null) {
+			logger.debug("Skipping compilation of {} — classpath not yet resolved", scope.projectRoot);
+			return false;
+		}
+		createOrUpdateCompilationUnit(scope);
+		resetChangedFilesForScope(scope);
+		compile(scope);
+		visitAST(scope);
+		// Build the full dependency graph after initial compilation
+		if (scope.astVisitor != null) {
+			scope.dependencyGraph.clear();
+			for (URI uri : scope.astVisitor.getDependenciesByURI().keySet()) {
+				Set<URI> deps = scope.astVisitor.resolveSourceDependencies(uri);
+				scope.dependencyGraph.updateDependencies(uri, deps);
+			}
+		}
+		scope.compiled = true;
+		return true;
 	}
 
 	/**
@@ -214,6 +226,13 @@ public class CompilationService {
 	}
 
 	public void compileAndVisitAST(ProjectScope scope, URI contextURI) {
+		// Early return: if the scope is already compiled and there are no
+		// pending changes under this scope's root, skip the compile cycle.
+		if (scope.compiled && !fileContentsTracker.hasChangedURIsUnder(scope.projectRoot)) {
+			scope.previousContext = contextURI;
+			return;
+		}
+
 		Set<URI> changedSnapshot = new HashSet<>(fileContentsTracker.getChangedURIs());
 
 		// Try incremental (single-file) compilation for small change sets
@@ -303,7 +322,7 @@ public class CompilationService {
 			}
 		}
 
-		logger.info("Incremental compilation succeeded for scope {} ({} changed, {} total in unit)",
+		logger.debug("Incremental compilation succeeded for scope {} ({} changed, {} total in unit)",
 				scope.projectRoot, changedPlusContext.size(), filesToCompile.size());
 		return true;
 	}
