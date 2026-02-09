@@ -22,12 +22,15 @@ package com.tomaszrup.groovyls.util;
 
 import java.net.URI;
 import java.util.Collections;
+import java.util.Set;
 
 import org.eclipse.lsp4j.DidChangeTextDocumentParams;
+import org.eclipse.lsp4j.DidCloseTextDocumentParams;
 import org.eclipse.lsp4j.DidOpenTextDocumentParams;
 import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.Range;
 import org.eclipse.lsp4j.TextDocumentContentChangeEvent;
+import org.eclipse.lsp4j.TextDocumentIdentifier;
 import org.eclipse.lsp4j.TextDocumentItem;
 import org.eclipse.lsp4j.VersionedTextDocumentIdentifier;
 import org.junit.jupiter.api.AfterEach;
@@ -100,5 +103,166 @@ class FileContentsTrackerTests {
 		changeParams.setContentChanges(Collections.singletonList(changeEvent));
 		tracker.didChange(changeParams);
 		Assertions.assertEquals("hello\nwaffles", tracker.getContents(URI.create("file.txt")));
+	}
+
+	// ------------------------------------------------------------------
+	// didClose
+	// ------------------------------------------------------------------
+
+	@Test
+	void testDidClose() {
+		DidOpenTextDocumentParams openParams = new DidOpenTextDocumentParams();
+		openParams.setTextDocument(new TextDocumentItem("file.txt", "plaintext", 1, "hello"));
+		tracker.didOpen(openParams);
+		Assertions.assertTrue(tracker.isOpen(URI.create("file.txt")));
+
+		DidCloseTextDocumentParams closeParams = new DidCloseTextDocumentParams();
+		closeParams.setTextDocument(new TextDocumentIdentifier("file.txt"));
+		tracker.didClose(closeParams);
+
+		Assertions.assertFalse(tracker.isOpen(URI.create("file.txt")));
+	}
+
+	@Test
+	void testDidCloseRemovesContents() {
+		DidOpenTextDocumentParams openParams = new DidOpenTextDocumentParams();
+		openParams.setTextDocument(new TextDocumentItem("file.txt", "plaintext", 1, "hello"));
+		tracker.didOpen(openParams);
+
+		DidCloseTextDocumentParams closeParams = new DidCloseTextDocumentParams();
+		closeParams.setTextDocument(new TextDocumentIdentifier("file.txt"));
+		tracker.didClose(closeParams);
+
+		// getContents will try to read from file system (which won't exist), returning null
+		// The in-memory copy should be removed
+		Assertions.assertFalse(tracker.isOpen(URI.create("file.txt")));
+	}
+
+	// ------------------------------------------------------------------
+	// getOpenURIs
+	// ------------------------------------------------------------------
+
+	@Test
+	void testGetOpenURIsEmpty() {
+		Set<URI> uris = tracker.getOpenURIs();
+		Assertions.assertNotNull(uris);
+		Assertions.assertTrue(uris.isEmpty());
+	}
+
+	@Test
+	void testGetOpenURIsAfterOpen() {
+		DidOpenTextDocumentParams params = new DidOpenTextDocumentParams();
+		params.setTextDocument(new TextDocumentItem("file.txt", "plaintext", 1, "hello"));
+		tracker.didOpen(params);
+
+		Set<URI> uris = tracker.getOpenURIs();
+		Assertions.assertEquals(1, uris.size());
+		Assertions.assertTrue(uris.contains(URI.create("file.txt")));
+	}
+
+	@Test
+	void testGetOpenURIsAfterOpenAndClose() {
+		DidOpenTextDocumentParams openParams = new DidOpenTextDocumentParams();
+		openParams.setTextDocument(new TextDocumentItem("file.txt", "plaintext", 1, "hello"));
+		tracker.didOpen(openParams);
+
+		DidCloseTextDocumentParams closeParams = new DidCloseTextDocumentParams();
+		closeParams.setTextDocument(new TextDocumentIdentifier("file.txt"));
+		tracker.didClose(closeParams);
+
+		Set<URI> uris = tracker.getOpenURIs();
+		Assertions.assertTrue(uris.isEmpty());
+	}
+
+	// ------------------------------------------------------------------
+	// getChangedURIs / resetChangedFiles
+	// ------------------------------------------------------------------
+
+	@Test
+	void testGetChangedURIsAfterOpen() {
+		DidOpenTextDocumentParams params = new DidOpenTextDocumentParams();
+		params.setTextDocument(new TextDocumentItem("file.txt", "plaintext", 1, "hello"));
+		tracker.didOpen(params);
+
+		Set<URI> changed = tracker.getChangedURIs();
+		Assertions.assertTrue(changed.contains(URI.create("file.txt")));
+	}
+
+	@Test
+	void testResetChangedFiles() {
+		DidOpenTextDocumentParams params = new DidOpenTextDocumentParams();
+		params.setTextDocument(new TextDocumentItem("file.txt", "plaintext", 1, "hello"));
+		tracker.didOpen(params);
+
+		Assertions.assertFalse(tracker.getChangedURIs().isEmpty());
+		tracker.resetChangedFiles();
+		Assertions.assertTrue(tracker.getChangedURIs().isEmpty());
+	}
+
+	@Test
+	void testResetChangedFilesSelective() {
+		DidOpenTextDocumentParams params1 = new DidOpenTextDocumentParams();
+		params1.setTextDocument(new TextDocumentItem("file1.txt", "plaintext", 1, "a"));
+		tracker.didOpen(params1);
+
+		DidOpenTextDocumentParams params2 = new DidOpenTextDocumentParams();
+		params2.setTextDocument(new TextDocumentItem("file2.txt", "plaintext", 1, "b"));
+		tracker.didOpen(params2);
+
+		// Reset only file1
+		tracker.resetChangedFiles(Collections.singleton(URI.create("file1.txt")));
+		Set<URI> changed = tracker.getChangedURIs();
+		Assertions.assertFalse(changed.contains(URI.create("file1.txt")));
+		Assertions.assertTrue(changed.contains(URI.create("file2.txt")));
+	}
+
+	// ------------------------------------------------------------------
+	// forceChanged
+	// ------------------------------------------------------------------
+
+	@Test
+	void testForceChanged() {
+		URI uri = URI.create("file.txt");
+		tracker.resetChangedFiles();
+		Assertions.assertFalse(tracker.getChangedURIs().contains(uri));
+
+		tracker.forceChanged(uri);
+		Assertions.assertTrue(tracker.getChangedURIs().contains(uri));
+	}
+
+	// ------------------------------------------------------------------
+	// isOpen
+	// ------------------------------------------------------------------
+
+	@Test
+	void testIsOpenFalseForUnknownFile() {
+		Assertions.assertFalse(tracker.isOpen(URI.create("unknown.txt")));
+	}
+
+	@Test
+	void testIsOpenTrueAfterDidOpen() {
+		DidOpenTextDocumentParams params = new DidOpenTextDocumentParams();
+		params.setTextDocument(new TextDocumentItem("file.txt", "plaintext", 1, "hello"));
+		tracker.didOpen(params);
+		Assertions.assertTrue(tracker.isOpen(URI.create("file.txt")));
+	}
+
+	// ------------------------------------------------------------------
+	// setContents / getContents
+	// ------------------------------------------------------------------
+
+	@Test
+	void testSetAndGetContents() {
+		URI uri = URI.create("file.txt");
+		tracker.setContents(uri, "custom content");
+		Assertions.assertEquals("custom content", tracker.getContents(uri));
+	}
+
+	@Test
+	void testGetContentsForNonExistentFile() {
+		URI uri = URI.create("file:///nonexistent_file_12345.txt");
+		// Should return null for a file that doesn't exist on disk and isn't open
+		String contents = tracker.getContents(uri);
+		Assertions.assertNull(contents);
 	}
 }

@@ -25,8 +25,10 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.Stack;
 import java.util.stream.Collectors;
 
@@ -141,6 +143,13 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 	private Map<String, ClassNode> classNodesByName = new HashMap<>();
 	private Map<ASTLookupKey, ASTNodeLookupData> lookup = new HashMap<>();
 
+	/**
+	 * Tracks fully-qualified class names referenced by each source file
+	 * (via imports, superclass, and interface declarations). Used to build
+	 * the inter-file dependency graph for incremental compilation.
+	 */
+	private Map<URI, Set<String>> dependenciesByURI = new HashMap<>();
+
 	private void pushASTNode(ASTNode node) {
 		boolean isSynthetic = false;
 		if (node instanceof AnnotatedNode) {
@@ -172,6 +181,17 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 			result.addAll(nodes);
 		}
 		return result;
+	}
+
+	/**
+	 * Returns the class nodes defined in the given source file.
+	 *
+	 * @param uri the source file URI
+	 * @return the list of class nodes, or an empty list if none
+	 */
+	public List<ClassNode> getClassNodes(URI uri) {
+		List<ClassNode> nodes = classNodesByURI.get(uri);
+		return nodes != null ? nodes : Collections.emptyList();
 	}
 
 	/**
@@ -287,6 +307,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		classNodesByURI.clear();
 		classNodesByName.clear();
 		lookup.clear();
+		dependenciesByURI.clear();
 		unit.iterator().forEachRemaining(sourceUnit -> {
 			visitSourceUnit(sourceUnit);
 		});
@@ -305,6 +326,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 			if (oldClassNodes != null) {
 				oldClassNodes.forEach(cn -> classNodesByName.remove(cn.getName()));
 			}
+			dependenciesByURI.remove(uri);
 		});
 		unit.iterator().forEachRemaining(sourceUnit -> {
 			URI uri = sourceUnit.getSource().getURI();
@@ -315,11 +337,78 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		});
 	}
 
+	/**
+	 * Creates a new {@code ASTNodeVisitor} that is a copy-on-write snapshot
+	 * of this visitor. Data for URIs in {@code excludedURIs} is omitted from
+	 * the copy (those URIs are about to be re-visited from fresh compilation
+	 * output). The original visitor is <em>not</em> mutated, so concurrent
+	 * readers can safely use it while the new visitor is being populated.
+	 *
+	 * <p>The returned visitor shares the same AST node object references as
+	 * the original, but the container maps are independent copies.</p>
+	 *
+	 * @param excludedURIs URIs whose data should be excluded from the snapshot
+	 * @return a new {@code ASTNodeVisitor} pre-populated with data for all
+	 *         URIs <em>except</em> those in {@code excludedURIs}
+	 */
+	public ASTNodeVisitor createSnapshotExcluding(Collection<URI> excludedURIs) {
+		ASTNodeVisitor copy = new ASTNodeVisitor();
+		Set<URI> excluded = excludedURIs instanceof Set
+				? (Set<URI>) excludedURIs
+				: new HashSet<>(excludedURIs);
+
+		// Share list/set references for non-excluded URIs (shallow copy).
+		// This is safe because the list/set values for non-excluded URIs are
+		// never mutated — visitSourceUnit() creates new containers only for
+		// the URIs being re-visited (which are the excluded ones).
+		for (Map.Entry<URI, List<ASTNode>> entry : nodesByURI.entrySet()) {
+			if (!excluded.contains(entry.getKey())) {
+				copy.nodesByURI.put(entry.getKey(), entry.getValue());
+			}
+		}
+		for (Map.Entry<URI, List<ClassNode>> entry : classNodesByURI.entrySet()) {
+			if (!excluded.contains(entry.getKey())) {
+				copy.classNodesByURI.put(entry.getKey(), entry.getValue());
+			}
+		}
+		for (Map.Entry<URI, Set<String>> entry : dependenciesByURI.entrySet()) {
+			if (!excluded.contains(entry.getKey())) {
+				copy.dependenciesByURI.put(entry.getKey(), entry.getValue());
+			}
+		}
+
+		// Copy classNodesByName — skip names belonging to excluded URIs
+		Set<String> excludedClassNames = new HashSet<>();
+		for (URI uri : excluded) {
+			List<ClassNode> classNodes = classNodesByURI.get(uri);
+			if (classNodes != null) {
+				for (ClassNode cn : classNodes) {
+					excludedClassNames.add(cn.getName());
+				}
+			}
+		}
+		for (Map.Entry<String, ClassNode> entry : classNodesByName.entrySet()) {
+			if (!excludedClassNames.contains(entry.getKey())) {
+				copy.classNodesByName.put(entry.getKey(), entry.getValue());
+			}
+		}
+
+		// Copy lookup — skip entries belonging to excluded URIs
+		for (Map.Entry<ASTLookupKey, ASTNodeLookupData> entry : lookup.entrySet()) {
+			if (!excluded.contains(entry.getValue().uri)) {
+				copy.lookup.put(entry.getKey(), entry.getValue());
+			}
+		}
+
+		return copy;
+	}
+
 	public void visitSourceUnit(SourceUnit unit) {
 		sourceUnit = unit;
 		URI uri = sourceUnit.getSource().getURI();
 		nodesByURI.put(uri, new ArrayList<>());
 		classNodesByURI.put(uri, new ArrayList<>());
+		dependenciesByURI.put(uri, new HashSet<>());
 		stack.clear();
 		ModuleNode moduleNode = unit.getAST();
 		if (moduleNode != null) {
@@ -351,6 +440,14 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 			ClassNode unresolvedSuperClass = node.getUnresolvedSuperClass();
 			if (unresolvedSuperClass != null && unresolvedSuperClass.getLineNumber() != -1) {
 				pushASTNode(unresolvedSuperClass);
+				// Track superclass as a dependency
+				String superName = unresolvedSuperClass.getName();
+				if (superName != null && !superName.startsWith("java.") && !superName.startsWith("groovy.")) {
+					Set<String> deps = dependenciesByURI.get(uri);
+					if (deps != null) {
+						deps.add(superName);
+					}
+				}
 				popASTNode();
 			}
 			for (ClassNode unresolvedInterface : node.getUnresolvedInterfaces()) {
@@ -358,6 +455,14 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 					continue;
 				}
 				pushASTNode(unresolvedInterface);
+				// Track interface as a dependency
+				String ifaceName = unresolvedInterface.getName();
+				if (ifaceName != null && !ifaceName.startsWith("java.") && !ifaceName.startsWith("groovy.")) {
+					Set<String> deps = dependenciesByURI.get(uri);
+					if (deps != null) {
+						deps.add(ifaceName);
+					}
+				}
 				popASTNode();
 			}
 			super.visitClass(node);
@@ -383,28 +488,65 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 	@Override
 	public void visitImports(ModuleNode node) {
 		if (node != null) {
+			URI uri = sourceUnit.getSource().getURI();
+			Set<String> deps = dependenciesByURI.get(uri);
+
 			for (ImportNode importNode : node.getImports()) {
 				pushASTNode(importNode);
 				visitAnnotations(importNode);
 				importNode.visit(this);
+				// Track regular import as a dependency
+				if (deps != null && importNode.getClassName() != null) {
+					String className = importNode.getClassName();
+					if (!className.startsWith("java.") && !className.startsWith("groovy.")) {
+						deps.add(className);
+					}
+				}
 				popASTNode();
 			}
 			for (ImportNode importStarNode : node.getStarImports()) {
 				pushASTNode(importStarNode);
 				visitAnnotations(importStarNode);
 				importStarNode.visit(this);
+				// Track star import — resolve conservatively against all known classes
+				if (deps != null) {
+					String packageName = importStarNode.getPackageName();
+					if (packageName != null && !packageName.startsWith("java.") && !packageName.startsWith("groovy.")) {
+						// Mark as depending on all classes in this package
+						for (Map.Entry<String, ClassNode> entry : classNodesByName.entrySet()) {
+							String fqn = entry.getKey();
+							if (fqn.startsWith(packageName)) {
+								deps.add(fqn);
+							}
+						}
+					}
+				}
 				popASTNode();
 			}
 			for (ImportNode importStaticNode : node.getStaticImports().values()) {
 				pushASTNode(importStaticNode);
 				visitAnnotations(importStaticNode);
 				importStaticNode.visit(this);
+				// Track static import as a dependency
+				if (deps != null && importStaticNode.getClassName() != null) {
+					String className = importStaticNode.getClassName();
+					if (!className.startsWith("java.") && !className.startsWith("groovy.")) {
+						deps.add(className);
+					}
+				}
 				popASTNode();
 			}
 			for (ImportNode importStaticStarNode : node.getStaticStarImports().values()) {
 				pushASTNode(importStaticStarNode);
 				visitAnnotations(importStaticStarNode);
 				importStaticStarNode.visit(this);
+				// Track static star import as a dependency
+				if (deps != null && importStaticStarNode.getClassName() != null) {
+					String className = importStaticStarNode.getClassName();
+					if (!className.startsWith("java.") && !className.startsWith("groovy.")) {
+						deps.add(className);
+					}
+				}
 				popASTNode();
 			}
 		}
@@ -930,5 +1072,48 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		} finally {
 			popASTNode();
 		}
+	}
+
+	// --- Dependency tracking ---
+
+	/**
+	 * Returns the raw dependency map: source URI → set of fully-qualified
+	 * class names that the source references (via imports, superclass, or
+	 * interface declarations).
+	 */
+	public Map<URI, Set<String>> getDependenciesByURI() {
+		return dependenciesByURI;
+	}
+
+	/**
+	 * Resolves class-name dependencies to source URIs using the current
+	 * {@link #classNodesByName} mapping.  Only dependencies on classes
+	 * that exist in the current compilation are resolved — references to
+	 * external (classpath) classes are silently dropped since they don't
+	 * belong to the source dependency graph.
+	 *
+	 * @param fileURI the source file whose dependencies to resolve
+	 * @return the set of source URIs that {@code fileURI} depends on,
+	 *         or an empty set if no dependencies were recorded
+	 */
+	public Set<URI> resolveSourceDependencies(URI fileURI) {
+		Set<String> classNames = dependenciesByURI.get(fileURI);
+		if (classNames == null || classNames.isEmpty()) {
+			return Collections.emptySet();
+		}
+		Set<URI> result = new HashSet<>();
+		for (String className : classNames) {
+			ClassNode classNode = classNodesByName.get(className);
+			if (classNode != null && classNode.getModule() != null
+					&& classNode.getModule().getContext() != null
+					&& classNode.getModule().getContext().getSource() != null) {
+				URI depURI = classNode.getModule().getContext().getSource().getURI();
+				// Don't add self-dependency
+				if (!depURI.equals(fileURI)) {
+					result.add(depURI);
+				}
+			}
+		}
+		return result;
 	}
 }

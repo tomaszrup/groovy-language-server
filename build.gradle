@@ -18,7 +18,21 @@ tasks.build.dependsOn tasks.shadowJar
 
 shadowJar {
   archiveBaseName.set("groovy-language-server")
-  
+
+  minimize {
+    // Keep dependencies that use reflection / ServiceLoader
+    exclude(dependency('org.slf4j:.*'))
+    exclude(dependency('org.eclipse.lsp4j:.*'))
+    exclude(dependency('com.google.code.gson:gson'))
+  }
+
+  // Strip bundled metadata that serves no runtime purpose
+  exclude 'META-INF/maven/**'
+  exclude 'META-INF/LICENSE*'
+  exclude 'META-INF/NOTICE*'
+  exclude 'META-INF/DEPENDENCIES'
+  exclude '**/*.html'
+
   manifest {
     attributes "Main-Class": "com.tomaszrup.groovyls.GroovyLanguageServer"
   }

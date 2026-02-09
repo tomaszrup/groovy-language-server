@@ -37,10 +37,10 @@ public class LanguageServerErrorCollector extends ErrorCollector {
 
     public void clear() {
         if (errors != null) {
-            errors.clear();
+            errors = null;
         }
         if (warnings != null) {
-            warnings.clear();
+            warnings = null;
         }
     }
 

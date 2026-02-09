@@ -20,8 +20,11 @@
 ////////////////////////////////////////////////////////////////////////////////
 package com.tomaszrup.groovyls.config;
 
+import java.net.URI;
 import java.nio.file.Path;
+import java.util.Collections;
 import java.util.List;
+import java.util.Set;
 
 import com.tomaszrup.groovyls.compiler.control.GroovyLSCompilationUnit;
 import com.tomaszrup.groovyls.util.FileContentsTracker;
@@ -50,4 +53,41 @@ public interface ICompilationUnitFactory {
 	 * Returns a compilation unit.
 	 */
 	public GroovyLSCompilationUnit create(Path workspaceRoot, FileContentsTracker fileContentsTracker);
+
+	/**
+	 * Returns a compilation unit, additionally invalidating the given URIs
+	 * even if they are not marked as changed in the {@code fileContentsTracker}.
+	 * This is used for dependency-driven invalidation: when a file changes,
+	 * its dependents need to be recompiled even though their contents haven't
+	 * changed.
+	 *
+	 * @param workspaceRoot        the project root directory
+	 * @param fileContentsTracker  tracks open file contents and changed URIs
+	 * @param additionalInvalidations  URIs of dependent files to force-invalidate
+	 * @return the (possibly reused) compilation unit
+	 */
+	default GroovyLSCompilationUnit create(Path workspaceRoot, FileContentsTracker fileContentsTracker,
+			Set<URI> additionalInvalidations) {
+		// Default implementation ignores additional invalidations for backward
+		// compatibility (e.g. test implementations that don't need this).
+		return create(workspaceRoot, fileContentsTracker);
+	}
+
+	/**
+	 * Creates a temporary, lightweight compilation unit containing only the
+	 * specified source files. Used for single-file incremental compilation.
+	 * The returned unit is <em>not</em> stored and does not replace the main
+	 * compilation unit.
+	 *
+	 * @param workspaceRoot       the project root directory
+	 * @param fileContentsTracker tracks open file contents
+	 * @param filesToInclude      the URIs of files to include as sources
+	 * @return a compilation unit containing only the specified files, or
+	 *         {@code null} if incremental compilation is not supported
+	 */
+	default GroovyLSCompilationUnit createIncremental(Path workspaceRoot,
+			FileContentsTracker fileContentsTracker, Set<URI> filesToInclude) {
+		// Default: not supported — caller should fall back to full compilation
+		return null;
+	}
 }

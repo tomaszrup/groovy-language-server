@@ -192,4 +192,91 @@ class GroovyServicesSignatureHelpTests {
 		Assertions.assertEquals((int) 0, (int) signatureHelp.getActiveSignature());
 		Assertions.assertEquals((int) 1, (int) signatureHelp.getActiveParameter());
 	}
+
+	@Test
+	void testSignatureHelpOnConstructor() throws Exception {
+		Path filePath = srcRoot.resolve("SignatureHelpCtor.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("class SignatureHelpCtor {\n");
+		contents.append("  String name\n");
+		contents.append("  SignatureHelpCtor(String name) {\n");
+		contents.append("    this.name = name\n");
+		contents.append("  }\n");
+		contents.append("  public SignatureHelpCtor() {\n");
+		contents.append("    this(\n");
+		contents.append("  }\n");
+		contents.append("}");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+		Position position = new Position(6, 9);
+		SignatureHelp signatureHelp = services.signatureHelp(new SignatureHelpParams(textDocument, position)).get();
+		Assertions.assertNotNull(signatureHelp);
+	}
+
+	@Test
+	void testSignatureHelpOnOverloadedMethods() throws Exception {
+		Path filePath = srcRoot.resolve("SignatureHelpOverload.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("class SignatureHelpOverload {\n");
+		contents.append("  public SignatureHelpOverload() {\n");
+		contents.append("    method(\n");
+		contents.append("  }\n");
+		contents.append("  public void method(int a) {}\n");
+		contents.append("  public void method(int a, String b) {}\n");
+		contents.append("}");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+		Position position = new Position(2, 11);
+		SignatureHelp signatureHelp = services.signatureHelp(new SignatureHelpParams(textDocument, position)).get();
+		List<SignatureInformation> signatures = signatureHelp.getSignatures();
+		Assertions.assertTrue(signatures.size() >= 2,
+				"Should find at least 2 overloads, got: " + signatures.size());
+	}
+
+	@Test
+	void testSignatureHelpAtInvalidPosition() throws Exception {
+		Path filePath = srcRoot.resolve("SignatureHelpInvalid.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("class SignatureHelpInvalid {\n");
+		contents.append("  String name\n");
+		contents.append("}");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+		// Position on the field declaration — no method call context
+		Position position = new Position(1, 10);
+		SignatureHelp signatureHelp = services.signatureHelp(new SignatureHelpParams(textDocument, position)).get();
+		Assertions.assertNotNull(signatureHelp);
+		// Should have no signatures since we're not inside a method call
+		Assertions.assertTrue(signatureHelp.getSignatures().isEmpty(),
+				"Should have no signatures at a non-call position");
+	}
+
+	@Test
+	void testSignatureHelpOnMethodWithNoParameters() throws Exception {
+		Path filePath = srcRoot.resolve("SignatureHelpNoParams.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("class SignatureHelpNoParams {\n");
+		contents.append("  public SignatureHelpNoParams() {\n");
+		contents.append("    method(\n");
+		contents.append("  }\n");
+		contents.append("  public void method() {}\n");
+		contents.append("}");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+		Position position = new Position(2, 11);
+		SignatureHelp signatureHelp = services.signatureHelp(new SignatureHelpParams(textDocument, position)).get();
+		List<SignatureInformation> signatures = signatureHelp.getSignatures();
+		Assertions.assertFalse(signatures.isEmpty(), "Should find at least one signature");
+		SignatureInformation sig = signatures.get(0);
+		Assertions.assertTrue(sig.getParameters().isEmpty(),
+				"Method with no parameters should have empty parameter list");
+	}
 }

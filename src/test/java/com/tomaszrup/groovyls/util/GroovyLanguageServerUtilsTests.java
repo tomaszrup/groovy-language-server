@@ -23,6 +23,7 @@ import java.net.URI;
 
 import org.codehaus.groovy.ast.ClassNode;
 import org.codehaus.groovy.ast.FieldNode;
+import org.codehaus.groovy.syntax.SyntaxException;
 import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.Parameter;
 import org.codehaus.groovy.ast.expr.VariableExpression;
@@ -282,6 +283,47 @@ class GroovyLanguageServerUtilsTests {
 		SymbolInformation info = GroovyLanguageServerUtils.astNodeToSymbolInformation(node, uri, null);
 		Assertions.assertNull(info,
 				"SymbolInformation should be null when location cannot be created");
+	}
+
+	// ------------------------------------------------------------------
+	// syntaxExceptionToRange
+	// ------------------------------------------------------------------
+
+	@Test
+	void testSyntaxExceptionToRangeNormal() {
+		SyntaxException ex = new SyntaxException("test error", 3, 5, 3, 15);
+		Range range = GroovyLanguageServerUtils.syntaxExceptionToRange(ex);
+		Assertions.assertNotNull(range);
+		// Groovy 1-based → LSP 0-based
+		Assertions.assertEquals(2, range.getStart().getLine());
+		Assertions.assertEquals(4, range.getStart().getCharacter());
+		Assertions.assertEquals(2, range.getEnd().getLine());
+		Assertions.assertEquals(14, range.getEnd().getCharacter());
+	}
+
+	@Test
+	void testSyntaxExceptionToRangeInvalidStartLine() {
+		SyntaxException ex = new SyntaxException("test error", -1, 5, 3, 15);
+		Range range = GroovyLanguageServerUtils.syntaxExceptionToRange(ex);
+		Assertions.assertNull(range, "Should return null when start line is -1");
+	}
+
+	@Test
+	void testSyntaxExceptionToRangeInvalidEndLine() {
+		SyntaxException ex = new SyntaxException("test error", 3, 5, -1, 15);
+		Range range = GroovyLanguageServerUtils.syntaxExceptionToRange(ex);
+		Assertions.assertNull(range, "Should return null when end line is -1");
+	}
+
+	@Test
+	void testSyntaxExceptionToRangeMultiLine() {
+		SyntaxException ex = new SyntaxException("test error", 1, 1, 5, 10);
+		Range range = GroovyLanguageServerUtils.syntaxExceptionToRange(ex);
+		Assertions.assertNotNull(range);
+		Assertions.assertEquals(0, range.getStart().getLine());
+		Assertions.assertEquals(0, range.getStart().getCharacter());
+		Assertions.assertEquals(4, range.getEnd().getLine());
+		Assertions.assertEquals(9, range.getEnd().getCharacter());
 	}
 
 	// ------------------------------------------------------------------

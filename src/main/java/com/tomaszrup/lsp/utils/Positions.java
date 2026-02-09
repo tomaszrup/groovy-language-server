@@ -48,12 +48,12 @@ public class Positions {
 			try {
 				int readLines = 0;
 				while (true) {
-					char currentChar = (char) reader.read();
-					if (currentChar == -1) {
+					int readChar = reader.read();
+					if (readChar == -1) {
 						return -1;
 					}
 					currentIndex++;
-					if (currentChar == '\n') {
+					if ((char) readChar == '\n') {
 						readLines++;
 						if (readLines == line) {
 							break;

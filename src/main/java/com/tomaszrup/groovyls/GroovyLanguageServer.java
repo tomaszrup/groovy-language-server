@@ -22,6 +22,8 @@ package com.tomaszrup.groovyls;
 
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.tomaszrup.groovyls.compiler.SharedClassGraphCache;
+import com.tomaszrup.groovyls.config.ClasspathCache;
 import com.tomaszrup.groovyls.config.CompilationUnitFactory;
 import com.tomaszrup.groovyls.config.ICompilationUnitFactory;
 import com.tomaszrup.groovyls.importers.GradleProjectImporter;
@@ -41,6 +43,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.stream.Collectors;
 
 public class GroovyLanguageServer implements LanguageServer, LanguageClientAware {
 
@@ -109,6 +112,8 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             });
     /** Future for the background import task, used for cancellation on shutdown. */
     private volatile Future<?> importFuture;
+    /** Whether the on-disk classpath cache is enabled (default: true). */
+    private volatile boolean classpathCacheEnabled = true;
 
     public GroovyLanguageServer() {
         this(new CompilationUnitFactory());
@@ -167,6 +172,11 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         ProjectImporter importer = projectImporterMap.get(projectRoot);
         if (importer != null) {
             logger.info("Recompiling {} project: {}", importer.getName(), projectRoot);
+            // Invalidate classpath cache — build files may have changed
+            Path workspaceRoot = groovyServices.getWorkspaceRoot();
+            if (classpathCacheEnabled && workspaceRoot != null) {
+                ClasspathCache.invalidate(workspaceRoot);
+            }
             importer.recompile(projectRoot);
         } else {
             logger.warn("No importer found for project root: {}", projectRoot);
@@ -180,6 +190,16 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             URI uri = URI.create(rootUriString);
             Path workspaceRoot = Paths.get(uri);
             groovyServices.setWorkspaceRoot(workspaceRoot);
+        }
+
+        // Parse initializationOptions for cache settings
+        Object initOptions = params.getInitializationOptions();
+        if (initOptions instanceof JsonObject) {
+            JsonObject opts = (JsonObject) initOptions;
+            if (opts.has("classpathCache") && !opts.get("classpathCache").getAsBoolean()) {
+                classpathCacheEnabled = false;
+                logger.info("Classpath caching disabled via initializationOptions");
+            }
         }
 
         // Build capabilities immediately so the client doesn't block
@@ -297,57 +317,95 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                 return;
             }
 
-            // Phase 2: Batch-import per importer, in parallel across importers
-            int totalProjects = discoveredByImporter.values().stream()
-                    .mapToInt(List::size).sum();
-            logProgress("Importing " + totalProjects + " project(s) across "
-                    + discoveredByImporter.size() + " build tool(s)...");
+            // Collect all discovered roots for cache key computation
+            List<Path> allDiscoveredRoots = discoveredByImporter.values().stream()
+                    .flatMap(List::stream).collect(Collectors.toList());
 
-            List<Future<?>> importFutures = new ArrayList<>();
-            for (Map.Entry<ProjectImporter, List<Path>> entry : discoveredByImporter.entrySet()) {
-                ProjectImporter importer = entry.getKey();
-                List<Path> roots = entry.getValue();
-
-                importFutures.add(parallelImportPool.submit(() -> {
-                    try {
-                        logProgress("Batch-importing " + roots.size() + " "
-                                + importer.getName() + " project(s)...");
-                        long start = System.currentTimeMillis();
-
-                        Map<Path, List<String>> batchResult = importer.importProjects(roots);
-
-                        long elapsed = System.currentTimeMillis() - start;
-                        logProgress(importer.getName() + " import completed in "
-                                + (elapsed / 1000) + "s (" + batchResult.size() + " projects)");
-
-                        for (Map.Entry<Path, List<String>> e : batchResult.entrySet()) {
-                            projectClasspaths.put(e.getKey(), e.getValue());
-                            importerMapLocal.put(e.getKey(), importer);
+            // Phase 1b: Check classpath cache
+            Path workspaceRoot = groovyServices.getWorkspaceRoot();
+            boolean cacheHit = false;
+            if (classpathCacheEnabled && workspaceRoot != null && !allDiscoveredRoots.isEmpty()) {
+                Map<String, String> currentHashes = ClasspathCache.computeBuildFileHashes(allDiscoveredRoots);
+                Optional<ClasspathCache.CacheData> cached = ClasspathCache.load(workspaceRoot);
+                if (cached.isPresent() && ClasspathCache.isValid(cached.get(), currentHashes)) {
+                    logProgress("Using cached classpath (build files unchanged)");
+                    Map<Path, List<String>> cachedClasspaths = ClasspathCache.toClasspathMap(cached.get());
+                    projectClasspaths.putAll(cachedClasspaths);
+                    // Assign importers for cached roots by matching against discovered roots
+                    for (Path cachedRoot : cachedClasspaths.keySet()) {
+                        for (Map.Entry<ProjectImporter, List<Path>> de : discoveredByImporter.entrySet()) {
+                            if (de.getValue().contains(cachedRoot)) {
+                                importerMapLocal.put(cachedRoot, de.getKey());
+                                break;
+                            }
                         }
-                    } catch (Exception e) {
-                        logger.error("Error importing {} projects: {}",
-                                importer.getName(), e.getMessage(), e);
-                        logProgress(importer.getName() + " import failed: " + e.getMessage());
                     }
-                }));
-            }
-
-            // Wait for all importers to finish
-            for (Future<?> f : importFutures) {
-                try {
-                    f.get();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    logProgress("Project import cancelled");
-                    return;
-                } catch (ExecutionException e) {
-                    logger.error("Import task failed: {}", e.getCause().getMessage(), e.getCause());
+                    cacheHit = true;
+                } else {
+                    logger.info("Classpath cache miss — will perform full import");
                 }
             }
 
-            if (Thread.currentThread().isInterrupted()) {
-                logProgress("Project import cancelled");
-                return;
+            // Phase 2: Batch-import per importer, in parallel across importers
+            //          (skipped entirely when cache hit)
+            if (!cacheHit) {
+                int totalProjects = discoveredByImporter.values().stream()
+                        .mapToInt(List::size).sum();
+                logProgress("Importing " + totalProjects + " project(s) across "
+                        + discoveredByImporter.size() + " build tool(s)...");
+
+                List<Future<?>> importFutures = new ArrayList<>();
+                for (Map.Entry<ProjectImporter, List<Path>> entry : discoveredByImporter.entrySet()) {
+                    ProjectImporter importer = entry.getKey();
+                    List<Path> roots = entry.getValue();
+
+                    importFutures.add(parallelImportPool.submit(() -> {
+                        try {
+                            logProgress("Batch-importing " + roots.size() + " "
+                                    + importer.getName() + " project(s)...");
+                            long start = System.currentTimeMillis();
+
+                            Map<Path, List<String>> batchResult = importer.importProjects(roots);
+
+                            long elapsed = System.currentTimeMillis() - start;
+                            logProgress(importer.getName() + " import completed in "
+                                    + (elapsed / 1000) + "s (" + batchResult.size() + " projects)");
+
+                            for (Map.Entry<Path, List<String>> e : batchResult.entrySet()) {
+                                projectClasspaths.put(e.getKey(), e.getValue());
+                                importerMapLocal.put(e.getKey(), importer);
+                            }
+                        } catch (Exception e) {
+                            logger.error("Error importing {} projects: {}",
+                                    importer.getName(), e.getMessage(), e);
+                            logProgress(importer.getName() + " import failed: " + e.getMessage());
+                        }
+                    }));
+                }
+
+                // Wait for all importers to finish
+                for (Future<?> f : importFutures) {
+                    try {
+                        f.get();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        logProgress("Project import cancelled");
+                        return;
+                    } catch (ExecutionException e) {
+                        logger.error("Import task failed: {}", e.getCause().getMessage(), e.getCause());
+                    }
+                }
+
+                if (Thread.currentThread().isInterrupted()) {
+                    logProgress("Project import cancelled");
+                    return;
+                }
+
+                // Save classpath cache for next startup
+                if (classpathCacheEnabled && workspaceRoot != null && !projectClasspaths.isEmpty()) {
+                    Map<String, String> hashes = ClasspathCache.computeBuildFileHashes(allDiscoveredRoots);
+                    ClasspathCache.save(workspaceRoot, projectClasspaths, hashes);
+                }
             }
 
             // Phase 3: Register all projects with GroovyServices
@@ -373,6 +431,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         }
         parallelImportPool.shutdownNow();
         importExecutor.shutdownNow();
+        SharedClassGraphCache.getInstance().clear();
         return CompletableFuture.completedFuture(new Object());
     }
 

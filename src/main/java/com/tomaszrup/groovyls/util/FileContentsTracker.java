@@ -24,10 +24,10 @@ import java.io.IOException;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Paths;
-import java.util.HashMap;
+import java.util.Collections;
 import java.util.HashSet;
-import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 import org.eclipse.lsp4j.DidChangeTextDocumentParams;
 import org.eclipse.lsp4j.DidCloseTextDocumentParams;
@@ -37,21 +37,38 @@ import org.eclipse.lsp4j.TextDocumentContentChangeEvent;
 
 import com.tomaszrup.lsp.utils.Positions;
 
+/**
+ * Thread-safe tracker for open document contents and change notifications.
+ *
+ * <p>Uses {@link ConcurrentHashMap} internally so that multiple per-project
+ * locks can safely read/write concurrently without a single global lock.</p>
+ */
 public class FileContentsTracker {
 
-	private Map<URI, String> openFiles = new HashMap<>();
-	private Set<URI> changedFiles = new HashSet<>();
+	private final ConcurrentHashMap<URI, String> openFiles = new ConcurrentHashMap<>();
+	private final Set<URI> changedFiles = ConcurrentHashMap.newKeySet();
 
 	public Set<URI> getOpenURIs() {
-		return openFiles.keySet();
+		return Collections.unmodifiableSet(openFiles.keySet());
 	}
 
 	public Set<URI> getChangedURIs() {
 		return changedFiles;
 	}
 
+	/**
+	 * Clear all tracked changes.
+	 */
 	public void resetChangedFiles() {
-		changedFiles = new HashSet<>();
+		changedFiles.clear();
+	}
+
+	/**
+	 * Clear only the specified URIs from the changed set. This allows
+	 * per-project resets without discarding changes for other projects.
+	 */
+	public void resetChangedFiles(Set<URI> toReset) {
+		changedFiles.removeAll(toReset);
 	}
 
 	public void forceChanged(URI uri) {
@@ -68,26 +85,39 @@ public class FileContentsTracker {
 		changedFiles.add(uri);
 	}
 
+	/**
+	 * Applies incremental or full-content changes atomically using
+	 * {@link ConcurrentHashMap#compute} to avoid races between concurrent
+	 * reads and writes to the same document.
+	 */
 	public void didChange(DidChangeTextDocumentParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
-		String currentText = openFiles.get(uri);
-		// Apply all content changes in order (incremental sync may send multiple)
-		for (TextDocumentContentChangeEvent change : params.getContentChanges()) {
-			Range range = change.getRange();
-			if (range == null) {
-				// Full content replacement
-				currentText = change.getText();
-			} else {
-				int offsetStart = Positions.getOffset(currentText, range.getStart());
-				int offsetEnd = Positions.getOffset(currentText, range.getEnd());
-				StringBuilder builder = new StringBuilder();
-				builder.append(currentText.substring(0, offsetStart));
-				builder.append(change.getText());
-				builder.append(currentText.substring(offsetEnd));
-				currentText = builder.toString();
+		openFiles.compute(uri, (key, currentText) -> {
+			if (currentText == null) {
+				// Should not happen (didOpen not called), but handle gracefully
+				for (TextDocumentContentChangeEvent change : params.getContentChanges()) {
+					currentText = change.getText();
+				}
+				return currentText;
 			}
-		}
-		openFiles.put(uri, currentText);
+			// Apply all content changes in order (incremental sync may send multiple)
+			for (TextDocumentContentChangeEvent change : params.getContentChanges()) {
+				Range range = change.getRange();
+				if (range == null) {
+					// Full content replacement
+					currentText = change.getText();
+				} else {
+					int offsetStart = Positions.getOffset(currentText, range.getStart());
+					int offsetEnd = Positions.getOffset(currentText, range.getEnd());
+					StringBuilder builder = new StringBuilder();
+					builder.append(currentText.substring(0, offsetStart));
+					builder.append(change.getText());
+					builder.append(currentText.substring(offsetEnd));
+					currentText = builder.toString();
+				}
+			}
+			return currentText;
+		});
 		changedFiles.add(uri);
 	}
 
@@ -98,14 +128,15 @@ public class FileContentsTracker {
 	}
 
 	public String getContents(URI uri) {
-		if (!openFiles.containsKey(uri)) {
-			try {
-				return Files.readString(Paths.get(uri));
-			} catch (IOException e) {
-				return null;
-			}
+		String contents = openFiles.get(uri);
+		if (contents != null) {
+			return contents;
 		}
-		return openFiles.get(uri);
+		try {
+			return Files.readString(Paths.get(uri));
+		} catch (IOException e) {
+			return null;
+		}
 	}
 
 	public void setContents(URI uri, String contents) {

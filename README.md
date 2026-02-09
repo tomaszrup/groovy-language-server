@@ -17,10 +17,13 @@ The following LSP capabilities are supported:
 - **Signature Help** — parameter hints when calling methods and constructors
 - **Document Symbols** — outline view of classes, methods, and fields in a file
 - **Workspace Symbols** — search for symbols across the entire workspace
-- **Code Actions** — quick-fix suggestions for common issues
+- **Code Actions** — quick-fix suggestions and source actions including: add/remove/organize imports, implement interface methods, generate constructors, generate getter/setter, generate `toString()`/`equals()`/`hashCode()`, and add `@Override`
 - **Diagnostics** — real-time syntax and compilation error reporting
 - **Inlay Hints** — inline type annotations for `def` variables and parameter name hints for method/constructor calls
 - **Semantic Highlighting** — semantic-aware syntax highlighting for classes, interfaces, enums, traits, methods, properties, variables, parameters, and more, with modifiers for `static`, `readonly`, `abstract`, and `declaration`
+- **Document Highlight** — highlights all occurrences of a symbol in the current file
+- **Implementation** — find all implementations of an interface or abstract class
+- **Formatting** — automatic document formatting with a built-in Groovy formatter
 - **Traits** — full support for Groovy traits (see below)
 
 ### Trait Support
@@ -73,7 +76,7 @@ Automatic classpath resolution for both **Gradle** and **Maven** projects:
 Gradle projects are imported via the [Gradle Tooling API](https://docs.gradle.org/current/userguide/third_party_integration.html):
 
 - Automatically discovers Gradle projects in the workspace (including multi-project builds)
-- Resolves `runtimeClasspath` dependencies so that autocomplete and navigation work for third-party libraries
+- Resolves all four classpath configurations (`compileClasspath`, `runtimeClasspath`, `testCompileClasspath`, `testRuntimeClasspath`) so that autocomplete and navigation work for third-party libraries
 - Recompiles Java/Gradle sources on change so the Groovy compilation unit picks up updates
 - Per-project scoping — each Gradle subproject gets its own classpath and compilation context
 

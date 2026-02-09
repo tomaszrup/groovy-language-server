@@ -1332,4 +1332,493 @@ class GroovyServicesCodeActionTests {
 		Assertions.assertFalse(hasRemoveUnusedQuickFix,
 				"Should NOT offer 'Remove unused import' QuickFix when no unused import diagnostics present");
 	}
+
+	// =========================================================================
+	// Edge case: Add @Override for interface method implementation
+	// =========================================================================
+
+	@Test
+	void testCodeActionAddOverrideForInterfaceMethodImplementation() throws Exception {
+		Path ifacePath = srcRoot.resolve("Speakable.groovy");
+		String ifaceUri = ifacePath.toUri().toString();
+		StringBuilder ifaceContents = new StringBuilder();
+		ifaceContents.append("interface Speakable {\n");
+		ifaceContents.append("  String speak()\n");
+		ifaceContents.append("}\n");
+		TextDocumentItem ifaceDoc = new TextDocumentItem(ifaceUri, LANGUAGE_GROOVY, 1, ifaceContents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(ifaceDoc));
+
+		Path implPath = srcRoot.resolve("Speaker.groovy");
+		String implUri = implPath.toUri().toString();
+		StringBuilder implContents = new StringBuilder();
+		implContents.append("class Speaker implements Speakable {\n");
+		implContents.append("  String speak() {\n");
+		implContents.append("    return 'hello'\n");
+		implContents.append("  }\n");
+		implContents.append("}\n");
+		TextDocumentItem implDoc = new TextDocumentItem(implUri, LANGUAGE_GROOVY, 1, implContents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(implDoc));
+
+		CodeActionContext context = new CodeActionContext(new ArrayList<>());
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(implUri);
+		CodeActionParams params = new CodeActionParams(textDocument,
+				new Range(new Position(1, 10), new Position(1, 10)), context);
+
+		List<Either<Command, CodeAction>> result = services.codeAction(params).get();
+
+		boolean hasAddOverride = result.stream()
+				.filter(Either::isRight)
+				.map(Either::getRight)
+				.anyMatch(action -> action.getTitle().contains("Add @Override"));
+
+		Assertions.assertTrue(hasAddOverride,
+				"Should suggest @Override for a method implementing an interface method");
+	}
+
+	@Test
+	void testCodeActionAddOverrideForMethodWithParameters() throws Exception {
+		Path basePath = srcRoot.resolve("Calculator.groovy");
+		String baseUri = basePath.toUri().toString();
+		StringBuilder baseContents = new StringBuilder();
+		baseContents.append("class Calculator {\n");
+		baseContents.append("  int add(int a, int b) {\n");
+		baseContents.append("    return a + b\n");
+		baseContents.append("  }\n");
+		baseContents.append("}\n");
+		TextDocumentItem baseDoc = new TextDocumentItem(baseUri, LANGUAGE_GROOVY, 1, baseContents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(baseDoc));
+
+		Path childPath = srcRoot.resolve("AdvancedCalculator.groovy");
+		String childUri = childPath.toUri().toString();
+		StringBuilder childContents = new StringBuilder();
+		childContents.append("class AdvancedCalculator extends Calculator {\n");
+		childContents.append("  int add(int a, int b) {\n");
+		childContents.append("    return a + b + 1\n");
+		childContents.append("  }\n");
+		childContents.append("}\n");
+		TextDocumentItem childDoc = new TextDocumentItem(childUri, LANGUAGE_GROOVY, 1, childContents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(childDoc));
+
+		CodeActionContext context = new CodeActionContext(new ArrayList<>());
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(childUri);
+		CodeActionParams params = new CodeActionParams(textDocument,
+				new Range(new Position(1, 6), new Position(1, 6)), context);
+
+		List<Either<Command, CodeAction>> result = services.codeAction(params).get();
+
+		boolean hasAddOverride = result.stream()
+				.filter(Either::isRight)
+				.map(Either::getRight)
+				.anyMatch(action -> action.getTitle().contains("Add @Override"));
+
+		Assertions.assertTrue(hasAddOverride,
+				"Should suggest @Override for a method with parameters that overrides a parent method");
+	}
+
+	// =========================================================================
+	// Edge case: Implement methods from multiple interfaces
+	// =========================================================================
+
+	@Test
+	void testCodeActionImplementMultipleInterfaceMethods() throws Exception {
+		Path iface1Path = srcRoot.resolve("Readable2.groovy");
+		String iface1Uri = iface1Path.toUri().toString();
+		StringBuilder iface1Contents = new StringBuilder();
+		iface1Contents.append("interface Readable2 {\n");
+		iface1Contents.append("  String read()\n");
+		iface1Contents.append("}\n");
+		TextDocumentItem iface1Doc = new TextDocumentItem(iface1Uri, LANGUAGE_GROOVY, 1, iface1Contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(iface1Doc));
+
+		Path iface2Path = srcRoot.resolve("Writable2.groovy");
+		String iface2Uri = iface2Path.toUri().toString();
+		StringBuilder iface2Contents = new StringBuilder();
+		iface2Contents.append("interface Writable2 {\n");
+		iface2Contents.append("  void write(String data)\n");
+		iface2Contents.append("}\n");
+		TextDocumentItem iface2Doc = new TextDocumentItem(iface2Uri, LANGUAGE_GROOVY, 1, iface2Contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(iface2Doc));
+
+		Path implPath = srcRoot.resolve("ReadWriter.groovy");
+		String implUri = implPath.toUri().toString();
+		StringBuilder implContents = new StringBuilder();
+		implContents.append("class ReadWriter implements Readable2, Writable2 {\n");
+		implContents.append("}\n");
+		TextDocumentItem implDoc = new TextDocumentItem(implUri, LANGUAGE_GROOVY, 1, implContents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(implDoc));
+
+		CodeActionContext context = new CodeActionContext(new ArrayList<>());
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(implUri);
+		CodeActionParams params = new CodeActionParams(textDocument,
+				new Range(new Position(0, 6), new Position(0, 6)), context);
+
+		List<Either<Command, CodeAction>> result = services.codeAction(params).get();
+
+		CodeAction implementAction = result.stream()
+				.filter(Either::isRight)
+				.map(Either::getRight)
+				.filter(action -> action.getTitle().contains("Implement methods"))
+				.findFirst()
+				.orElse(null);
+
+		Assertions.assertNotNull(implementAction,
+				"Should suggest implementing methods from multiple interfaces");
+
+		List<TextEdit> edits = implementAction.getEdit().getChanges().get(implUri);
+		Assertions.assertNotNull(edits);
+		String editText = edits.get(0).getNewText();
+		Assertions.assertTrue(editText.contains("read"),
+				"Should include 'read' from Readable2");
+		Assertions.assertTrue(editText.contains("write"),
+				"Should include 'write' from Writable2");
+	}
+
+	@Test
+	void testCodeActionImplementMethodsWithParameters() throws Exception {
+		Path ifacePath = srcRoot.resolve("Processor.groovy");
+		String ifaceUri = ifacePath.toUri().toString();
+		StringBuilder ifaceContents = new StringBuilder();
+		ifaceContents.append("interface Processor {\n");
+		ifaceContents.append("  String process(String input, int count)\n");
+		ifaceContents.append("}\n");
+		TextDocumentItem ifaceDoc = new TextDocumentItem(ifaceUri, LANGUAGE_GROOVY, 1, ifaceContents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(ifaceDoc));
+
+		Path implPath = srcRoot.resolve("DataProcessor.groovy");
+		String implUri = implPath.toUri().toString();
+		StringBuilder implContents = new StringBuilder();
+		implContents.append("class DataProcessor implements Processor {\n");
+		implContents.append("}\n");
+		TextDocumentItem implDoc = new TextDocumentItem(implUri, LANGUAGE_GROOVY, 1, implContents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(implDoc));
+
+		CodeActionContext context = new CodeActionContext(new ArrayList<>());
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(implUri);
+		CodeActionParams params = new CodeActionParams(textDocument,
+				new Range(new Position(0, 6), new Position(0, 6)), context);
+
+		List<Either<Command, CodeAction>> result = services.codeAction(params).get();
+
+		CodeAction implementAction = result.stream()
+				.filter(Either::isRight)
+				.map(Either::getRight)
+				.filter(action -> action.getTitle().contains("Implement methods"))
+				.findFirst()
+				.orElse(null);
+
+		Assertions.assertNotNull(implementAction, "Should suggest implementing method with parameters");
+
+		List<TextEdit> edits = implementAction.getEdit().getChanges().get(implUri);
+		Assertions.assertNotNull(edits);
+		String editText = edits.get(0).getNewText();
+		Assertions.assertTrue(editText.contains("String input"),
+				"Generated method should include parameter names and types");
+		Assertions.assertTrue(editText.contains("int count"),
+				"Generated method should include all parameters");
+	}
+
+	// =========================================================================
+	// Edge case: Generate equals/hashCode edit content verification
+	// =========================================================================
+
+	@Test
+	void testCodeActionEqualsEditContent() throws Exception {
+		Path filePath = srcRoot.resolve("EqualsEditTest.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("class EqualsEditTest {\n");
+		contents.append("  String name\n");
+		contents.append("  int age\n");
+		contents.append("}\n");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+
+		CodeActionContext context = new CodeActionContext(new ArrayList<>());
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+		CodeActionParams params = new CodeActionParams(textDocument,
+				new Range(new Position(0, 6), new Position(0, 6)), context);
+
+		List<Either<Command, CodeAction>> result = services.codeAction(params).get();
+
+		CodeAction equalsAction = result.stream()
+				.filter(Either::isRight)
+				.map(Either::getRight)
+				.filter(action -> action.getTitle().equals("Generate equals()"))
+				.findFirst()
+				.orElse(null);
+
+		Assertions.assertNotNull(equalsAction, "Should have an equals action");
+		List<TextEdit> edits = equalsAction.getEdit().getChanges().get(uri);
+		Assertions.assertNotNull(edits);
+		String editText = edits.get(0).getNewText();
+		Assertions.assertTrue(editText.contains("@Override"),
+				"equals() should have @Override annotation");
+		Assertions.assertTrue(editText.contains("boolean equals(Object o)"),
+				"equals() should have correct signature");
+		Assertions.assertTrue(editText.contains("instanceof EqualsEditTest"),
+				"equals() should check instanceof");
+		Assertions.assertTrue(editText.contains("name") && editText.contains("that.name"),
+				"equals() should compare name field");
+		Assertions.assertTrue(editText.contains("age") && editText.contains("that.age"),
+				"equals() should compare age field");
+	}
+
+	@Test
+	void testCodeActionHashCodeEditContent() throws Exception {
+		Path filePath = srcRoot.resolve("HashCodeEditTest.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("class HashCodeEditTest {\n");
+		contents.append("  String name\n");
+		contents.append("  int age\n");
+		contents.append("}\n");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+
+		CodeActionContext context = new CodeActionContext(new ArrayList<>());
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+		CodeActionParams params = new CodeActionParams(textDocument,
+				new Range(new Position(0, 6), new Position(0, 6)), context);
+
+		List<Either<Command, CodeAction>> result = services.codeAction(params).get();
+
+		CodeAction hashCodeAction = result.stream()
+				.filter(Either::isRight)
+				.map(Either::getRight)
+				.filter(action -> action.getTitle().equals("Generate hashCode()"))
+				.findFirst()
+				.orElse(null);
+
+		Assertions.assertNotNull(hashCodeAction, "Should have a hashCode action");
+		List<TextEdit> edits = hashCodeAction.getEdit().getChanges().get(uri);
+		Assertions.assertNotNull(edits);
+		String editText = edits.get(0).getNewText();
+		Assertions.assertTrue(editText.contains("@Override"),
+				"hashCode() should have @Override annotation");
+		Assertions.assertTrue(editText.contains("int hashCode()"),
+				"hashCode() should have correct signature");
+		Assertions.assertTrue(editText.contains("result"),
+				"hashCode() should use a result accumulator");
+		Assertions.assertTrue(editText.contains("name"),
+				"hashCode() should include name field");
+		Assertions.assertTrue(editText.contains("age"),
+				"hashCode() should include age field");
+	}
+
+	// =========================================================================
+	// Edge case: Generate getter/setter for boolean field (isXxx)
+	// =========================================================================
+
+	@Test
+	void testCodeActionGetterForBooleanFieldUsesIsPrefix() throws Exception {
+		Path filePath = srcRoot.resolve("BooleanFieldTest.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("class BooleanFieldTest {\n");
+		contents.append("  private boolean active\n");
+		contents.append("}\n");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+
+		CodeActionContext context = new CodeActionContext(new ArrayList<>());
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+		CodeActionParams params = new CodeActionParams(textDocument,
+				new Range(new Position(0, 6), new Position(0, 6)), context);
+
+		List<Either<Command, CodeAction>> result = services.codeAction(params).get();
+
+		CodeAction generateAll = result.stream()
+				.filter(Either::isRight)
+				.map(Either::getRight)
+				.filter(action -> action.getTitle().contains("Generate all getters/setters"))
+				.findFirst()
+				.orElse(null);
+
+		Assertions.assertNotNull(generateAll, "Should suggest getters/setters for boolean field");
+		List<TextEdit> edits = generateAll.getEdit().getChanges().get(uri);
+		Assertions.assertNotNull(edits);
+		String editText = edits.get(0).getNewText();
+		Assertions.assertTrue(editText.contains("isActive"),
+				"Boolean getter should use 'is' prefix (isActive)");
+		Assertions.assertTrue(editText.contains("setActive"),
+				"Boolean setter should use 'set' prefix");
+	}
+
+	@Test
+	void testCodeActionNoSetterForFinalField() throws Exception {
+		Path filePath = srcRoot.resolve("FinalFieldTest.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("class FinalFieldTest {\n");
+		contents.append("  private final String id = 'abc'\n");
+		contents.append("}\n");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+
+		CodeActionContext context = new CodeActionContext(new ArrayList<>());
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+		CodeActionParams params = new CodeActionParams(textDocument,
+				new Range(new Position(0, 6), new Position(0, 6)), context);
+
+		List<Either<Command, CodeAction>> result = services.codeAction(params).get();
+
+		CodeAction generateAll = result.stream()
+				.filter(Either::isRight)
+				.map(Either::getRight)
+				.filter(action -> action.getTitle().contains("Generate all getters/setters"))
+				.findFirst()
+				.orElse(null);
+
+		if (generateAll != null) {
+			List<TextEdit> edits = generateAll.getEdit().getChanges().get(uri);
+			Assertions.assertNotNull(edits);
+			String editText = edits.get(0).getNewText();
+			Assertions.assertTrue(editText.contains("getId"),
+					"Should generate getter for final field");
+			Assertions.assertFalse(editText.contains("setId"),
+					"Should NOT generate setter for final field");
+		}
+		// If no action is generated at all, that's also acceptable for final-only fields
+	}
+
+	// =========================================================================
+	// Edge case: Constructor not offered for enum
+	// =========================================================================
+
+	@Test
+	void testCodeActionNoConstructorForEnum() throws Exception {
+		Path filePath = srcRoot.resolve("ColorEnum.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("enum ColorEnum {\n");
+		contents.append("  RED, GREEN, BLUE\n");
+		contents.append("}\n");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+
+		CodeActionContext context = new CodeActionContext(new ArrayList<>());
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+		CodeActionParams params = new CodeActionParams(textDocument,
+				new Range(new Position(0, 5), new Position(0, 5)), context);
+
+		List<Either<Command, CodeAction>> result = services.codeAction(params).get();
+
+		boolean hasConstructor = result.stream()
+				.filter(Either::isRight)
+				.map(Either::getRight)
+				.anyMatch(action -> action.getTitle().contains("Generate constructor"));
+
+		Assertions.assertFalse(hasConstructor,
+				"Should not suggest constructor generation for enum classes");
+	}
+
+	// =========================================================================
+	// Edge case: No toString/equals/hashCode for enum
+	// =========================================================================
+
+	@Test
+	void testCodeActionNoMethodGenerationForEnum() throws Exception {
+		Path filePath = srcRoot.resolve("StatusEnum.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("enum StatusEnum {\n");
+		contents.append("  ACTIVE, INACTIVE\n");
+		contents.append("}\n");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+
+		CodeActionContext context = new CodeActionContext(new ArrayList<>());
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+		CodeActionParams params = new CodeActionParams(textDocument,
+				new Range(new Position(0, 5), new Position(0, 5)), context);
+
+		List<Either<Command, CodeAction>> result = services.codeAction(params).get();
+
+		boolean hasMethodGen = result.stream()
+				.filter(Either::isRight)
+				.map(Either::getRight)
+				.anyMatch(action -> action.getTitle().contains("Generate toString()")
+						|| action.getTitle().contains("Generate equals()")
+						|| action.getTitle().contains("Generate hashCode()"));
+
+		Assertions.assertFalse(hasMethodGen,
+				"Should not suggest toString/equals/hashCode generation for enums");
+	}
+
+	// =========================================================================
+	// Edge case: Constructor for class with mixed fields and properties
+	// =========================================================================
+
+	@Test
+	void testCodeActionConstructorWithMixedFieldsAndProperties() throws Exception {
+		Path filePath = srcRoot.resolve("MixedFieldsTest.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("class MixedFieldsTest {\n");
+		contents.append("  String name\n"); // Groovy property
+		contents.append("  private int code\n"); // explicit field
+		contents.append("}\n");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+
+		CodeActionContext context = new CodeActionContext(new ArrayList<>());
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+		CodeActionParams params = new CodeActionParams(textDocument,
+				new Range(new Position(0, 6), new Position(0, 6)), context);
+
+		List<Either<Command, CodeAction>> result = services.codeAction(params).get();
+
+		CodeAction ctorAction = result.stream()
+				.filter(Either::isRight)
+				.map(Either::getRight)
+				.filter(action -> action.getTitle().contains("Generate constructor with all fields"))
+				.findFirst()
+				.orElse(null);
+
+		Assertions.assertNotNull(ctorAction,
+				"Should suggest constructor for a class with mixed fields and properties");
+
+		List<TextEdit> edits = ctorAction.getEdit().getChanges().get(uri);
+		Assertions.assertNotNull(edits);
+		String editText = edits.get(0).getNewText();
+		Assertions.assertTrue(editText.contains("name"),
+				"Constructor should include Groovy property 'name'");
+		Assertions.assertTrue(editText.contains("code"),
+				"Constructor should include explicit field 'code'");
+	}
+
+	// =========================================================================
+	// Edge case: Organize imports with aliased imports
+	// =========================================================================
+
+	@Test
+	void testCodeActionOrganizeImportsWithAliasedImport() throws Exception {
+		Path filePath = srcRoot.resolve("AliasedImportTest.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("import java.util.ArrayList as AList\n");
+		contents.append("import java.util.HashMap\n");
+		contents.append("\n");
+		contents.append("class AliasedImportTest {\n");
+		contents.append("  AList<String> list = new AList<>()\n");
+		contents.append("}\n");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+
+		CodeActionContext context = new CodeActionContext(new ArrayList<>());
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+		CodeActionParams params = new CodeActionParams(textDocument,
+				new Range(new Position(0, 0), new Position(0, 0)), context);
+
+		List<Either<Command, CodeAction>> result = services.codeAction(params).get();
+
+		// Should detect HashMap as unused and offer removal
+		boolean hasRemoveUnused = result.stream()
+				.filter(Either::isRight)
+				.map(Either::getRight)
+				.anyMatch(action -> action.getTitle().contains("Remove unused imports"));
+
+		Assertions.assertTrue(hasRemoveUnused,
+				"Should detect unused HashMap import while preserving aliased ArrayList import");
+	}
 }

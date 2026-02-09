@@ -37,8 +37,6 @@ import org.codehaus.groovy.control.Phases;
 import org.eclipse.lsp4j.Position;
 
 import groovy.lang.GroovyClassLoader;
-import io.github.classgraph.ClassGraph;
-import io.github.classgraph.ClassGraphException;
 import io.github.classgraph.ScanResult;
 import com.tomaszrup.groovyls.compiler.ast.ASTNodeVisitor;
 import com.tomaszrup.groovyls.compiler.control.GroovyLSCompilationUnit;
@@ -60,11 +58,22 @@ public class CompilationOrchestrator {
 	private static final Pattern PATTERN_CONSTRUCTOR_CALL = Pattern.compile(".*new \\w*$");
 
 	/**
-	 * Holds the cached ClassGraph scan result. When the classloader changes,
-	 * this is updated lazily.
+	 * Process-wide shared cache for ClassGraph scan results. Scopes with
+	 * identical classpaths (common in Gradle multi-project builds) share a
+	 * single {@code ScanResult}, saving 50–200 MB of heap per duplicate.
 	 */
-	private ScanResult cachedScanResult;
-	private GroovyClassLoader cachedClassLoader;
+	private final SharedClassGraphCache sharedScanCache;
+
+	public CompilationOrchestrator() {
+		this(SharedClassGraphCache.getInstance());
+	}
+
+	/**
+	 * Constructor accepting a custom cache — primarily for testing.
+	 */
+	public CompilationOrchestrator(SharedClassGraphCache sharedScanCache) {
+		this.sharedScanCache = sharedScanCache;
+	}
 
 	/**
 	 * Creates or updates the compilation unit for the given scope.
@@ -80,6 +89,29 @@ public class CompilationOrchestrator {
 			FileContentsTracker fileContentsTracker,
 			ScanResult[] scanResultHolder,
 			GroovyClassLoader[] classLoaderHolder) {
+		return createOrUpdateCompilationUnit(compilationUnitHolder, astVisitorHolder,
+				projectRoot, compilationUnitFactory, fileContentsTracker,
+				scanResultHolder, classLoaderHolder, Collections.emptySet());
+	}
+
+	/**
+	 * Creates or updates the compilation unit for the given scope, with
+	 * additional URIs to force-invalidate (dependency-driven recompilation).
+	 *
+	 * @param additionalInvalidations  URIs of dependent files to force-invalidate
+	 *                                  even if their contents have not changed
+	 * @return {@code true} if the compilation unit is the same object as before
+	 *         (i.e. it was reused rather than recreated)
+	 */
+	public boolean createOrUpdateCompilationUnit(
+			GroovyLSCompilationUnit[] compilationUnitHolder,
+			ASTNodeVisitor[] astVisitorHolder,
+			Path projectRoot,
+			com.tomaszrup.groovyls.config.ICompilationUnitFactory compilationUnitFactory,
+			FileContentsTracker fileContentsTracker,
+			ScanResult[] scanResultHolder,
+			GroovyClassLoader[] classLoaderHolder,
+			Set<URI> additionalInvalidations) {
 
 		GroovyLSCompilationUnit compilationUnit = compilationUnitHolder[0];
 		if (compilationUnit != null) {
@@ -97,7 +129,7 @@ public class CompilationOrchestrator {
 		}
 
 		GroovyLSCompilationUnit oldCompilationUnit = compilationUnit;
-		compilationUnit = compilationUnitFactory.create(projectRoot, fileContentsTracker);
+		compilationUnit = compilationUnitFactory.create(projectRoot, fileContentsTracker, additionalInvalidations);
 		compilationUnitHolder[0] = compilationUnit;
 
 		if (compilationUnit != null) {
@@ -109,7 +141,7 @@ public class CompilationOrchestrator {
 			updateClassGraphScan(newClassLoader, scanResultHolder, classLoaderHolder);
 		} else {
 			if (scanResultHolder[0] != null) {
-				scanResultHolder[0].close();
+				sharedScanCache.release(scanResultHolder[0]);
 			}
 			scanResultHolder[0] = null;
 		}
@@ -119,8 +151,8 @@ public class CompilationOrchestrator {
 
 	/**
 	 * Updates the ClassGraph scan result if the classloader has changed.
-	 * Caches the scan result to avoid expensive rescanning when the classloader
-	 * is the same object.
+	 * Delegates to the {@link SharedClassGraphCache} so that scopes with
+	 * identical classpaths share a single {@code ScanResult} instance.
 	 */
 	private void updateClassGraphScan(GroovyClassLoader newClassLoader,
 			ScanResult[] scanResultHolder, GroovyClassLoader[] classLoaderHolder) {
@@ -129,33 +161,15 @@ public class CompilationOrchestrator {
 		}
 		classLoaderHolder[0] = newClassLoader;
 
-		// Check if we already have a cached scan for this exact classloader instance
-		if (newClassLoader == cachedClassLoader && cachedScanResult != null) {
-			ScanResult oldScanResult = scanResultHolder[0];
-			scanResultHolder[0] = cachedScanResult;
-			if (oldScanResult != null && oldScanResult != cachedScanResult) {
-				oldScanResult.close();
-			}
-			return;
-		}
-
 		ScanResult oldScanResult = scanResultHolder[0];
-		try {
-			ScanResult newResult = new ClassGraph().overrideClassLoaders(newClassLoader)
-					.enableClassInfo()
-					.enableSystemJarsAndModules()
-					.scan();
-			scanResultHolder[0] = newResult;
-			cachedScanResult = newResult;
-			cachedClassLoader = newClassLoader;
-		} catch (ClassGraphException e) {
-			scanResultHolder[0] = null;
-			cachedScanResult = null;
-			cachedClassLoader = null;
-		} finally {
-			if (oldScanResult != null && oldScanResult != scanResultHolder[0]) {
-				oldScanResult.close();
-			}
+
+		// Acquire a (potentially shared) ScanResult from the cache
+		ScanResult newResult = sharedScanCache.acquire(newClassLoader);
+		scanResultHolder[0] = newResult;
+
+		// Release the previous result (decrements ref count; closes if zero)
+		if (oldScanResult != null && oldScanResult != newResult) {
+			sharedScanCache.release(oldScanResult);
 		}
 	}
 
@@ -172,8 +186,15 @@ public class CompilationOrchestrator {
 	}
 
 	/**
-	 * Incrementally visits only the given URIs in the AST.
-	 * Falls back to a full visit if the existing visitor is null.
+	 * Incrementally visits only the given URIs in the AST, producing a
+	 * <b>new</b> {@code ASTNodeVisitor} via copy-on-write. The existing
+	 * visitor is not mutated, so concurrent readers using the old reference
+	 * remain safe (stale-AST reads).
+	 *
+	 * <p>Falls back to a full visit if the existing visitor is null.</p>
+	 *
+	 * @return a new visitor containing updated data for {@code uris} and
+	 *         unchanged data for everything else
 	 */
 	public ASTNodeVisitor visitAST(GroovyLSCompilationUnit compilationUnit,
 			ASTNodeVisitor existingVisitor, Set<URI> uris) {
@@ -183,8 +204,10 @@ public class CompilationOrchestrator {
 		if (compilationUnit == null) {
 			return existingVisitor;
 		}
-		existingVisitor.visitCompilationUnit(compilationUnit, uris);
-		return existingVisitor;
+		// Create a snapshot that excludes the URIs about to be re-visited
+		ASTNodeVisitor newVisitor = existingVisitor.createSnapshotExcluding(uris);
+		newVisitor.visitCompilationUnit(compilationUnit, uris);
+		return newVisitor;
 	}
 
 	/**
@@ -215,6 +238,40 @@ public class CompilationOrchestrator {
 			logger.debug("Compilation exception details", e);
 		}
 		return compilationUnit.getErrorCollector();
+	}
+
+	/**
+	 * Compiles an incremental (lightweight) compilation unit to the
+	 * CANONICALIZATION phase. Unlike {@link #compile}, this does not manage
+	 * the target directory since the incremental unit is temporary.
+	 *
+	 * @param incrementalUnit the incremental compilation unit containing
+	 *                        only the changed files and their dependencies
+	 * @param projectRoot     the project root path (for logging)
+	 * @return the error collector, or {@code null} if the unit is null
+	 */
+	public ErrorCollector compileIncremental(GroovyLSCompilationUnit incrementalUnit, Path projectRoot) {
+		if (incrementalUnit == null) {
+			logger.warn("compileIncremental() called but incrementalUnit is null for scope {}", projectRoot);
+			return null;
+		}
+		int sourceCount = 0;
+		var iter = incrementalUnit.iterator();
+		while (iter.hasNext()) {
+			iter.next();
+			sourceCount++;
+		}
+		logger.info("Incremental compile for scope: {}, {} sources", projectRoot, sourceCount);
+		try {
+			incrementalUnit.compile(Phases.CANONICALIZATION);
+		} catch (CompilationFailedException e) {
+			logger.info("Incremental compilation failed for {}: {}", projectRoot, e.getMessage());
+		} catch (GroovyBugError e) {
+			logger.warn("Groovy compiler bug during incremental compile for {}: {}", projectRoot, e.getMessage());
+		} catch (Exception e) {
+			logger.warn("Unexpected exception during incremental compile for {}: {}", projectRoot, e.getMessage());
+		}
+		return incrementalUnit.getErrorCollector();
 	}
 
 	/**

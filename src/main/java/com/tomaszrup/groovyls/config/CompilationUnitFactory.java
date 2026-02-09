@@ -28,6 +28,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -128,6 +129,12 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 	}
 
 	public GroovyLSCompilationUnit create(Path workspaceRoot, FileContentsTracker fileContentsTracker) {
+		return create(workspaceRoot, fileContentsTracker, Collections.emptySet());
+	}
+
+	@Override
+	public GroovyLSCompilationUnit create(Path workspaceRoot, FileContentsTracker fileContentsTracker,
+			Set<URI> additionalInvalidations) {
 		if (config == null) {
 			config = getConfiguration();
 		}
@@ -137,13 +144,22 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 		}
 
 		Set<URI> changedUris = fileContentsTracker.getChangedURIs();
+		// Merge additional invalidations (dependency-driven) with content changes
+		Set<URI> effectiveChanged;
+		if (additionalInvalidations != null && !additionalInvalidations.isEmpty()) {
+			effectiveChanged = new HashSet<>(changedUris);
+			effectiveChanged.addAll(additionalInvalidations);
+		} else {
+			effectiveChanged = changedUris;
+		}
+
 		if (compilationUnit == null) {
 			compilationUnit = new GroovyLSCompilationUnit(config, null, classLoader);
 			// we don't care about changed URIs if there's no compilation unit yet
-			changedUris = null;
+			effectiveChanged = null;
 		} else {
 			compilationUnit.setClassLoader(classLoader);
-			final Set<URI> urisToRemove = changedUris;
+			final Set<URI> urisToRemove = effectiveChanged;
 			List<SourceUnit> sourcesToRemove = new ArrayList<>();
 			compilationUnit.iterator().forEachRemaining(sourceUnit -> {
 				URI uri = sourceUnit.getSource().getURI();
@@ -157,9 +173,9 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 		}
 
 		if (workspaceRoot != null) {
-			addDirectoryToCompilationUnit(workspaceRoot, compilationUnit, fileContentsTracker, changedUris);
+			addDirectoryToCompilationUnit(workspaceRoot, compilationUnit, fileContentsTracker, effectiveChanged);
 		} else {
-			final Set<URI> urisToAdd = changedUris;
+			final Set<URI> urisToAdd = effectiveChanged;
 			fileContentsTracker.getOpenURIs().forEach(uri -> {
 				// if we're only tracking changes, skip all files that haven't
 				// actually changed
@@ -172,6 +188,37 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 		}
 
 		return compilationUnit;
+	}
+
+	@Override
+	public GroovyLSCompilationUnit createIncremental(Path workspaceRoot,
+			FileContentsTracker fileContentsTracker, Set<URI> filesToInclude) {
+		if (config == null) {
+			config = getConfiguration();
+		}
+		if (classLoader == null) {
+			classLoader = new GroovyClassLoader(ClassLoader.getSystemClassLoader().getParent(), config, true);
+		}
+
+		// Create a separate, temporary compilation unit — NOT stored in the
+		// 'compilationUnit' field so it doesn't interfere with the base unit.
+		GroovyLSCompilationUnit incrementalUnit = new GroovyLSCompilationUnit(config, null, classLoader);
+
+		for (URI uri : filesToInclude) {
+			if (fileContentsTracker.isOpen(uri)) {
+				String contents = fileContentsTracker.getContents(uri);
+				if (contents != null) {
+					addOpenFileToCompilationUnit(uri, contents, incrementalUnit);
+				}
+			} else {
+				Path filePath = Paths.get(uri);
+				if (Files.isRegularFile(filePath)) {
+					incrementalUnit.addSource(filePath.toFile());
+				}
+			}
+		}
+
+		return incrementalUnit;
 	}
 
 	protected CompilerConfiguration getConfiguration() {
