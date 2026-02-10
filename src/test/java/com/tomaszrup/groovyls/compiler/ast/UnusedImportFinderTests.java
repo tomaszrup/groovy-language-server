@@ -201,6 +201,55 @@ class UnusedImportFinderTests {
 				"Serializable used as interface should NOT be unused");
 	}
 
+	@Test
+	void testStaticMethodImportUsedInMethodCall() {
+		GroovyLSCompilationUnit cu = compileSource(
+				"import static java.util.Collections.emptyList\n" +
+				"class Foo {\n" +
+				"  void bar() {\n" +
+				"    def items = emptyList()\n" +
+				"  }\n" +
+				"}\n");
+		Map<URI, List<ImportNode>> result = finder.findUnusedImports(cu);
+		boolean emptyListUnused = result.values().stream()
+				.flatMap(List::stream)
+				.anyMatch(i -> "emptyList".equals(i.getFieldName()));
+		Assertions.assertFalse(emptyListUnused,
+				"Static import of emptyList() used in method call should NOT be unused");
+	}
+
+	@Test
+	void testStaticFieldImportUsedAsVariable() {
+		GroovyLSCompilationUnit cu = compileSource(
+				"import static java.lang.Math.PI\n" +
+				"class Foo {\n" +
+				"  double getArea(double r) {\n" +
+				"    return PI * r * r\n" +
+				"  }\n" +
+				"}\n");
+		Map<URI, List<ImportNode>> result = finder.findUnusedImports(cu);
+		boolean piUnused = result.values().stream()
+				.flatMap(List::stream)
+				.anyMatch(i -> "PI".equals(i.getFieldName()));
+		Assertions.assertFalse(piUnused,
+				"Static import of PI used as variable should NOT be unused");
+	}
+
+	@Test
+	void testUnusedStaticImportDetected() {
+		GroovyLSCompilationUnit cu = compileSource(
+				"import static java.util.Collections.emptyList\n" +
+				"class Foo {\n" +
+				"  String name\n" +
+				"}\n");
+		Map<URI, List<ImportNode>> result = finder.findUnusedImports(cu);
+		boolean emptyListUnused = result.values().stream()
+				.flatMap(List::stream)
+				.anyMatch(i -> "emptyList".equals(i.getFieldName()));
+		Assertions.assertTrue(emptyListUnused,
+				"Static import of emptyList() not used anywhere should BE unused");
+	}
+
 	// ------------------------------------------------------------------
 	// Helper
 	// ------------------------------------------------------------------

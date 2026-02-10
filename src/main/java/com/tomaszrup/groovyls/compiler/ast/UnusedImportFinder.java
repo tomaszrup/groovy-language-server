@@ -154,8 +154,12 @@ public class UnusedImportFinder {
 			collectFromClassNode(classNode, usedNames);
 		}
 
-		// Also check script-level statements — the Groovy compiler wraps them
-		// in a run() method of a generated class, which we already iterate above.
+		// Also visit the module's statement block directly — script-level code
+		// is wrapped in a synthetic run() method which we skip in collectFromClassNode.
+		if (moduleNode.getStatementBlock() != null) {
+			UsedTypeCollectorVisitor visitor = new UsedTypeCollectorVisitor(usedNames);
+			moduleNode.getStatementBlock().visit(visitor);
+		}
 
 		return usedNames;
 	}

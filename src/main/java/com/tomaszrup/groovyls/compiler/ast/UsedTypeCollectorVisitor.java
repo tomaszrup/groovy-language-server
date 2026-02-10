@@ -28,6 +28,9 @@ import org.codehaus.groovy.ast.expr.CastExpression;
 import org.codehaus.groovy.ast.expr.ClassExpression;
 import org.codehaus.groovy.ast.expr.ConstructorCallExpression;
 import org.codehaus.groovy.ast.expr.DeclarationExpression;
+import org.codehaus.groovy.ast.expr.MethodCallExpression;
+import org.codehaus.groovy.ast.expr.PropertyExpression;
+import org.codehaus.groovy.ast.expr.StaticMethodCallExpression;
 import org.codehaus.groovy.ast.expr.VariableExpression;
 import org.codehaus.groovy.ast.stmt.CatchStatement;
 import org.codehaus.groovy.ast.stmt.ForStatement;
@@ -75,6 +78,9 @@ class UsedTypeCollectorVisitor extends ClassCodeVisitorSupport {
 			addClassName(expression.getAccessedVariable().getOriginType());
 		}
 		addClassName(expression.getOriginType());
+		// Also collect the variable name itself — needed for static field imports
+		// (e.g., import static java.lang.Math.PI → variable "PI")
+		usedNames.add(expression.getName());
 		super.visitVariableExpression(expression);
 	}
 
@@ -96,6 +102,24 @@ class UsedTypeCollectorVisitor extends ClassCodeVisitorSupport {
 	public void visitForLoop(ForStatement forLoop) {
 		addClassName(forLoop.getVariableType());
 		super.visitForLoop(forLoop);
+	}
+
+	@Override
+	public void visitMethodCallExpression(MethodCallExpression call) {
+		usedNames.add(call.getMethodAsString());
+		super.visitMethodCallExpression(call);
+	}
+
+	@Override
+	public void visitStaticMethodCallExpression(StaticMethodCallExpression call) {
+		usedNames.add(call.getMethod());
+		super.visitStaticMethodCallExpression(call);
+	}
+
+	@Override
+	public void visitPropertyExpression(PropertyExpression expression) {
+		usedNames.add(expression.getPropertyAsString());
+		super.visitPropertyExpression(expression);
 	}
 
 	private void addClassName(ClassNode classNode) {

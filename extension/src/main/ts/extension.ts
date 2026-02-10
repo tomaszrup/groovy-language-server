@@ -27,6 +27,7 @@ import {
   LanguageClientOptions,
   Executable,
   ServerOptions,
+  State,
   StreamInfo,
 } from "vscode-languageclient/node";
 
@@ -360,25 +361,37 @@ function startLanguageServer() {
 
           // The server starts a background import (Gradle/Maven) after
           // initialization.  Listen for structured status notifications to
-          // transition the status bar.  This replaces the previous approach
-          // of parsing window/logMessage text with fragile string-prefix matching.
+          // transition the status bar and keep the progress notification
+          // visible until the server is ready.
           setStatusBar("importing");
+          progress.report({ message: "Importing projects…" });
+
+          // Resolve the progress notification if the server stops unexpectedly
+          // (crash, shutdown, etc.) so it doesn't hang forever.
+          languageClient.onDidChangeState((event) => {
+            if (event.newState === State.Stopped) {
+              resolve();
+            }
+          });
+
           languageClient.onNotification("groovy/statusUpdate", (params: { state: string; message?: string }) => {
             const state = params.state;
             if (state === "importing") {
               setStatusBar("importing", params.message);
+              progress.report({ message: params.message || "Importing projects…" });
             } else if (state === "ready") {
               setStatusBar("ready");
+              resolve();
             } else if (state === "error") {
               setStatusBar("error");
+              resolve();
             }
           });
         } catch (e) {
           setStatusBar("error");
           vscode.window.showErrorMessage(STARTUP_ERROR);
+          resolve();
         }
-
-        resolve();
       });
     }
   );

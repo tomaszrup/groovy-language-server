@@ -45,6 +45,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.logging.Level;
 import java.util.stream.Collectors;
 
 public class GroovyLanguageServer implements LanguageServer, LanguageClientAware {
@@ -53,6 +54,11 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     private GroovyLanguageClient client;
 
     public static void main(String[] args) throws IOException {
+        // Suppress noisy "Unmatched cancel notification for request id" warnings
+        // from LSP4J's RemoteEndpoint. These occur normally when the client
+        // sends $/cancelRequest for a request that already completed.
+        java.util.logging.Logger.getLogger("org.eclipse.lsp4j.jsonrpc.RemoteEndpoint")
+                .setLevel(Level.SEVERE);
         if (args.length > 0 && "--tcp".equals(args[0])) {
             int port = 5007;
             if (args.length > 1) {
