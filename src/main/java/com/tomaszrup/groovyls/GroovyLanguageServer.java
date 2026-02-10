@@ -45,6 +45,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.Future;
 import java.util.logging.Level;
 import java.util.stream.Collectors;
 
@@ -54,6 +55,16 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     private GroovyLanguageClient client;
 
     public static void main(String[] args) throws IOException {
+        // Install a global uncaught-exception handler so that unexpected
+        // exceptions on any thread are logged instead of silently killing
+        // the JVM process (which the client sees as an EPIPE).
+        Thread.setDefaultUncaughtExceptionHandler((thread, throwable) -> {
+            System.err.println("[FATAL] Uncaught exception on thread " + thread.getName());
+            throwable.printStackTrace(System.err);
+            logger.error("Uncaught exception on thread {}: {}",
+                    thread.getName(), throwable.getMessage(), throwable);
+        });
+
         // Suppress noisy "Unmatched cancel notification for request id" warnings
         // from LSP4J's RemoteEndpoint. These occur normally when the client
         // sends $/cancelRequest for a request that already completed.
@@ -95,7 +106,21 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         GroovyLanguageServer server = new GroovyLanguageServer();
         Launcher<GroovyLanguageClient> launcher = Launcher.createLauncher(server, GroovyLanguageClient.class, in, out);
         server.connect(launcher.getRemoteProxy());
-        launcher.startListening();
+
+        // Block the main (non-daemon) thread on the listener future.
+        // Without this, the main thread exits immediately after starting
+        // the listener, and since all pool threads are daemon threads the
+        // JVM terminates — which the client sees as an EPIPE.
+        Future<Void> future = launcher.startListening();
+        try {
+            future.get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            logger.info("Language server listener interrupted");
+        } catch (ExecutionException e) {
+            logger.error("Language server listener terminated with error: {}",
+                    e.getCause() != null ? e.getCause().getMessage() : e.getMessage(), e);
+        }
     }
 
     private final GroovyServices groovyServices;

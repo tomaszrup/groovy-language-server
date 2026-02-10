@@ -29,6 +29,10 @@ import {
   ServerOptions,
   State,
   StreamInfo,
+  ErrorAction,
+  CloseAction,
+  ErrorHandler,
+  Message,
 } from "vscode-languageclient/node";
 
 const MISSING_JAVA_ERROR =
@@ -39,8 +43,14 @@ const INITIALIZING_MESSAGE = "Initializing Groovy language server...";
 const RELOAD_WINDOW_MESSAGE =
   "To apply new settings for Groovy, please reload the window.";
 const STARTUP_ERROR = "The Groovy extension failed to start.";
+const SERVER_CRASHED_MESSAGE = "The Groovy language server has crashed.";
+const LABEL_RESTART_SERVER = "Restart Server";
 const LABEL_RELOAD_WINDOW = "Reload Window";
+const MAX_SERVER_RESTARTS = 5;
 let extensionContext: vscode.ExtensionContext | null = null;
+let serverCrashCount = 0;
+/** True when the user (or code) intentionally stops the server. */
+let isIntentionalStop = false;
 let languageClient: LanguageClient | null = null;
 let javaPath: string | null = null;
 let outputChannel: vscode.OutputChannel | null = null;
@@ -83,6 +93,7 @@ export function deactivate(): Thenable<void> | undefined {
   if (!languageClient) {
     return undefined;
   }
+  isIntentionalStop = true;
   return languageClient.stop();
 }
 
@@ -141,6 +152,7 @@ function shortenDetail(message: string): string {
 function onDidChangeConfiguration(event: vscode.ConfigurationChangeEvent) {
   if (
     event.affectsConfiguration("groovy.java.home") ||
+    event.affectsConfiguration("groovy.java.vmargs") ||
     event.affectsConfiguration("groovy.debug.serverPort") ||
     event.affectsConfiguration("groovy.semanticHighlighting.enabled") ||
     event.affectsConfiguration("groovy.formatting.enabled")
@@ -157,13 +169,16 @@ function restartLanguageServer() {
     startLanguageServer();
     return;
   }
+  isIntentionalStop = true;
   let oldLanguageClient = languageClient;
   languageClient = null;
   oldLanguageClient.stop().then(
     () => {
+      isIntentionalStop = false;
       startLanguageServer();
     },
     () => {
+      isIntentionalStop = false;
       //something went wrong restarting the language server...
       //this shouldn't happen, but if it does, the user can manually restart
       setStatusBar("error");
@@ -254,6 +269,17 @@ function startLanguageServer() {
             ),
           ];
 
+          // Apply user-configurable JVM arguments (e.g. -Xmx768m).
+          // Falls back to -Xmx512m so large workspaces don't OOM-kill
+          // the server process (which the client sees as an EPIPE).
+          const vmargs = config.get<string>("java.vmargs");
+          if (vmargs) {
+            const vmTokens = vmargs.match(/\S+/g) || [];
+            args.unshift(...vmTokens);
+          } else {
+            args.unshift("-Xmx512m");
+          }
+
           //uncomment to allow a debugger to attach to the language server
           //args.unshift("-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=5005,quiet=y");
           let executable: Executable = {
@@ -265,6 +291,43 @@ function startLanguageServer() {
         }
 
         progress.report({ message: "Starting language server…" });
+
+        // Custom error handler: tolerate transient connection errors
+        // and auto-restart the server up to MAX_SERVER_RESTARTS times.
+        const errorHandler: ErrorHandler = {
+          error(
+            _error: Error,
+            _message: Message | undefined,
+            _count: number | undefined
+          ) {
+            // Continue on transient write/read errors — the server may
+            // still be alive.  If it truly died the "closed" handler
+            // takes over.
+            return { action: ErrorAction.Continue };
+          },
+          closed() {
+            if (isIntentionalStop) {
+              return { action: CloseAction.DoNotRestart };
+            }
+            serverCrashCount++;
+            if (serverCrashCount <= MAX_SERVER_RESTARTS) {
+              outputChannel?.appendLine(
+                `Server connection lost — restarting (attempt ${serverCrashCount}/${MAX_SERVER_RESTARTS})…`
+              );
+              return {
+                action: CloseAction.Restart,
+                message: `Connection lost. Restarting server (attempt ${serverCrashCount}/${MAX_SERVER_RESTARTS})…`,
+              };
+            }
+            outputChannel?.appendLine(
+              "Server has crashed too many times. Not restarting."
+            );
+            return {
+              action: CloseAction.DoNotRestart,
+              message: `The Groovy language server has crashed ${MAX_SERVER_RESTARTS} times and will not be restarted.`,
+            };
+          },
+        };
 
         let clientOptions: LanguageClientOptions = {
           documentSelector: [
@@ -282,6 +345,7 @@ function startLanguageServer() {
               vscode.workspace.createFileSystemWatcher("**/pom.xml"),
             ],
           },
+          errorHandler,
           outputChannel: outputChannel ?? undefined,
           uriConverters: {
             code2Protocol: (value: vscode.Uri) => {
@@ -366,11 +430,30 @@ function startLanguageServer() {
           setStatusBar("importing");
           progress.report({ message: "Importing projects…" });
 
-          // Resolve the progress notification if the server stops unexpectedly
-          // (crash, shutdown, etc.) so it doesn't hang forever.
+          // Handle unexpected server stops: resolve the progress
+          // notification, update the status bar, and offer a restart.
           languageClient.onDidChangeState((event) => {
             if (event.newState === State.Stopped) {
               resolve();
+              if (!isIntentionalStop) {
+                setStatusBar("error");
+                if (serverCrashCount >= MAX_SERVER_RESTARTS) {
+                  vscode.window
+                    .showErrorMessage(
+                      SERVER_CRASHED_MESSAGE,
+                      LABEL_RESTART_SERVER
+                    )
+                    .then((action) => {
+                      if (action === LABEL_RESTART_SERVER) {
+                        serverCrashCount = 0;
+                        restartLanguageServer();
+                      }
+                    });
+                }
+              }
+            } else if (event.newState === State.Running) {
+              // Server (re)started successfully — reset crash counter.
+              serverCrashCount = 0;
             }
           });
 
