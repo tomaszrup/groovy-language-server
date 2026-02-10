@@ -184,7 +184,16 @@ public class CompilationOrchestrator {
 			return null;
 		}
 		ASTNodeVisitor astVisitor = new ASTNodeVisitor();
-		astVisitor.visitCompilationUnit(compilationUnit);
+		try {
+			astVisitor.visitCompilationUnit(compilationUnit);
+		} catch (Exception e) {
+			logger.warn("Exception during AST visit: {}", e.getMessage());
+			logger.debug("AST visit exception details", e);
+		} catch (LinkageError e) {
+			logger.warn("Classpath linkage error during AST visit "
+					+ "(a dependency may be missing or incompatible): {}", e.toString());
+			logger.debug("AST visit LinkageError details", e);
+		}
 		return astVisitor;
 	}
 
@@ -209,7 +218,15 @@ public class CompilationOrchestrator {
 		}
 		// Create a snapshot that excludes the URIs about to be re-visited
 		ASTNodeVisitor newVisitor = existingVisitor.createSnapshotExcluding(uris);
-		newVisitor.visitCompilationUnit(compilationUnit, uris);
+		try {
+			newVisitor.visitCompilationUnit(compilationUnit, uris);
+		} catch (Exception e) {
+			logger.warn("Exception during incremental AST visit: {}", e.getMessage());
+			logger.debug("Incremental AST visit exception details", e);
+		} catch (LinkageError e) {
+			logger.warn("Classpath linkage error during incremental AST visit: {}", e.toString());
+			logger.debug("Incremental AST visit LinkageError details", e);
+		}
 		return newVisitor;
 	}
 
@@ -239,6 +256,15 @@ public class CompilationOrchestrator {
 			logger.warn("Unexpected exception during compilation for scope {}: {}",
 					projectRoot, e.getMessage());
 			logger.debug("Compilation exception details", e);
+		} catch (LinkageError e) {
+			// NoClassDefFoundError, UnsatisfiedLinkError, etc. — a class from
+			// the project's classpath could not be loaded.  Log and continue
+			// so this doesn't propagate to LSP4J's listener thread and kill
+			// the server (EPIPE).
+			logger.warn("Classpath linkage error during compilation for scope {} "
+					+ "(a dependency may be missing or incompatible): {}",
+					projectRoot, e.toString());
+			logger.debug("LinkageError details", e);
 		}
 		return compilationUnit.getErrorCollector();
 	}
@@ -273,6 +299,11 @@ public class CompilationOrchestrator {
 			logger.debug("Groovy compiler bug during incremental compile for {}: {}", projectRoot, e.getMessage());
 		} catch (Exception e) {
 			logger.warn("Unexpected exception during incremental compile for {}: {}", projectRoot, e.getMessage());
+		} catch (LinkageError e) {
+			logger.warn("Classpath linkage error during incremental compile for {} "
+					+ "(a dependency may be missing or incompatible): {}",
+					projectRoot, e.toString());
+			logger.debug("LinkageError details", e);
 		}
 		return incrementalUnit.getErrorCollector();
 	}

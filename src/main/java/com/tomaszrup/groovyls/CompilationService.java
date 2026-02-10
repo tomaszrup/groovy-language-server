@@ -267,17 +267,26 @@ public class CompilationService {
 	 */
 	private void doFullCompilation(ProjectScope scope) {
 		long fullStart = System.currentTimeMillis();
-		createOrUpdateCompilationUnit(scope);
-		resetChangedFilesForScope(scope);
-		compile(scope);
-		visitAST(scope);
-		// Build the full dependency graph after initial compilation
-		if (scope.getAstVisitor() != null) {
-			scope.getDependencyGraph().clear();
-			for (URI uri : scope.getAstVisitor().getDependenciesByURI().keySet()) {
-				Set<URI> deps = scope.getAstVisitor().resolveSourceDependencies(uri);
-				scope.getDependencyGraph().updateDependencies(uri, deps);
+		try {
+			createOrUpdateCompilationUnit(scope);
+			resetChangedFilesForScope(scope);
+			compile(scope);
+			visitAST(scope);
+			// Build the full dependency graph after initial compilation
+			if (scope.getAstVisitor() != null) {
+				scope.getDependencyGraph().clear();
+				for (URI uri : scope.getAstVisitor().getDependenciesByURI().keySet()) {
+					Set<URI> deps = scope.getAstVisitor().resolveSourceDependencies(uri);
+					scope.getDependencyGraph().updateDependencies(uri, deps);
+				}
 			}
+		} catch (LinkageError e) {
+			// NoClassDefFoundError or similar — a project dependency could not
+			// be class-loaded. Log and mark compiled so we don't retry
+			// endlessly; the partial AST is still usable.
+			logger.warn("Classpath linkage error during full compilation of {}: {}",
+					scope.getProjectRoot(), e.toString());
+			logger.debug("Full compilation LinkageError details", e);
 		}
 		scope.setCompiled(true);
 		long fullElapsed = System.currentTimeMillis() - fullStart;
@@ -313,6 +322,10 @@ public class CompilationService {
 				if (fileContentsTracker.hasChangedURIsUnder(scope.getProjectRoot())) {
 					compileAndVisitAST(scope, uri);
 				}
+			} catch (LinkageError e) {
+				logger.warn("Classpath linkage error in ensureCompiledForContext for {}: {}",
+						uri, e.toString());
+				logger.debug("ensureCompiledForContext LinkageError details", e);
 			} finally {
 				scope.getLock().writeLock().unlock();
 			}
@@ -323,6 +336,10 @@ public class CompilationService {
 				if (fileContentsTracker.hasChangedURIsUnder(scope.getProjectRoot())) {
 					compileAndVisitAST(scope, uri);
 				}
+			} catch (LinkageError e) {
+				logger.warn("Classpath linkage error in ensureCompiledForContext (recompile) for {}: {}",
+						uri, e.toString());
+				logger.debug("ensureCompiledForContext recompile LinkageError details", e);
 			} finally {
 				scope.getLock().writeLock().unlock();
 			}

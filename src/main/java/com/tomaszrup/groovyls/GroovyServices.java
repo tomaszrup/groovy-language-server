@@ -416,6 +416,23 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	public void didOpen(DidOpenTextDocumentParams params) {
 		fileContentsTracker.didOpen(params);
 		URI uri = URI.create(params.getTextDocument().getUri());
+		try {
+			doDidOpen(uri);
+		} catch (LinkageError e) {
+			// NoClassDefFoundError or similar — a project class could not be
+			// loaded during compilation.  Catch here so the error does NOT
+			// propagate to LSP4J's listener thread (which only catches
+			// Exception, not Error), which would kill the connection and
+			// cause the EPIPE seen by the VS Code client.
+			logger.warn("Classpath linkage error during didOpen for {}: {}", uri, e.toString());
+			logger.debug("didOpen LinkageError details", e);
+		} catch (Exception e) {
+			logger.warn("Unexpected exception during didOpen for {}: {}", uri, e.getMessage());
+			logger.debug("didOpen exception details", e);
+		}
+	}
+
+	private void doDidOpen(URI uri) {
 		ProjectScope scope = scopeManager.findProjectScope(uri);
 
 		if (scope != null && !scopeManager.isImportPendingFor(scope)) {
@@ -453,24 +470,32 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		// two concurrent didChange calls could both cancel the same future
 		// and both schedule new ones, causing redundant compilation.
 		ScheduledFuture<?> newFuture = schedulingPool.schedule(() -> {
-			URI uri = URI.create(params.getTextDocument().getUri());
-			ProjectScope scope = scopeManager.findProjectScope(uri);
-			if (scope != null && !scopeManager.isImportPendingFor(scope)) {
-				if (!scope.isClasspathResolved() && resolutionCoordinator != null) {
-					// Classpath not yet resolved — request lazy resolution.
-					// Don't attempt full compilation without classpath.
-					resolutionCoordinator.requestResolution(scope, uri);
-				} else {
-					scope.getLock().writeLock().lock();
-					try {
-						boolean didFullCompile = compilationService.ensureScopeCompiled(scope);
-						if (!didFullCompile) {
-							compilationService.compileAndVisitAST(scope, uri);
+			try {
+				URI uri = URI.create(params.getTextDocument().getUri());
+				ProjectScope scope = scopeManager.findProjectScope(uri);
+				if (scope != null && !scopeManager.isImportPendingFor(scope)) {
+					if (!scope.isClasspathResolved() && resolutionCoordinator != null) {
+						// Classpath not yet resolved — request lazy resolution.
+						// Don't attempt full compilation without classpath.
+						resolutionCoordinator.requestResolution(scope, uri);
+					} else {
+						scope.getLock().writeLock().lock();
+						try {
+							boolean didFullCompile = compilationService.ensureScopeCompiled(scope);
+							if (!didFullCompile) {
+								compilationService.compileAndVisitAST(scope, uri);
+							}
+						} finally {
+							scope.getLock().writeLock().unlock();
 						}
-					} finally {
-						scope.getLock().writeLock().unlock();
 					}
 				}
+			} catch (LinkageError e) {
+				logger.warn("Classpath linkage error during didChange: {}", e.toString());
+				logger.debug("didChange LinkageError details", e);
+			} catch (Exception e) {
+				logger.warn("Unexpected exception during didChange: {}", e.getMessage());
+				logger.debug("didChange exception details", e);
 			}
 		}, DEBOUNCE_DELAY_MS, TimeUnit.MILLISECONDS);
 		ScheduledFuture<?> prev = pendingDebounce.getAndSet(newFuture);
