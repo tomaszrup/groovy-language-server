@@ -38,6 +38,8 @@ import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.Range;
 import org.eclipse.lsp4j.TextDocumentIdentifier;
 import org.eclipse.lsp4j.jsonrpc.messages.Either;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import com.tomaszrup.groovyls.compiler.ast.ASTNodeVisitor;
 import com.tomaszrup.groovyls.compiler.util.GroovyASTUtils;
@@ -46,16 +48,31 @@ import com.tomaszrup.groovyls.util.GroovyLanguageServerUtils;
 import com.tomaszrup.groovyls.util.JavaSourceLocator;
 
 public class DefinitionProvider {
+	private static final Logger logger = LoggerFactory.getLogger(DefinitionProvider.class);
+
 	private ASTNodeVisitor ast;
 	private JavaSourceLocator javaSourceLocator;
+	private List<JavaSourceLocator> siblingLocators;
 
 	public DefinitionProvider(ASTNodeVisitor ast) {
-		this(ast, null);
+		this(ast, null, Collections.emptyList());
 	}
 
 	public DefinitionProvider(ASTNodeVisitor ast, JavaSourceLocator javaSourceLocator) {
+		this(ast, javaSourceLocator, Collections.emptyList());
+	}
+
+	/**
+	 * @param ast              the AST visitor for the current scope
+	 * @param javaSourceLocator the primary locator for the current scope
+	 * @param siblingLocators  locators from other project scopes in the workspace,
+	 *                         checked when the primary locator cannot resolve a class
+	 */
+	public DefinitionProvider(ASTNodeVisitor ast, JavaSourceLocator javaSourceLocator,
+			List<JavaSourceLocator> siblingLocators) {
 		this.ast = ast;
 		this.javaSourceLocator = javaSourceLocator;
+		this.siblingLocators = siblingLocators != null ? siblingLocators : Collections.emptyList();
 	}
 
 	public CompletableFuture<Either<List<? extends Location>, List<? extends LocationLink>>> provideDefinition(
@@ -104,70 +121,138 @@ public class DefinitionProvider {
 			definitionNode = GroovyASTUtils.getDefinition(offsetNode, false, ast);
 		}
 		if (definitionNode == null) {
+			logger.debug("resolveJavaSource: no definition node found for {}",
+					offsetNode.getClass().getSimpleName());
 			return null;
 		}
 		if (definitionNode instanceof ClassNode) {
 			ClassNode classNode = (ClassNode) definitionNode;
-			Location loc = javaSourceLocator.findLocationForClass(classNode.getName());
-			if (loc != null) return loc;
+			String className = classNode.getName();
+			logger.debug("resolveJavaSource: resolving ClassNode '{}'", className);
+			Location loc = javaSourceLocator.findLocationForClass(className);
+			if (loc == null) {
+				loc = findInSiblingLocators(className);
+			}
+			if (loc != null) {
+				logger.debug("resolveJavaSource: found source for '{}' at {}",
+						className, loc.getUri());
+				return loc;
+			}
+			logger.debug("resolveJavaSource: no source for '{}', falling back to decompilation",
+					className);
 			return decompileAndLocateClass(classNode);
 		}
 		if (definitionNode instanceof ConstructorNode) {
 			ConstructorNode ctorNode = (ConstructorNode) definitionNode;
 			ClassNode declaringClass = ctorNode.getDeclaringClass();
 			if (declaringClass != null) {
-				Location loc = javaSourceLocator.findLocationForConstructor(
-						declaringClass.getName(), ctorNode.getParameters().length);
+				String className = declaringClass.getName();
+				int paramCount = ctorNode.getParameters().length;
+				Location loc = javaSourceLocator.findLocationForConstructor(className, paramCount);
+				if (loc == null) {
+					loc = findConstructorInSiblingLocators(className, paramCount);
+				}
 				if (loc != null) return loc;
-				return decompileAndLocateConstructor(declaringClass, ctorNode.getParameters().length);
+				return decompileAndLocateConstructor(declaringClass, paramCount);
 			}
 		}
 		if (definitionNode instanceof MethodNode) {
 			MethodNode methodNode = (MethodNode) definitionNode;
 			ClassNode declaringClass = methodNode.getDeclaringClass();
 			if (declaringClass != null) {
+				String className = declaringClass.getName();
+				int paramCount = methodNode.getParameters().length;
 				if ("<init>".equals(methodNode.getName())) {
-					Location loc = javaSourceLocator.findLocationForConstructor(
-							declaringClass.getName(), methodNode.getParameters().length);
+					Location loc = javaSourceLocator.findLocationForConstructor(className, paramCount);
+					if (loc == null) {
+						loc = findConstructorInSiblingLocators(className, paramCount);
+					}
 					if (loc != null) return loc;
-					return decompileAndLocateConstructor(declaringClass, methodNode.getParameters().length);
+					return decompileAndLocateConstructor(declaringClass, paramCount);
 				}
-				Location loc = javaSourceLocator.findLocationForMethod(
-						declaringClass.getName(), methodNode.getName(),
-						methodNode.getParameters().length);
+				String methodName = methodNode.getName();
+				Location loc = javaSourceLocator.findLocationForMethod(className, methodName, paramCount);
+				if (loc == null) {
+					loc = findMethodInSiblingLocators(className, methodName, paramCount);
+				}
 				if (loc != null) return loc;
-				return decompileAndLocateMethod(declaringClass, methodNode.getName(),
-						methodNode.getParameters().length);
+				return decompileAndLocateMethod(declaringClass, methodName, paramCount);
 			}
 		}
 		if (definitionNode instanceof PropertyNode) {
 			PropertyNode propNode = (PropertyNode) definitionNode;
 			ClassNode declaringClass = propNode.getDeclaringClass();
 			if (declaringClass != null) {
-				Location loc = javaSourceLocator.findLocationForField(
-						declaringClass.getName(), propNode.getName());
+				String className = declaringClass.getName();
+				String fieldName = propNode.getName();
+				Location loc = javaSourceLocator.findLocationForField(className, fieldName);
+				if (loc == null) {
+					loc = findFieldInSiblingLocators(className, fieldName);
+				}
 				if (loc != null) return loc;
-				return decompileAndLocateField(declaringClass, propNode.getName());
+				return decompileAndLocateField(declaringClass, fieldName);
 			}
 		}
 		if (definitionNode instanceof FieldNode) {
 			FieldNode fieldNode = (FieldNode) definitionNode;
 			ClassNode declaringClass = fieldNode.getDeclaringClass();
 			if (declaringClass != null) {
-				Location loc = javaSourceLocator.findLocationForField(
-						declaringClass.getName(), fieldNode.getName());
+				String className = declaringClass.getName();
+				String fieldName = fieldNode.getName();
+				Location loc = javaSourceLocator.findLocationForField(className, fieldName);
+				if (loc == null) {
+					loc = findFieldInSiblingLocators(className, fieldName);
+				}
 				if (loc != null) return loc;
-				return decompileAndLocateField(declaringClass, fieldNode.getName());
+				return decompileAndLocateField(declaringClass, fieldName);
 			}
 		}
 		if (definitionNode instanceof Variable) {
 			Variable variable = (Variable) definitionNode;
 			ClassNode originType = variable.getOriginType();
 			if (originType != null) {
-				Location loc = javaSourceLocator.findLocationForClass(originType.getName());
+				String className = originType.getName();
+				Location loc = javaSourceLocator.findLocationForClass(className);
+				if (loc == null) {
+					loc = findInSiblingLocators(className);
+				}
 				if (loc != null) return loc;
 				return decompileAndLocateClass(originType);
 			}
+		}
+		return null;
+	}
+
+	// --- Sibling scope lookup helpers ---
+
+	private Location findInSiblingLocators(String className) {
+		for (JavaSourceLocator sibling : siblingLocators) {
+			Location loc = sibling.findLocationForClass(className);
+			if (loc != null) return loc;
+		}
+		return null;
+	}
+
+	private Location findConstructorInSiblingLocators(String className, int paramCount) {
+		for (JavaSourceLocator sibling : siblingLocators) {
+			Location loc = sibling.findLocationForConstructor(className, paramCount);
+			if (loc != null) return loc;
+		}
+		return null;
+	}
+
+	private Location findMethodInSiblingLocators(String className, String methodName, int paramCount) {
+		for (JavaSourceLocator sibling : siblingLocators) {
+			Location loc = sibling.findLocationForMethod(className, methodName, paramCount);
+			if (loc != null) return loc;
+		}
+		return null;
+	}
+
+	private Location findFieldInSiblingLocators(String className, String fieldName) {
+		for (JavaSourceLocator sibling : siblingLocators) {
+			Location loc = sibling.findLocationForField(className, fieldName);
+			if (loc != null) return loc;
 		}
 		return null;
 	}
@@ -212,6 +297,11 @@ public class DefinitionProvider {
 		// If real source is now available (e.g. source JARs indexed after
 		// lazy classpath resolution), skip decompilation entirely.
 		if (javaSourceLocator.hasSource(className)) return null;
+		// Also check sibling locators — if any sibling has the real source,
+		// skip decompilation (the resolution methods already checked siblings).
+		for (JavaSourceLocator sibling : siblingLocators) {
+			if (sibling.hasSource(className)) return null;
+		}
 		List<String> lines = ClassNodeDecompiler.decompile(classNode);
 		return javaSourceLocator.registerDecompiledContent(className, lines);
 	}

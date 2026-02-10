@@ -517,6 +517,24 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 
 	// --- TextDocumentService requests ---
 
+	/**
+	 * Collect JavaSourceLocators from all project scopes except the given one.
+	 * Used to enable cross-project "Go to Definition" in multi-module workspaces.
+	 */
+	private List<JavaSourceLocator> collectSiblingLocators(ProjectScope currentScope) {
+		List<ProjectScope> allScopes = scopeManager.getAllScopes();
+		if (allScopes.size() <= 1) {
+			return Collections.emptyList();
+		}
+		List<JavaSourceLocator> siblings = new ArrayList<>();
+		for (ProjectScope other : allScopes) {
+			if (other != currentScope && other.getJavaSourceLocator() != null) {
+				siblings.add(other.getJavaSourceLocator());
+			}
+		}
+		return siblings;
+	}
+
 	@Override
 	public CompletableFuture<Hover> hover(HoverParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
@@ -614,7 +632,8 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			return CompletableFuture.completedFuture(Either.forLeft(Collections.emptyList()));
 		}
 
-		DefinitionProvider provider = new DefinitionProvider(visitor, scope.getJavaSourceLocator());
+		DefinitionProvider provider = new DefinitionProvider(visitor, scope.getJavaSourceLocator(),
+				collectSiblingLocators(scope));
 		return provider.provideDefinition(params.getTextDocument(), params.getPosition());
 	}
 
@@ -675,7 +694,8 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			return CompletableFuture.completedFuture(Either.forLeft(Collections.emptyList()));
 		}
 
-		TypeDefinitionProvider provider = new TypeDefinitionProvider(visitor, scope.getJavaSourceLocator());
+		TypeDefinitionProvider provider = new TypeDefinitionProvider(visitor, scope.getJavaSourceLocator(),
+				collectSiblingLocators(scope));
 		return provider.provideTypeDefinition(params.getTextDocument(), params.getPosition());
 	}
 

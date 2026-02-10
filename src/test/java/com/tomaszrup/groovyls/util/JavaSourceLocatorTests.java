@@ -521,4 +521,156 @@ class JavaSourceLocatorTests {
 		Assertions.assertEquals(3, loc.getRange().getStart().getLine(),
 				"Should point to real class declaration in source JAR");
 	}
+
+	// ------------------------------------------------------------------
+	// Inner class ($) resolution
+	// ------------------------------------------------------------------
+
+	@Test
+	void testFindLocationForInnerClass() throws Exception {
+		createJavaSource("src/main/java/com/example/Outer.java",
+				"package com.example;\n"
+				+ "\n"
+				+ "public class Outer {\n"
+				+ "\n"
+				+ "    public static class Inner {\n"
+				+ "        public void doSomething() {}\n"
+				+ "    }\n"
+				+ "}\n");
+
+		locator.addProjectRoot(tempProjectRoot);
+
+		// Look up using the JVM inner class name (with $)
+		Location loc = locator.findLocationForClass("com.example.Outer$Inner");
+		Assertions.assertNotNull(loc, "Should find location for inner class via outer class source");
+		// "Inner" declaration is on line 4 (0-indexed)
+		Assertions.assertEquals(4, loc.getRange().getStart().getLine(),
+				"Should point to the inner class declaration line");
+	}
+
+	@Test
+	void testHasSourceForInnerClass() throws Exception {
+		createJavaSource("src/main/java/com/example/Container.java",
+				"package com.example;\npublic class Container {\n    public static class Nested {}\n}\n");
+
+		locator.addProjectRoot(tempProjectRoot);
+
+		Assertions.assertTrue(locator.hasSource("com.example.Container"),
+				"Should have source for outer class");
+		Assertions.assertTrue(locator.hasSource("com.example.Container$Nested"),
+				"Should have source for inner class via outer class");
+		Assertions.assertFalse(locator.hasSource("com.example.DoesNotExist$Nested"),
+				"Should not have source for non-existent outer class");
+	}
+
+	@Test
+	void testFindSourceURIForInnerClass() throws Exception {
+		createJavaSource("src/main/java/com/example/Outer.java",
+				"package com.example;\npublic class Outer {\n    public class Inner {}\n}\n");
+
+		locator.addProjectRoot(tempProjectRoot);
+
+		// Direct lookup for the outer class
+		URI outerUri = locator.findSourceURI("com.example.Outer");
+		Assertions.assertNotNull(outerUri, "Should find URI for outer class");
+
+		// Inner class lookup should resolve to the outer class source file
+		URI innerUri = locator.findSourceURI("com.example.Outer$Inner");
+		Assertions.assertNotNull(innerUri, "Should find URI for inner class via outer");
+		Assertions.assertEquals(outerUri, innerUri,
+				"Inner class URI should point to the same file as the outer class");
+	}
+
+	@Test
+	void testFindLocationForDeeplyNestedInnerClass() throws Exception {
+		createJavaSource("src/main/java/com/example/Top.java",
+				"package com.example;\n"
+				+ "\n"
+				+ "public class Top {\n"
+				+ "    public static class Middle {\n"
+				+ "        public static class Deep {\n"
+				+ "        }\n"
+				+ "    }\n"
+				+ "}\n");
+
+		locator.addProjectRoot(tempProjectRoot);
+
+		Location loc = locator.findLocationForClass("com.example.Top$Middle$Deep");
+		Assertions.assertNotNull(loc, "Should find location for deeply nested class");
+		// "Deep" declaration is on line 4 (0-indexed)
+		Assertions.assertEquals(4, loc.getRange().getStart().getLine(),
+				"Should point to the Deep class declaration");
+	}
+
+	@Test
+	void testFindLocationForConstructorOfInnerClass() throws Exception {
+		createJavaSource("src/main/java/com/example/Outer.java",
+				"package com.example;\n"
+				+ "\n"
+				+ "public class Outer {\n"
+				+ "\n"
+				+ "    public static class Inner {\n"
+				+ "        public Inner(String arg) {}\n"
+				+ "    }\n"
+				+ "}\n");
+
+		locator.addProjectRoot(tempProjectRoot);
+
+		Location loc = locator.findLocationForConstructor("com.example.Outer$Inner", 1);
+		Assertions.assertNotNull(loc, "Should find constructor in inner class");
+		Assertions.assertEquals(5, loc.getRange().getStart().getLine(),
+				"Should point to the Inner constructor line");
+	}
+
+	@Test
+	void testFindLocationForMethodOfInnerClass() throws Exception {
+		createJavaSource("src/main/java/com/example/Outer.java",
+				"package com.example;\n"
+				+ "\n"
+				+ "public class Outer {\n"
+				+ "\n"
+				+ "    public static class Inner {\n"
+				+ "        public void hello() {}\n"
+				+ "    }\n"
+				+ "}\n");
+
+		locator.addProjectRoot(tempProjectRoot);
+
+		Location loc = locator.findLocationForMethod("com.example.Outer$Inner", "hello", 0);
+		Assertions.assertNotNull(loc, "Should find method in inner class");
+		Assertions.assertEquals(5, loc.getRange().getStart().getLine(),
+				"Should point to the hello() method line");
+	}
+
+	@Test
+	void testFindLocationForFieldOfInnerClass() throws Exception {
+		createJavaSource("src/main/java/com/example/Outer.java",
+				"package com.example;\n"
+				+ "\n"
+				+ "public class Outer {\n"
+				+ "\n"
+				+ "    public static class Inner {\n"
+				+ "        public String name;\n"
+				+ "    }\n"
+				+ "}\n");
+
+		locator.addProjectRoot(tempProjectRoot);
+
+		Location loc = locator.findLocationForField("com.example.Outer$Inner", "name");
+		Assertions.assertNotNull(loc, "Should find field in inner class");
+		Assertions.assertEquals(5, loc.getRange().getStart().getLine(),
+				"Should point to the name field line");
+	}
+
+	@Test
+	void testToOuterClassName() {
+		Assertions.assertNull(JavaSourceLocator.toOuterClassName("com.example.Foo"),
+				"Non-inner class should return null");
+		Assertions.assertEquals("com.example.Outer",
+				JavaSourceLocator.toOuterClassName("com.example.Outer$Inner"),
+				"Should strip inner class suffix");
+		Assertions.assertEquals("com.example.Outer",
+				JavaSourceLocator.toOuterClassName("com.example.Outer$Inner$Deep"),
+				"Should strip all nested parts to get top-level class");
+	}
 }

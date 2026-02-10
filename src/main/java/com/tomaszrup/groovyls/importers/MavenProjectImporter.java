@@ -110,13 +110,49 @@ public class MavenProjectImporter implements ProjectImporter {
     }
 
     /**
-     * Resolve classpaths for all Maven projects <b>without compiling</b>
-     * source code.  Only resolves dependency JARs and discovers existing
-     * compiled class directories from prior builds.
+     * Resolve classpaths for all Maven projects <b>with compilation</b>.
+     * Unlike Gradle, Maven's {@code dependency:build-classpath} only reports
+     * external dependency JARs — it does <em>not</em> include the project's
+     * own compiled output directories ({@code target/classes},
+     * {@code target/test-classes}).  Those directories are discovered via
+     * {@link #discoverClassDirs}, but they must actually exist on disk.
+     * Without compilation, Java classes from {@code src/main/java} are never
+     * compiled, so Groovy test files in {@code src/test/groovy} cannot
+     * resolve them at analysis time.
      */
     @Override
     public Map<Path, List<String>> resolveClasspaths(List<Path> projectRoots) {
-        return doImportProjects(projectRoots, false);
+        return doImportProjects(projectRoots, true);
+    }
+
+    /**
+     * Resolve classpath for a <b>single</b> Maven project, compiling first
+     * so that {@code target/classes} and {@code target/test-classes} exist.
+     *
+     * <p>This is the lazy on-demand path called when the user opens a file
+     * in a project whose classpath hasn't been resolved yet.  For Maven,
+     * compilation is essential because the dependency resolution
+     * ({@code mvn dependency:build-classpath}) only returns external JARs —
+     * the project's own compiled output is discovered separately via
+     * {@link #discoverClassDirs}, which requires the directories to be
+     * populated.</p>
+     */
+    @Override
+    public List<String> resolveClasspath(Path projectRoot) {
+        List<String> classpath = new ArrayList<>();
+
+        // Compile so that target/classes and target/test-classes are populated
+        compileProject(projectRoot);
+
+        // Resolve external dependency JARs
+        classpath.addAll(resolveClasspathInternal(projectRoot));
+
+        // Discover compiled class output directories
+        classpath.addAll(discoverClassDirs(projectRoot));
+
+        logger.info("Lazy-resolved classpath for Maven project {}: {} entries",
+                projectRoot, classpath.size());
+        return classpath;
     }
 
     private Map<Path, List<String>> doImportProjects(List<Path> projectRoots, boolean compile) {

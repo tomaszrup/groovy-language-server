@@ -171,6 +171,7 @@ public class JavaSourceLocator {
             }
         }
         classNameToSource = Collections.unmodifiableMap(snapshot);
+        logger.debug("addProjectRoot({}): indexed {} source classes", projectRoot, snapshot.size());
     }
 
     /**
@@ -485,6 +486,8 @@ public class JavaSourceLocator {
     /**
      * Look up the source file for a fully-qualified class name.
      * Checks project sources first, then dependency source JARs.
+     * For inner classes (names containing {@code $}), falls back to the
+     * enclosing top-level class source file.
      *
      * @param className fully-qualified class name, e.g. "com.example.MyClass"
      * @return the source file URI, or null if not found
@@ -497,6 +500,11 @@ public class JavaSourceLocator {
         SourceJarEntry jarEntry = classNameToSourceJar.get(className);
         if (jarEntry != null) {
             return sourceJarToVSCodeURI(jarEntry);
+        }
+        // For inner classes, try the outer class
+        String outerClassName = toOuterClassName(className);
+        if (outerClassName != null) {
+            return findSourceURI(outerClassName);
         }
         return null;
     }
@@ -558,6 +566,8 @@ public class JavaSourceLocator {
     /**
      * Resolve a fully-qualified class name to a source location.
      * Checks project sources first, then dependency source JARs.
+     * For inner classes (names containing {@code $}), falls back to the
+     * enclosing top-level class source file.
      *
      * @return a SourceInfo for reading the source, or null if not found
      */
@@ -583,6 +593,25 @@ public class JavaSourceLocator {
             // Fall back to JAR entry reference if reading fails
             return new SourceInfo(uri, jarEntry, this);
         }
+        // For inner classes (com.example.Outer$Inner), try the outer class
+        String outerClassName = toOuterClassName(className);
+        if (outerClassName != null) {
+            return resolveSource(outerClassName);
+        }
+        return null;
+    }
+
+    /**
+     * If {@code className} is an inner/nested class name (contains {@code $}),
+     * return the top-level enclosing class name. Otherwise return {@code null}.
+     * <p>
+     * Example: {@code "com.example.Outer$Inner$Deep"} → {@code "com.example.Outer"}
+     */
+    static String toOuterClassName(String className) {
+        int dollarIdx = className.indexOf('$');
+        if (dollarIdx > 0) {
+            return className.substring(0, dollarIdx);
+        }
         return null;
     }
 
@@ -599,9 +628,13 @@ public class JavaSourceLocator {
         if (source == null) {
             return null;
         }
-        String simpleName = className.contains(".")
+        // For inner classes (Outer$Inner), use the inner class simple name
+        String baseName = className.contains(".")
                 ? className.substring(className.lastIndexOf('.') + 1)
                 : className;
+        String simpleName = baseName.contains("$")
+                ? baseName.substring(baseName.lastIndexOf('$') + 1)
+                : baseName;
 
         List<String> lines = source.readLines();
         if (lines != null) {
@@ -717,9 +750,13 @@ public class JavaSourceLocator {
         if (source == null) {
             return null;
         }
-        String simpleName = className.contains(".")
+        // For inner classes (Outer$Inner), use the inner class simple name
+        String baseName = className.contains(".")
                 ? className.substring(className.lastIndexOf('.') + 1)
                 : className;
+        String simpleName = baseName.contains("$")
+                ? baseName.substring(baseName.lastIndexOf('$') + 1)
+                : baseName;
 
         List<String> lines = source.readLines();
         if (lines != null) {
@@ -882,10 +919,21 @@ public class JavaSourceLocator {
     /**
      * Check if this locator can resolve the given class name to any source
      * (project source, source JAR, or decompiled content).
+     * For inner classes (names containing {@code $}), also checks the
+     * enclosing top-level class.
      */
     public boolean hasSource(String className) {
-        return classNameToSource.containsKey(className)
-                || classNameToSourceJar.containsKey(className);
+        if (classNameToSource.containsKey(className)
+                || classNameToSourceJar.containsKey(className)) {
+            return true;
+        }
+        // For inner classes, check the outer class
+        String outerClassName = toOuterClassName(className);
+        if (outerClassName != null) {
+            return classNameToSource.containsKey(outerClassName)
+                    || classNameToSourceJar.containsKey(outerClassName);
+        }
+        return false;
     }
 
     /**

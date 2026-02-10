@@ -45,14 +45,21 @@ import com.tomaszrup.groovyls.util.JavaSourceLocator;
 public class TypeDefinitionProvider {
 	private ASTNodeVisitor ast;
 	private JavaSourceLocator javaSourceLocator;
+	private List<JavaSourceLocator> siblingLocators;
 
 	public TypeDefinitionProvider(ASTNodeVisitor ast) {
-		this(ast, null);
+		this(ast, null, Collections.emptyList());
 	}
 
 	public TypeDefinitionProvider(ASTNodeVisitor ast, JavaSourceLocator javaSourceLocator) {
+		this(ast, javaSourceLocator, Collections.emptyList());
+	}
+
+	public TypeDefinitionProvider(ASTNodeVisitor ast, JavaSourceLocator javaSourceLocator,
+			List<JavaSourceLocator> siblingLocators) {
 		this.ast = ast;
 		this.javaSourceLocator = javaSourceLocator;
+		this.siblingLocators = siblingLocators != null ? siblingLocators : Collections.emptyList();
 	}
 
 	public CompletableFuture<Either<List<? extends Location>, List<? extends LocationLink>>> provideTypeDefinition(
@@ -101,7 +108,14 @@ public class TypeDefinitionProvider {
 		}
 		ClassNode typeClass = extractTypeClass(definitionNode);
 		if (typeClass != null) {
-			Location loc = javaSourceLocator.findLocationForClass(typeClass.getName());
+			String className = typeClass.getName();
+			Location loc = javaSourceLocator.findLocationForClass(className);
+			if (loc == null) {
+				for (JavaSourceLocator sibling : siblingLocators) {
+					loc = sibling.findLocationForClass(className);
+					if (loc != null) return loc;
+				}
+			}
 			if (loc != null) return loc;
 			return decompileAndLocateClass(typeClass);
 		}
@@ -123,7 +137,14 @@ public class TypeDefinitionProvider {
 		}
 		ClassNode typeClass = extractTypeClass(defNode);
 		if (typeClass != null) {
-			Location loc = javaSourceLocator.findLocationForClass(typeClass.getName());
+			String className = typeClass.getName();
+			Location loc = javaSourceLocator.findLocationForClass(className);
+			if (loc == null) {
+				for (JavaSourceLocator sibling : siblingLocators) {
+					loc = sibling.findLocationForClass(className);
+					if (loc != null) return loc;
+				}
+			}
 			if (loc != null) return loc;
 			return decompileAndLocateClass(typeClass);
 		}
@@ -151,6 +172,13 @@ public class TypeDefinitionProvider {
 		if (javaSourceLocator.hasSource(className)) {
 			Location loc = javaSourceLocator.findLocationForClass(className);
 			if (loc != null) return loc;
+		}
+		// Also check sibling locators
+		for (JavaSourceLocator sibling : siblingLocators) {
+			if (sibling.hasSource(className)) {
+				Location loc = sibling.findLocationForClass(className);
+				if (loc != null) return loc;
+			}
 		}
 		List<String> lines = ClassNodeDecompiler.decompile(classNode);
 		URI uri = javaSourceLocator.registerDecompiledContent(className, lines);

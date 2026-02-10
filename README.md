@@ -76,7 +76,10 @@ Automatic classpath resolution for both **Gradle** and **Maven** projects:
 Gradle projects are imported via the [Gradle Tooling API](https://docs.gradle.org/current/userguide/third_party_integration.html):
 
 - Automatically discovers Gradle projects in the workspace (including multi-project builds)
+- Supports both Groovy DSL (`build.gradle`) and Kotlin DSL (`build.gradle.kts`) build scripts
+- Supports the **Gradle Wrapper** (`gradlew` / `gradlew.bat`) — the Tooling API automatically uses the wrapper when present
 - Resolves all four classpath configurations (`compileClasspath`, `runtimeClasspath`, `testCompileClasspath`, `testRuntimeClasspath`) so that autocomplete and navigation work for third-party libraries
+- Caches resolved classpaths and validates them against build-file timestamps to avoid redundant resolution
 - Recompiles Java/Gradle sources on change so the Groovy compilation unit picks up updates
 - Per-project scoping — each Gradle subproject gets its own classpath and compilation context
 
@@ -101,7 +104,10 @@ A bundled VS Code extension provides a seamless editor experience:
 
 - **Automatic server lifecycle** — the language server JAR starts automatically when a `.groovy` file is opened
 - **JDK auto-detection** — locates a suitable JDK from `JAVA_HOME`, `JDK_HOME`, `PATH`, or the `groovy.java.home` setting
+- **Go-to-definition into external libraries** — navigating to classes from JARs or the JDK opens a decompiled skeleton view (supports `decompiled:`, `jar:`, and `jrt:` URI schemes)
+- **Status bar indicator** — shows server state (starting, importing, ready, error) with live progress during project import
 - **Restart command** — `Groovy: Restart Groovy language server` command to restart the server without reloading the window
+- **Show Output Channel** — `Groovy: Show Output Channel` command to view the language server log
 
 ### Language Configuration
 
@@ -135,7 +141,7 @@ The extension ships a `language-configuration.json` that enables rich editing su
 
 This produces:
 - `build/libs/groovy-language-server-all.jar` — the language server fat JAR
-- `extension/groovy-*.vsix` — the VS Code extension package (bundling the JAR)
+- `extension/groovy-spock-support-0.1.0.vsix` — the VS Code extension package (bundling the JAR)
 
 The server communicates via standard I/O using the Language Server Protocol.
 
