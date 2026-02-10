@@ -30,6 +30,7 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.eclipse.lsp4j.DidChangeTextDocumentParams;
 import org.eclipse.lsp4j.DidCloseTextDocumentParams;
@@ -56,6 +57,9 @@ public class FileContentsTracker {
 
 	private final ConcurrentHashMap<URI, String> openFiles = new ConcurrentHashMap<>();
 	private final Set<URI> changedFiles = ConcurrentHashMap.newKeySet();
+
+	/** The URI of the most recently opened file (for prioritising compilation). */
+	private final AtomicReference<URI> lastOpenedURI = new AtomicReference<>();
 
 	/**
 	 * Cache for files that are not open in the editor. Entries expire after
@@ -142,6 +146,15 @@ public class FileContentsTracker {
 		openFiles.put(uri, params.getTextDocument().getText());
 		closedFileCache.remove(uri);
 		changedFiles.add(uri);
+		lastOpenedURI.set(uri);
+	}
+
+	/**
+	 * Returns the URI of the most recently opened file, or {@code null} if
+	 * no file has been opened yet.
+	 */
+	public URI getLastOpenedURI() {
+		return lastOpenedURI.get();
 	}
 
 	/**

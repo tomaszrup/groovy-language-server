@@ -223,16 +223,22 @@ public class UnusedImportFinder {
 		addClassName(method.getReturnType(), usedNames);
 		addGenericsTypes(method.getReturnType(), usedNames);
 
-		// Parameters
-		for (Parameter param : method.getParameters()) {
-			addClassName(param.getType(), usedNames);
-			addGenericsTypes(param.getType(), usedNames);
-			param.getAnnotations().forEach(ann -> addClassName(ann.getClassNode(), usedNames));
+		// Parameters — may be null for methods in incompletely-compiled ASTs
+		Parameter[] params = method.getParameters();
+		if (params != null) {
+			for (Parameter param : params) {
+				addClassName(param.getType(), usedNames);
+				addGenericsTypes(param.getType(), usedNames);
+				param.getAnnotations().forEach(ann -> addClassName(ann.getClassNode(), usedNames));
+			}
 		}
 
-		// Exceptions
-		for (ClassNode exception : method.getExceptions()) {
-			addClassName(exception, usedNames);
+		// Exceptions — may be null for methods in incompletely-compiled ASTs
+		ClassNode[] exceptions = method.getExceptions();
+		if (exceptions != null) {
+			for (ClassNode exception : exceptions) {
+				addClassName(exception, usedNames);
+			}
 		}
 
 		// Annotations

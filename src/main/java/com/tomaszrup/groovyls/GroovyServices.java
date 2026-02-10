@@ -280,20 +280,50 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			if (!scopeToResolvedURI.isEmpty()) {
 				logger.info("Scheduling background compilation for {} scope(s) with open files",
 						scopeToResolvedURI.size());
-				backgroundCompiler.submit(() -> {
-					for (Map.Entry<ProjectScope, URI> entry : scopeToResolvedURI.entrySet()) {
-						ProjectScope scope = entry.getKey();
-					scope.getLock().writeLock().lock();
-					try {
-						compilationService.ensureScopeCompiled(scope);
-					} finally {
-						scope.getLock().writeLock().unlock();
+
+				// Prioritise the scope containing the most recently opened
+				// file so the user sees diagnostics for it first.
+				URI lastOpened = fileContentsTracker.getLastOpenedURI();
+				ProjectScope activeScope = lastOpened != null
+						? scopeManager.findProjectScope(lastOpened) : null;
+
+				// Submit separate tasks per scope so diagnostics are published
+				// incrementally (not blocked until all scopes finish).
+				// Active scope is submitted first.
+				if (activeScope != null && scopeToResolvedURI.containsKey(activeScope)) {
+					ProjectScope first = activeScope;
+					backgroundCompiler.submit(() -> {
+						if (Thread.currentThread().isInterrupted()) return;
+						first.getLock().writeLock().lock();
+						try {
+							compilationService.ensureScopeCompiled(first);
+						} finally {
+							first.getLock().writeLock().unlock();
 						}
+						if (languageClient != null) {
+							languageClient.refreshSemanticTokens();
+						}
+					});
+				}
+
+				for (Map.Entry<ProjectScope, URI> entry : scopeToResolvedURI.entrySet()) {
+					ProjectScope scope = entry.getKey();
+					if (scope == activeScope) {
+						continue; // already submitted above
 					}
-					if (languageClient != null) {
-						languageClient.refreshSemanticTokens();
-					}
-				});
+					backgroundCompiler.submit(() -> {
+						if (Thread.currentThread().isInterrupted()) return;
+						scope.getLock().writeLock().lock();
+						try {
+							compilationService.ensureScopeCompiled(scope);
+						} finally {
+							scope.getLock().writeLock().unlock();
+						}
+						if (languageClient != null) {
+							languageClient.refreshSemanticTokens();
+						}
+					});
+				}
 			}
 
 			// For open files in scopes whose classpath has NOT been resolved

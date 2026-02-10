@@ -75,25 +75,33 @@ public class DiagnosticHandler {
 
 		Map<URI, List<Diagnostic>> diagnosticsByFile = new HashMap<>();
 
-		// Find unused imports and add them as diagnostics with the Unnecessary tag
-		UnusedImportFinder unusedImportFinder = new UnusedImportFinder();
-		Map<URI, List<org.codehaus.groovy.ast.ImportNode>> unusedImportsByFile = unusedImportFinder
-				.findUnusedImports(compilationUnit);
-		for (Map.Entry<URI, List<org.codehaus.groovy.ast.ImportNode>> entry : unusedImportsByFile.entrySet()) {
-			URI uri = entry.getKey();
-			for (org.codehaus.groovy.ast.ImportNode importNode : entry.getValue()) {
-				Range range = GroovyLanguageServerUtils.astNodeToRange(importNode);
-				if (range == null) {
-					continue;
+		// Find unused imports and add them as diagnostics with the Unnecessary tag.
+		// Wrapped in try/catch because incompletely-compiled ASTs (e.g. projects
+		// that have never been built) can contain null arrays in MethodNode,
+		// and we don't want unused-import analysis failures to prevent real
+		// diagnostics from being published.
+		try {
+			UnusedImportFinder unusedImportFinder = new UnusedImportFinder();
+			Map<URI, List<org.codehaus.groovy.ast.ImportNode>> unusedImportsByFile = unusedImportFinder
+					.findUnusedImports(compilationUnit);
+			for (Map.Entry<URI, List<org.codehaus.groovy.ast.ImportNode>> entry : unusedImportsByFile.entrySet()) {
+				URI uri = entry.getKey();
+				for (org.codehaus.groovy.ast.ImportNode importNode : entry.getValue()) {
+					Range range = GroovyLanguageServerUtils.astNodeToRange(importNode);
+					if (range == null) {
+						continue;
+					}
+					Diagnostic diagnostic = new Diagnostic();
+					diagnostic.setRange(range);
+					diagnostic.setSeverity(DiagnosticSeverity.Hint);
+					diagnostic.setMessage("Unused import");
+					diagnostic.setTags(Collections.singletonList(DiagnosticTag.Unnecessary));
+					diagnostic.setSource("groovy");
+					diagnosticsByFile.computeIfAbsent(uri, (key) -> new ArrayList<>()).add(diagnostic);
 				}
-				Diagnostic diagnostic = new Diagnostic();
-				diagnostic.setRange(range);
-				diagnostic.setSeverity(DiagnosticSeverity.Hint);
-				diagnostic.setMessage("Unused import");
-				diagnostic.setTags(Collections.singletonList(DiagnosticTag.Unnecessary));
-				diagnostic.setSource("groovy");
-				diagnosticsByFile.computeIfAbsent(uri, (key) -> new ArrayList<>()).add(diagnostic);
 			}
+		} catch (Exception e) {
+			logger.warn("Unused import analysis failed for scope {}: {}", projectRoot, e.getMessage());
 		}
 
 		List<? extends Message> errors = collector.getErrors();
