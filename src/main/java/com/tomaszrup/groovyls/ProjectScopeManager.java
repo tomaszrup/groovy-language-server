@@ -30,6 +30,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
@@ -81,10 +84,28 @@ public class ProjectScopeManager {
 	 */
 	private final Object scopesMutationLock = new Object();
 
+	/**
+	 * Cache for {@link #findProjectScope(URI)} results.  The URI → scope
+	 * mapping is stable while the scope list is unchanged, so this avoids
+	 * repeated linear scans on every LSP request (hover, completion,
+	 * semantic tokens, inlay hints, etc.).
+	 * <p>Invalidated whenever the scope list is mutated.</p>
+	 */
+	private final ConcurrentHashMap<URI, ProjectScope> scopeCache = new ConcurrentHashMap<>();
+
 	private final FileContentsTracker fileContentsTracker;
 
 	/** Supplier of language client — set after server connects. */
 	private volatile LanguageClient languageClient;
+
+	/**
+	 * TTL in seconds for scope eviction. When a scope hasn't been accessed
+	 * for longer than this duration, its heavy state is evicted. 0 disables.
+	 */
+	private volatile long scopeEvictionTTLSeconds = 300;
+
+	/** Handle for the periodic eviction sweep, cancelled on shutdown. */
+	private volatile ScheduledFuture<?> evictionFuture;
 
 	public ProjectScopeManager(ICompilationUnitFactory defaultFactory, FileContentsTracker fileContentsTracker) {
 		this.fileContentsTracker = fileContentsTracker;
@@ -107,6 +128,7 @@ public class ProjectScopeManager {
 			ds.setCompiled(false);
 			ds.setClasspathResolved(true);
 			this.defaultScope = ds;
+			scopeCache.clear();
 		}
 	}
 
@@ -148,9 +170,17 @@ public class ProjectScopeManager {
 	 */
 	public ProjectScope findProjectScope(URI uri) {
 		if (!projectScopes.isEmpty() && uri != null) {
+			// Fast path: check the cache first to avoid repeated linear scans
+			ProjectScope cached = scopeCache.get(uri);
+			if (cached != null) {
+				cached.touchAccess();
+				return cached;
+			}
 			Path filePath = Paths.get(uri);
 			for (ProjectScope scope : projectScopes) {
 				if (scope.getProjectRoot() != null && filePath.startsWith(scope.getProjectRoot())) {
+					scopeCache.put(uri, scope);
+					scope.touchAccess();
 					logger.debug("findProjectScope({}) -> {}", uri, scope.getProjectRoot());
 					return scope;
 				}
@@ -159,6 +189,14 @@ public class ProjectScopeManager {
 			return null;
 		}
 		return defaultScope;
+	}
+
+	/**
+	 * Invalidate the {@link #findProjectScope(URI)} cache.  Must be called
+	 * whenever the scope list is replaced or the workspace root changes.
+	 */
+	public void clearScopeCache() {
+		scopeCache.clear();
 	}
 
 	/**
@@ -257,6 +295,7 @@ public class ProjectScopeManager {
 
 			newScopes.sort((a, b) -> b.getProjectRoot().toString().length() - a.getProjectRoot().toString().length());
 			projectScopes = Collections.unmodifiableList(newScopes);
+			scopeCache.clear();
 		}
 
 		clearDefaultScopeDiagnostics();
@@ -318,6 +357,10 @@ public class ProjectScopeManager {
 		try {
 			scope.getCompilationUnitFactory().setAdditionalClasspathList(classpath);
 			scope.setClasspathResolved(true);
+			// Reset any previous OOM failure — the classpath change may
+			// have reduced memory requirements (fewer deps) or the user
+			// may have increased -Xmx.
+			scope.resetCompilationFailed();
 			// Index dependency source JARs for Go to Definition
 			scope.updateSourceLocatorClasspath(classpath);
 			JavadocResolver.clearCache();
@@ -373,6 +416,7 @@ public class ProjectScopeManager {
 
 			newScopes.sort((a, b) -> b.getProjectRoot().toString().length() - a.getProjectRoot().toString().length());
 			projectScopes = Collections.unmodifiableList(newScopes);
+			scopeCache.clear();
 		}
 
 		clearDefaultScopeDiagnostics();
@@ -449,6 +493,124 @@ public class ProjectScopeManager {
 	 */
 	public boolean hasClasspathChanged(List<String> classpathList) {
 		return !classpathList.equals(defaultScope.getCompilationUnitFactory().getAdditionalClasspathList());
+	}
+
+	// --- Diagnostics helpers ---
+
+	// --- Eviction ---
+
+	/**
+	 * Set the scope eviction TTL. 0 disables eviction.
+	 */
+	public void setScopeEvictionTTLSeconds(long ttlSeconds) {
+		this.scopeEvictionTTLSeconds = ttlSeconds;
+		logger.info("Scope eviction TTL set to {} seconds", ttlSeconds);
+	}
+
+	public long getScopeEvictionTTLSeconds() {
+		return scopeEvictionTTLSeconds;
+	}
+
+	/**
+	 * Start the periodic eviction scheduler. Should be called once after
+	 * the server is fully initialized.
+	 *
+	 * @param schedulingPool the shared scheduling pool from ExecutorPools
+	 */
+	public void startEvictionScheduler(ScheduledExecutorService schedulingPool) {
+		if (scopeEvictionTTLSeconds <= 0) {
+			logger.info("Scope eviction disabled (TTL=0)");
+			return;
+		}
+		// Run sweep every 60 seconds
+		long sweepIntervalSeconds = Math.max(30, scopeEvictionTTLSeconds / 5);
+		evictionFuture = schedulingPool.scheduleAtFixedRate(
+				this::performEvictionSweep,
+				sweepIntervalSeconds,
+				sweepIntervalSeconds,
+				TimeUnit.SECONDS);
+		logger.info("Scope eviction scheduler started (TTL={}s, sweep interval={}s)",
+				scopeEvictionTTLSeconds, sweepIntervalSeconds);
+	}
+
+	/**
+	 * Periodic sweep that evicts heavy state from inactive scopes and
+	 * cleans up expired entries from the closed-file cache.
+	 */
+	private void performEvictionSweep() {
+		// Sweep expired closed-file cache entries
+		int expired = fileContentsTracker.sweepExpiredClosedFileCache();
+		if (expired > 0) {
+			logger.debug("Swept {} expired closed-file cache entries", expired);
+		}
+
+		long ttlMs = scopeEvictionTTLSeconds * 1000;
+		if (ttlMs <= 0) {
+			return;
+		}
+		long now = System.currentTimeMillis();
+		Set<URI> openURIs = fileContentsTracker.getOpenURIs();
+
+		for (ProjectScope scope : projectScopes) {
+			if (scope.isEvicted() || !scope.isCompiled()) {
+				continue;
+			}
+
+			long idleMs = now - scope.getLastAccessedAt();
+			if (idleMs < ttlMs) {
+				continue;
+			}
+
+			// Don't evict scopes that have open files
+			if (hasOpenFilesInScope(scope, openURIs)) {
+				continue;
+			}
+
+			// Evict under write lock
+			scope.getLock().writeLock().lock();
+			try {
+				// Double-check under lock
+				if (!scope.isEvicted() && scope.isCompiled()
+						&& (now - scope.getLastAccessedAt()) >= ttlMs
+						&& !hasOpenFilesInScope(scope, openURIs)) {
+					logger.info("Evicting scope {} (idle for {}s)",
+							scope.getProjectRoot(), idleMs / 1000);
+					scope.evictHeavyState();
+				}
+			} finally {
+				scope.getLock().writeLock().unlock();
+			}
+		}
+	}
+
+	/**
+	 * Returns true if any of the given open URIs belong to the given scope.
+	 */
+	private boolean hasOpenFilesInScope(ProjectScope scope, Set<URI> openURIs) {
+		if (openURIs.isEmpty() || scope.getProjectRoot() == null) {
+			return false;
+		}
+		for (URI uri : openURIs) {
+			try {
+				if (Paths.get(uri).startsWith(scope.getProjectRoot())) {
+					return true;
+				}
+			} catch (Exception e) {
+				// ignore URIs that can't be converted to Path
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Stop the eviction scheduler. Called on server shutdown.
+	 */
+	public void stopEvictionScheduler() {
+		ScheduledFuture<?> f = evictionFuture;
+		if (f != null) {
+			f.cancel(false);
+			evictionFuture = null;
+		}
 	}
 
 	// --- Diagnostics helpers ---

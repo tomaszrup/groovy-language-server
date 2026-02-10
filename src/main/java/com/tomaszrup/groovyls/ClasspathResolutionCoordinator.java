@@ -28,6 +28,8 @@ import org.eclipse.lsp4j.services.LanguageClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.tomaszrup.groovyls.util.MdcProjectContext;
+
 import java.net.URI;
 import java.nio.file.Path;
 import java.util.*;
@@ -77,6 +79,7 @@ public class ClasspathResolutionCoordinator {
     private volatile Path workspaceRoot;
     private volatile List<Path> allDiscoveredRoots;
     private volatile boolean classpathCacheEnabled = true;
+    private volatile boolean backfillEnabled = false;
 
     public ClasspathResolutionCoordinator(ProjectScopeManager scopeManager,
                                           CompilationService compilationService,
@@ -107,6 +110,15 @@ public class ClasspathResolutionCoordinator {
     }
 
     /**
+     * Enable or disable automatic backfill of sibling subprojects.
+     * When disabled (default), each project's classpath is resolved on
+     * demand when a file is first opened in it.
+     */
+    public void setBackfillEnabled(boolean enabled) {
+        this.backfillEnabled = enabled;
+    }
+
+    /**
      * Request lazy classpath resolution for the given scope. If the scope's
      * classpath is already resolved or resolution is already in-flight,
      * this is a no-op.
@@ -123,6 +135,8 @@ public class ClasspathResolutionCoordinator {
             return;
         }
 
+        // Set MDC so the MDC-propagating executor captures project context
+        MdcProjectContext.setProject(scope.getProjectRoot());
         logger.info("Scheduling lazy classpath resolution for {}", scope.getProjectRoot());
         importPool.submit(() -> {
             try {
@@ -134,10 +148,12 @@ public class ClasspathResolutionCoordinator {
                 scopeManager.markResolutionComplete(scope.getProjectRoot());
             }
         });
+        MdcProjectContext.clear();
     }
 
     private void doResolve(ProjectScope scope, URI triggerURI) {
         Path projectRoot = scope.getProjectRoot();
+        MdcProjectContext.setProject(projectRoot);
         ProjectImporter importer = projectImporterMap.get(projectRoot);
         if (importer == null) {
             logger.warn("No importer found for {}", projectRoot);
@@ -170,6 +186,11 @@ public class ClasspathResolutionCoordinator {
             updatedScope.getLock().writeLock().lock();
             try {
                 compilationService.ensureScopeCompiled(updatedScope);
+            } catch (VirtualMachineError e) {
+                logger.error("VirtualMachineError during post-resolve compilation for {}: {}",
+                        projectRoot, e.toString());
+                // Swallow — the scope is already marked as failed by
+                // CompilationService.handleCompilationOOM if it got that far.
             } finally {
                 updatedScope.getLock().writeLock().unlock();
             }
@@ -178,8 +199,12 @@ public class ClasspathResolutionCoordinator {
             }
         }
 
-        // Schedule backfill for sibling subprojects
-        scheduleBackfill(importer, projectRoot);
+        // Schedule backfill for sibling subprojects (if enabled)
+        if (backfillEnabled) {
+            scheduleBackfill(importer, projectRoot);
+        } else {
+            logger.debug("Backfill disabled — sibling projects will resolve on demand");
+        }
 
         // Schedule low-priority background source JAR download so that
         // Go-to-Definition can show real source.  This is NOT on the
@@ -223,6 +248,7 @@ public class ClasspathResolutionCoordinator {
     }
 
     private void doBackfill(GradleProjectImporter gradleImporter, Path gradleRoot) {
+        MdcProjectContext.setProject(gradleRoot);
         // Find all unresolved sibling scopes under this Gradle root
         List<ProjectScope> unresolvedSiblings = new ArrayList<>();
         for (ProjectScope scope : scopeManager.getProjectScopes()) {
@@ -281,6 +307,10 @@ public class ClasspathResolutionCoordinator {
                     + " project(s) resolved in " + elapsed + "ms";
             logProgress(backfillMsg);
             sendStatusUpdate("ready", backfillMsg);
+
+            // Log memory stats after backfill so the user (and us) can
+            // diagnose memory pressure in large workspaces early.
+            logMemoryStats();
         } catch (Exception e) {
             logger.error("Backfill failed for Gradle root {}: {}", gradleRoot, e.getMessage(), e);
         } finally {
@@ -304,6 +334,30 @@ public class ClasspathResolutionCoordinator {
                 languageClient.statusUpdate(new StatusUpdateParams(state, message));
             } catch (Exception e) {
                 logger.debug("Failed to send statusUpdate: {}", e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Log JVM memory statistics and warn if usage exceeds 80% of max heap.
+     */
+    private void logMemoryStats() {
+        Runtime rt = Runtime.getRuntime();
+        long usedMB = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024);
+        long maxMB = rt.maxMemory() / (1024 * 1024);
+        int scopeCount = scopeManager.getProjectScopes().size();
+        logger.info("JVM memory after backfill: used={}MB, max={}MB, scopes={}",
+                usedMB, maxMB, scopeCount);
+        if (usedMB > maxMB * 0.8) {
+            String warning = String.format(
+                    "Memory usage is high (%dMB / %dMB, %d project scopes). "
+                    + "Consider increasing heap via groovy.java.vmargs setting, "
+                    + "e.g. \"-Xmx%dm\".",
+                    usedMB, maxMB, scopeCount,
+                    Math.min(4096, (int) (maxMB * 2)));
+            logger.warn(warning);
+            if (languageClient != null) {
+                languageClient.logMessage(new MessageParams(MessageType.Warning, warning));
             }
         }
     }

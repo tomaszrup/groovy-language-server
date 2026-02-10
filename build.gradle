@@ -33,6 +33,7 @@ shadowJar {
   minimize {
     // Keep dependencies that use reflection / ServiceLoader / static initializers
     exclude(dependency('org.slf4j:.*'))
+    exclude(dependency('ch.qos.logback:.*'))
     exclude(dependency('org.eclipse.lsp4j:.*'))
     exclude(dependency('com.google.code.gson:gson'))
     exclude(dependency('org.apache.groovy:.*'))
@@ -125,7 +126,7 @@ dependencies {
   implementation "com.google.code.gson:gson:2.13.1"
   implementation "io.github.classgraph:classgraph:4.8.179"
   implementation "org.slf4j:slf4j-api:2.0.17"
-  implementation "org.slf4j:slf4j-simple:2.0.17"
+  implementation "ch.qos.logback:logback-classic:1.5.12"
   testImplementation "org.junit.jupiter:junit-jupiter-api:5.11.4"
   testRuntimeOnly "org.junit.jupiter:junit-jupiter-engine:5.11.4"
 }

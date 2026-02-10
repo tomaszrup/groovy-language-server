@@ -23,17 +23,21 @@ package com.tomaszrup.groovyls;
 import java.net.URI;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Semaphore;
 
 import org.codehaus.groovy.control.CompilationFailedException;
 import org.codehaus.groovy.control.CompilerConfiguration;
 import org.codehaus.groovy.control.ErrorCollector;
 import org.codehaus.groovy.control.Phases;
+import org.eclipse.lsp4j.Diagnostic;
 import org.eclipse.lsp4j.Position;
+import org.eclipse.lsp4j.PublishDiagnosticsParams;
 import org.eclipse.lsp4j.services.LanguageClient;
 
 import groovy.lang.GroovyClassLoader;
@@ -45,6 +49,7 @@ import com.tomaszrup.groovyls.compiler.DiagnosticHandler;
 import com.tomaszrup.groovyls.compiler.ast.ASTNodeVisitor;
 import com.tomaszrup.groovyls.compiler.control.GroovyLSCompilationUnit;
 import com.tomaszrup.groovyls.util.FileContentsTracker;
+import com.tomaszrup.groovyls.util.MdcProjectContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -73,12 +78,28 @@ public class CompilationService {
 	private final FileContentsTracker fileContentsTracker;
 	private volatile LanguageClient languageClient;
 
+	/**
+	 * Global semaphore that caps concurrent compilations across all thread
+	 * pools (import, background, LSP).  May be {@code null} for tests that
+	 * don't inject an {@link ExecutorPools} instance.
+	 */
+	private volatile Semaphore compilationPermits;
+
 	public CompilationService(FileContentsTracker fileContentsTracker) {
 		this.fileContentsTracker = fileContentsTracker;
 	}
 
 	public void setLanguageClient(LanguageClient client) {
 		this.languageClient = client;
+	}
+
+	/**
+	 * Inject the global compilation semaphore from {@link ExecutorPools}.
+	 * When set, all compilation entry points will acquire a permit before
+	 * starting compilation and release it in a {@code finally} block.
+	 */
+	public void setCompilationPermits(Semaphore permits) {
+		this.compilationPermits = permits;
 	}
 
 	public FileContentsTracker getFileContentsTracker() {
@@ -145,15 +166,34 @@ public class CompilationService {
 	// --- Compilation ---
 
 	public void compile(ProjectScope scope) {
-		ErrorCollector collector = compilationOrchestrator.compile(
-				scope.getCompilationUnit(), scope.getProjectRoot());
-		if (collector != null) {
-			DiagnosticHandler.DiagnosticResult result = diagnosticHandler.handleErrorCollector(
-					scope.getCompilationUnit(), collector, scope.getProjectRoot(), scope.getPrevDiagnosticsByFile());
-			scope.setPrevDiagnosticsByFile(result.getDiagnosticsByFile());
-			LanguageClient client = languageClient;
-			if (client != null) {
-				result.getDiagnosticsToPublish().forEach(client::publishDiagnostics);
+		MdcProjectContext.setProject(scope.getProjectRoot());
+		Semaphore permits = compilationPermits;
+		if (permits != null) {
+			try {
+				permits.acquire();
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+				logger.debug("Compilation interrupted for {}", scope.getProjectRoot());
+				return;
+			}
+		}
+		try {
+			ErrorCollector collector = compilationOrchestrator.compile(
+					scope.getCompilationUnit(), scope.getProjectRoot());
+			if (collector != null) {
+				DiagnosticHandler.DiagnosticResult result = diagnosticHandler.handleErrorCollector(
+						scope.getCompilationUnit(), collector, scope.getProjectRoot(), scope.getPrevDiagnosticsByFile());
+				scope.setPrevDiagnosticsByFile(result.getDiagnosticsByFile());
+				LanguageClient client = languageClient;
+				if (client != null) {
+					result.getDiagnosticsToPublish().forEach(client::publishDiagnostics);
+				}
+			}
+		} catch (VirtualMachineError e) {
+			handleCompilationOOM(scope, e, "compile");
+		} finally {
+			if (permits != null) {
+				permits.release();
 			}
 		}
 	}
@@ -193,6 +233,12 @@ public class CompilationService {
 	public boolean ensureScopeCompiled(ProjectScope scope, URI triggerURI,
 			java.util.concurrent.ExecutorService backgroundCompiler) {
 		if (scope.isCompiled()) {
+			return false;
+		}
+		// If a previous compilation failed with OOM, don't retry endlessly.
+		// The user needs to increase heap or reduce scope count.
+		if (scope.isCompilationFailed()) {
+			logger.debug("Skipping compilation of {} — previously failed with OOM", scope.getProjectRoot());
 			return false;
 		}
 		// Guard: do not compile a scope whose classpath hasn't been resolved
@@ -266,6 +312,7 @@ public class CompilationService {
 	 * <p><b>Caller must hold the scope's write lock.</b></p>
 	 */
 	private void doFullCompilation(ProjectScope scope) {
+		MdcProjectContext.setProject(scope.getProjectRoot());
 		long fullStart = System.currentTimeMillis();
 		try {
 			createOrUpdateCompilationUnit(scope);
@@ -287,8 +334,20 @@ public class CompilationService {
 			logger.warn("Classpath linkage error during full compilation of {}: {}",
 					scope.getProjectRoot(), e.toString());
 			logger.debug("Full compilation LinkageError details", e);
+		} catch (VirtualMachineError e) {
+			handleCompilationOOM(scope, e, "doFullCompilation");
+			return; // setCompiled(true) still runs via finally below
+		} finally {
+			// Always mark as compiled to prevent infinite retry loops.
+			// Even after OOM, retrying immediately would just OOM again.
+			scope.setCompiled(true);
+			// If this scope was evicted, clear the evicted flag and update
+			// the last access time so it doesn't get immediately re-evicted.
+			if (scope.isEvicted()) {
+				scope.clearEvicted();
+				logger.info("Reactivated evicted scope {}", scope.getProjectRoot());
+			}
 		}
-		scope.setCompiled(true);
 		long fullElapsed = System.currentTimeMillis() - fullStart;
 		logger.info("Full compilation of {} completed in {}ms", scope.getProjectRoot(), fullElapsed);
 		// Refresh semantic tokens after full compilation replaces the AST
@@ -312,6 +371,9 @@ public class CompilationService {
 			return null;
 		}
 
+		// Set MDC project context for all log messages during this request
+		MdcProjectContext.setProject(scope.getProjectRoot());
+
 		if (!scope.isCompiled() || scope.getAstVisitor() == null) {
 			scope.getLock().writeLock().lock();
 			try {
@@ -326,6 +388,8 @@ public class CompilationService {
 				logger.warn("Classpath linkage error in ensureCompiledForContext for {}: {}",
 						uri, e.toString());
 				logger.debug("ensureCompiledForContext LinkageError details", e);
+			} catch (VirtualMachineError e) {
+				handleCompilationOOM(scope, e, "ensureCompiledForContext");
 			} finally {
 				scope.getLock().writeLock().unlock();
 			}
@@ -340,6 +404,8 @@ public class CompilationService {
 				logger.warn("Classpath linkage error in ensureCompiledForContext (recompile) for {}: {}",
 						uri, e.toString());
 				logger.debug("ensureCompiledForContext recompile LinkageError details", e);
+			} catch (VirtualMachineError e) {
+				handleCompilationOOM(scope, e, "ensureCompiledForContext recompile");
 			} finally {
 				scope.getLock().writeLock().unlock();
 			}
@@ -669,5 +735,83 @@ public class CompilationService {
 				scope.getDependencyGraph().updateDependencies(uri, deps);
 			}
 		}
+	}
+
+	// --- OOM handling ---
+
+	/**
+	 * Handles a {@link VirtualMachineError} (typically {@link OutOfMemoryError})
+	 * caught during compilation.  This method:
+	 * <ol>
+	 *   <li>Logs the error</li>
+	 *   <li>Attempts {@code System.gc()} to reclaim soft references</li>
+	 *   <li>Marks the scope as failed so future compilations are skipped</li>
+	 *   <li>Publishes a synthetic diagnostic so the user gets feedback</li>
+	 * </ol>
+	 */
+	private void handleCompilationOOM(ProjectScope scope, VirtualMachineError e, String context) {
+		logger.error("{}: {} for scope {} — marking as failed. "
+				+ "Consider increasing -Xmx via groovy.java.vmargs setting.",
+				context, e.toString(), scope.getProjectRoot());
+
+		// Attempt to reclaim memory (soft references, finalizable objects)
+		try {
+			System.gc();
+		} catch (Throwable ignored) {
+			// Best effort
+		}
+
+		scope.setCompilationFailed(true);
+		scope.setCompiled(true); // prevent retry loops
+
+		// Publish a synthetic diagnostic so the user sees feedback
+		publishOOMDiagnostic(scope, e);
+
+		logMemoryStats();
+	}
+
+	/**
+	 * Publishes a synthetic error diagnostic for a scope that failed with OOM,
+	 * so the user sees actionable feedback instead of silent failure.
+	 */
+	private void publishOOMDiagnostic(ProjectScope scope, VirtualMachineError e) {
+		LanguageClient client = languageClient;
+		if (client == null || scope.getProjectRoot() == null) {
+			return;
+		}
+		try {
+			// Create a synthetic diagnostic on the build file
+			URI buildFileURI = scope.getProjectRoot().resolve("build.gradle").toUri();
+			Diagnostic diag = new Diagnostic();
+			diag.setRange(new org.eclipse.lsp4j.Range(
+					new Position(0, 0), new Position(0, 0)));
+			diag.setSeverity(org.eclipse.lsp4j.DiagnosticSeverity.Error);
+			diag.setSource("groovy-language-server");
+			Runtime rt = Runtime.getRuntime();
+			long usedMB = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024);
+			long maxMB = rt.maxMemory() / (1024 * 1024);
+			diag.setMessage(String.format(
+					"Compilation failed: %s (heap: %dMB/%dMB). "
+					+ "Increase heap via groovy.java.vmargs setting, e.g. \"-Xmx2g\".",
+					e.getClass().getSimpleName(), usedMB, maxMB));
+			PublishDiagnosticsParams params = new PublishDiagnosticsParams(
+					buildFileURI.toString(), List.of(diag));
+			client.publishDiagnostics(params);
+		} catch (Throwable t) {
+			// If we're so low on memory we can't even publish diagnostics,
+			// just log and move on.
+			logger.debug("Failed to publish OOM diagnostic: {}", t.getMessage());
+		}
+	}
+
+	/**
+	 * Logs current JVM memory statistics for diagnostic purposes.
+	 */
+	private void logMemoryStats() {
+		Runtime rt = Runtime.getRuntime();
+		long usedMB = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024);
+		long totalMB = rt.totalMemory() / (1024 * 1024);
+		long maxMB = rt.maxMemory() / (1024 * 1024);
+		logger.warn("JVM memory: used={}MB, total={}MB, max={}MB", usedMB, totalMB, maxMB);
 	}
 }

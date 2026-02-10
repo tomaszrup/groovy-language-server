@@ -140,12 +140,21 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
      */
     private volatile Set<String> enabledImporters = Collections.emptySet();
 
+    /** Whether backfill of sibling Gradle subprojects is enabled (default: false). */
+    private volatile boolean backfillSiblingProjects = false;
+
+    /** Scope eviction TTL in seconds (default: 300). 0 disables eviction. */
+    private volatile long scopeEvictionTTLSeconds = 300;
+
     /**
      * Coordinator for lazy on-demand classpath resolution. Created during
      * {@link #importProjectsAsync} once the scope manager and importer map
      * are initialized.
      */
     private volatile ClasspathResolutionCoordinator resolutionCoordinator;
+
+    /** Future for the periodic memory usage reporter, cancelled on shutdown. */
+    private volatile java.util.concurrent.ScheduledFuture<?> memoryReporterFuture;
 
     public GroovyLanguageServer() {
         this(new CompilationUnitFactory());
@@ -230,6 +239,11 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         Object initOptions = params.getInitializationOptions();
         if (initOptions instanceof JsonObject) {
             JsonObject opts = (JsonObject) initOptions;
+            // Apply log level before any other processing so all subsequent
+            // log messages respect the configured level.
+            if (opts.has("logLevel") && opts.get("logLevel").isJsonPrimitive()) {
+                applyLogLevel(opts.get("logLevel").getAsString());
+            }
             if (opts.has("classpathCache") && !opts.get("classpathCache").getAsBoolean()) {
                 classpathCacheEnabled = false;
                 logger.info("Classpath caching disabled via initializationOptions");
@@ -248,7 +262,19 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                     logger.info("Enabled importers: {}", enabledImporters);
                 }
             }
+            // Memory management settings
+            if (opts.has("backfillSiblingProjects") && opts.get("backfillSiblingProjects").isJsonPrimitive()) {
+                backfillSiblingProjects = opts.get("backfillSiblingProjects").getAsBoolean();
+                logger.info("Backfill sibling projects: {}", backfillSiblingProjects);
+            }
+            if (opts.has("scopeEvictionTTLSeconds") && opts.get("scopeEvictionTTLSeconds").isJsonPrimitive()) {
+                scopeEvictionTTLSeconds = opts.get("scopeEvictionTTLSeconds").getAsLong();
+                logger.info("Scope eviction TTL: {}s", scopeEvictionTTLSeconds);
+            }
         }
+
+        // Apply memory settings to scope manager
+        groovyServices.getScopeManager().setScopeEvictionTTLSeconds(scopeEvictionTTLSeconds);
 
         // Set workspace bound on the Gradle importer so findGradleRoot()
         // stops at the workspace root instead of walking to the filesystem root.
@@ -308,6 +334,9 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             logProgress("Project import complete");
             sendStatusUpdate("ready", "Project import complete");
         }
+
+        // Start periodic memory usage reporter (every 5 seconds)
+        startMemoryReporter();
 
         InitializeResult initializeResult = new InitializeResult(serverCapabilities);
         return CompletableFuture.completedFuture(initializeResult);
@@ -652,6 +681,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             coordinator.setWorkspaceRoot(workspaceRoot);
             coordinator.setAllDiscoveredRoots(allDiscoveredRoots);
             coordinator.setClasspathCacheEnabled(classpathCacheEnabled);
+            coordinator.setBackfillEnabled(backfillSiblingProjects);
             this.resolutionCoordinator = coordinator;
             groovyServices.setResolutionCoordinator(coordinator);
 
@@ -660,6 +690,9 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                     + cacheHits + " cached, " + unresolvedCount + " lazy)";
             logProgress(completeMsg);
             sendStatusUpdate("ready", completeMsg);
+
+            // Start the eviction scheduler after import is complete
+            groovyServices.getScopeManager().startEvictionScheduler(executorPools.getSchedulingPool());
         } catch (Exception e) {
             logger.error("Background project import failed: {}", e.getMessage(), e);
             String failMsg = "Project import failed: " + e.getMessage();
@@ -672,15 +705,20 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
 
     @Override
     public CompletableFuture<Object> shutdown() {
+        if (memoryReporterFuture != null) {
+            memoryReporterFuture.cancel(false);
+        }
         if (importFuture != null) {
             importFuture.cancel(true);
         }
         if (resolutionCoordinator != null) {
             resolutionCoordinator.shutdown();
         }
+        groovyServices.getScopeManager().stopEvictionScheduler();
         groovyServices.shutdown();
         executorPools.shutdownAll();
         SharedClassGraphCache.getInstance().clear();
+        com.tomaszrup.groovyls.util.SharedSourceJarIndex.getInstance().clear();
         return CompletableFuture.completedFuture(new Object());
     }
 
@@ -743,11 +781,55 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         }
     }
 
+    /**
+     * Start a periodic timer that sends JVM memory usage to the client
+     * every 5 seconds via the {@code groovy/memoryUsage} notification.
+     */
+    private void startMemoryReporter() {
+        memoryReporterFuture = executorPools.getSchedulingPool().scheduleAtFixedRate(() -> {
+            try {
+                if (client == null) {
+                    return;
+                }
+                Runtime rt = Runtime.getRuntime();
+                long usedBytes = rt.totalMemory() - rt.freeMemory();
+                long maxBytes = rt.maxMemory();
+                int usedMB = (int) (usedBytes / (1024 * 1024));
+                int maxMB = (int) (maxBytes / (1024 * 1024));
+                client.memoryUsage(new MemoryUsageParams(usedMB, maxMB));
+            } catch (Exception e) {
+                // Ignore — client may have disconnected
+            }
+        }, 5, 5, TimeUnit.SECONDS);
+    }
+
     /** Send a progress log message to the client (visible in output channel). */
     private void logProgress(String message) {
         logger.info(message);
         if (client != null) {
             client.logMessage(new MessageParams(MessageType.Info, message));
+        }
+    }
+
+    /**
+     * Dynamically set the Logback root logger level from a string value.
+     * Accepted values (case-insensitive): ERROR, WARN, INFO, DEBUG, TRACE.
+     * Invalid values are ignored and a warning is logged.
+     */
+    private static void applyLogLevel(String levelName) {
+        try {
+            ch.qos.logback.classic.Level level = ch.qos.logback.classic.Level.toLevel(levelName, null);
+            if (level == null) {
+                logger.warn("Unknown log level '{}', keeping current level", levelName);
+                return;
+            }
+            ch.qos.logback.classic.Logger root = (ch.qos.logback.classic.Logger)
+                    LoggerFactory.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME);
+            ch.qos.logback.classic.Level previous = root.getLevel();
+            root.setLevel(level);
+            logger.info("Log level changed from {} to {}", previous, level);
+        } catch (Exception e) {
+            logger.warn("Failed to set log level to '{}': {}", levelName, e.getMessage());
         }
     }
 }

@@ -2,7 +2,7 @@
   "name": "groovy-spock-support",
   "displayName": "Groovy & Spock Language Support",
   "description": "Language support for Groovy and Spock",
-  "version": "0.1.5",
+  "version": "0.1.8",
   "publisher": "TomaszRup",
   "homepage": "https://github.com/tomaszrup/groovy-language-server",
   "repository": {
@@ -139,6 +139,17 @@
           "default": 0,
           "description": "If set, connect to an existing Groovy LSP server on this TCP port instead of starting one automatically."
         },
+        "groovy.logLevel": {
+          "type": "string",
+          "default": "INFO",
+          "enum": ["ERROR", "WARN", "INFO", "DEBUG", "TRACE"],
+          "description": "Set the log level for the Groovy language server. Lower levels produce more output. Changing this restarts the server."
+        },
+        "groovy.showMemoryUsage": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show the language server's JVM memory usage in the status bar next to \"Groovy\"."
+        },
         "groovy.semanticHighlighting.enabled": {
           "type": "boolean",
           "default": true,
@@ -165,6 +176,17 @@
             "type": "string",
             "enum": ["Gradle", "Maven"]
           }
+        },
+        "groovy.memory.scopeEvictionTTL": {
+          "type": "number",
+          "default": 300,
+          "minimum": 0,
+          "description": "Time in seconds after which an inactive project scope's heavy state (AST, classloader, compilation unit) is evicted from memory. The scope is transparently reactivated on the next request. Set to 0 to disable eviction. Useful for large multi-project workspaces."
+        },
+        "groovy.memory.backfillSiblingProjects": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, opening a file in one Gradle subproject automatically resolves classpaths for all sibling subprojects in the background. This improves cross-project navigation but increases memory usage. When false (default), each project's classpath is resolved on demand when you first open a file in it."
         }
       }
     }

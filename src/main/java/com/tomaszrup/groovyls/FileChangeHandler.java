@@ -39,6 +39,8 @@ import org.eclipse.lsp4j.DidChangeWatchedFilesParams;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.tomaszrup.groovyls.util.MdcProjectContext;
+
 /**
  * Handles file-system change events (didChangeWatchedFiles) and coordinates
  * debounced Java/build-file recompilation across project scopes.
@@ -188,6 +190,7 @@ public class FileChangeHandler {
 						.collect(Collectors.toSet());
 			}
 			if (!scopeUris.isEmpty()) {
+				MdcProjectContext.setProject(scope.getProjectRoot());
 				scope.getLock().writeLock().lock();
 				try {
 					scope.getCompilationUnitFactory().invalidateFileCache();
@@ -248,6 +251,7 @@ public class FileChangeHandler {
 		if (prev != null) {
 			prev.cancel(false);
 		}
+		MdcProjectContext.setProject(projectRoot);
 		logger.info("Scheduling debounced Java recompile for {} ({}ms delay)",
 				projectRoot, JAVA_RECOMPILE_DEBOUNCE_MS);
 		pendingJavaRecompiles.put(projectRoot, javaRecompileExecutor.schedule(() -> {
@@ -266,6 +270,7 @@ public class FileChangeHandler {
 	 * Executes the full Java recompile flow for a project.
 	 */
 	private void executeJavaRecompile(Path projectRoot) {
+		MdcProjectContext.setProject(projectRoot);
 		logger.info("Java/build files changed in {}, triggering recompile", projectRoot);
 		if (javaChangeListener != null) {
 			javaChangeListener.onJavaFilesChanged(projectRoot);

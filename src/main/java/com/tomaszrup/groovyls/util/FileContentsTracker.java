@@ -143,9 +143,35 @@ public class FileContentsTracker {
 
 	public void didOpen(DidOpenTextDocumentParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
-		openFiles.put(uri, params.getTextDocument().getText());
+		String newText = params.getTextDocument().getText();
+
+		// Determine previously known content before updating openFiles.
+		// Only mark as "changed" when the content actually differs — opening
+		// an unmodified file should NOT trigger an incremental recompile.
+		boolean contentChanged = true;
+		String previousContent = openFiles.get(uri);
+		if (previousContent == null) {
+			CachedContent cached = closedFileCache.get(uri);
+			if (cached != null) {
+				previousContent = cached.content;
+			} else {
+				try {
+					previousContent = Files.readString(Paths.get(uri));
+				} catch (Exception e) {
+					// Unable to read from disk (new file, non-file URI, etc.)
+					// — treat as changed so it gets compiled.
+				}
+			}
+		}
+		if (previousContent != null && previousContent.equals(newText)) {
+			contentChanged = false;
+		}
+
+		openFiles.put(uri, newText);
 		closedFileCache.remove(uri);
-		changedFiles.add(uri);
+		if (contentChanged) {
+			changedFiles.add(uri);
+		}
 		lastOpenedURI.set(uri);
 	}
 
@@ -273,5 +299,25 @@ public class FileContentsTracker {
 	 */
 	public void invalidateAllClosedFileCache() {
 		closedFileCache.clear();
+	}
+
+	/**
+	 * Remove expired entries from the closed-file cache. This actively
+	 * cleans up entries that have outlived their TTL, rather than waiting
+	 * for the next {@link #getContents(URI)} call to lazily evict them.
+	 *
+	 * @return the number of expired entries removed
+	 */
+	public int sweepExpiredClosedFileCache() {
+		int removed = 0;
+		var iterator = closedFileCache.entrySet().iterator();
+		while (iterator.hasNext()) {
+			var entry = iterator.next();
+			if (entry.getValue().isExpired()) {
+				iterator.remove();
+				removed++;
+			}
+		}
+		return removed;
 	}
 }

@@ -19,13 +19,23 @@
 ////////////////////////////////////////////////////////////////////////////////
 package com.tomaszrup.groovyls;
 
+import java.util.Collection;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import com.tomaszrup.groovyls.util.MdcProjectContext;
 
 /**
  * Centralized thread pool management for the Groovy Language Server.
@@ -80,26 +90,42 @@ public class ExecutorPools {
      */
     private final ExecutorService backgroundCompilationPool;
 
+    /**
+     * Global semaphore that caps the total number of concurrent compilations
+     * across ALL thread pools (import pool, background pool, LSP threads).
+     * This prevents memory spikes when many projects resolve their classpaths
+     * simultaneously and each triggers compilation on the import pool thread.
+     */
+    private final Semaphore compilationPermits;
+
     public ExecutorPools() {
-        this.schedulingPool = Executors.newScheduledThreadPool(2, r -> {
+        ScheduledExecutorService rawSchedulingPool = Executors.newScheduledThreadPool(2, r -> {
             Thread t = new Thread(r, "groovyls-scheduler");
             t.setDaemon(true);
             return t;
         });
+        this.schedulingPool = new MdcScheduledExecutorService(rawSchedulingPool);
 
-        this.importPool = Executors.newFixedThreadPool(
+        ExecutorService rawImportPool = Executors.newFixedThreadPool(
                 Math.max(2, Runtime.getRuntime().availableProcessors()), r -> {
                     Thread t = new Thread(r, "groovyls-import");
                     t.setDaemon(true);
                     return t;
                 });
+        this.importPool = new MdcExecutorService(rawImportPool);
 
         int bgCompileThreads = Math.min(2, Runtime.getRuntime().availableProcessors());
-        this.backgroundCompilationPool = Executors.newFixedThreadPool(bgCompileThreads, r -> {
+        ExecutorService rawBgPool = Executors.newFixedThreadPool(bgCompileThreads, r -> {
             Thread t = new Thread(r, "groovyls-bg-compile");
             t.setDaemon(true);
             return t;
         });
+        this.backgroundCompilationPool = new MdcExecutorService(rawBgPool);
+
+        // Allow at most 2 concurrent compilations regardless of which pool
+        // they originate from.  This bounds peak memory consumption for
+        // large workspaces with many subprojects.
+        this.compilationPermits = new Semaphore(Math.min(2, Runtime.getRuntime().availableProcessors()));
     }
 
     /** Scheduled executor for debounce timers and delayed task scheduling. */
@@ -118,6 +144,15 @@ public class ExecutorPools {
     }
 
     /**
+     * Global semaphore limiting concurrent compilations across all pools.
+     * Callers should {@code acquire()} before starting compilation work
+     * and {@code release()} in a {@code finally} block afterwards.
+     */
+    public Semaphore getCompilationPermits() {
+        return compilationPermits;
+    }
+
+    /**
      * Shut down all pools. Attempts graceful shutdown first, then forces
      * termination after 5 seconds.
      */
@@ -132,6 +167,135 @@ public class ExecutorPools {
             backgroundCompilationPool.awaitTermination(5, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // MDC-propagating executor wrappers
+    // -----------------------------------------------------------------------
+
+    /**
+     * Wraps an {@link ExecutorService} so that every submitted task
+     * automatically inherits the caller thread's SLF4J MDC context.
+     */
+    private static class MdcExecutorService implements ExecutorService {
+        protected final ExecutorService delegate;
+
+        MdcExecutorService(ExecutorService delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override public void execute(Runnable command) {
+            delegate.execute(MdcProjectContext.wrap(command));
+        }
+
+        @Override public Future<?> submit(Runnable task) {
+            return delegate.submit(MdcProjectContext.wrap(task));
+        }
+
+        @Override public <T> Future<T> submit(Runnable task, T result) {
+            return delegate.submit(MdcProjectContext.wrap(task), result);
+        }
+
+        @Override public <T> Future<T> submit(Callable<T> task) {
+            return delegate.submit(wrapCallable(task));
+        }
+
+        @Override public <T> List<Future<T>> invokeAll(Collection<? extends Callable<T>> tasks)
+                throws InterruptedException {
+            return delegate.invokeAll(wrapCallables(tasks));
+        }
+
+        @Override public <T> List<Future<T>> invokeAll(Collection<? extends Callable<T>> tasks,
+                long timeout, TimeUnit unit) throws InterruptedException {
+            return delegate.invokeAll(wrapCallables(tasks), timeout, unit);
+        }
+
+        @Override public <T> T invokeAny(Collection<? extends Callable<T>> tasks)
+                throws InterruptedException, ExecutionException {
+            return delegate.invokeAny(wrapCallables(tasks));
+        }
+
+        @Override public <T> T invokeAny(Collection<? extends Callable<T>> tasks,
+                long timeout, TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException {
+            return delegate.invokeAny(wrapCallables(tasks), timeout, unit);
+        }
+
+        @Override public void shutdown() { delegate.shutdown(); }
+        @Override public List<Runnable> shutdownNow() { return delegate.shutdownNow(); }
+        @Override public boolean isShutdown() { return delegate.isShutdown(); }
+        @Override public boolean isTerminated() { return delegate.isTerminated(); }
+        @Override public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
+            return delegate.awaitTermination(timeout, unit);
+        }
+
+        private static <T> Callable<T> wrapCallable(Callable<T> task) {
+            java.util.Map<String, String> ctx = MdcProjectContext.snapshot();
+            return () -> {
+                java.util.Map<String, String> prev = MdcProjectContext.snapshot();
+                MdcProjectContext.restore(ctx);
+                try {
+                    return task.call();
+                } finally {
+                    MdcProjectContext.restore(prev);
+                }
+            };
+        }
+
+        private static <T> Collection<Callable<T>> wrapCallables(Collection<? extends Callable<T>> tasks) {
+            List<Callable<T>> wrapped = new java.util.ArrayList<>(tasks.size());
+            for (Callable<T> task : tasks) {
+                wrapped.add(wrapCallable(task));
+            }
+            return wrapped;
+        }
+    }
+
+    /**
+     * Wraps a {@link ScheduledExecutorService} so that every scheduled task
+     * automatically inherits the caller thread's SLF4J MDC context.
+     */
+    private static class MdcScheduledExecutorService extends MdcExecutorService
+            implements ScheduledExecutorService {
+        private final ScheduledExecutorService scheduledDelegate;
+
+        MdcScheduledExecutorService(ScheduledExecutorService delegate) {
+            super(delegate);
+            this.scheduledDelegate = delegate;
+        }
+
+        @Override
+        public ScheduledFuture<?> schedule(Runnable command, long delay, TimeUnit unit) {
+            return scheduledDelegate.schedule(MdcProjectContext.wrap(command), delay, unit);
+        }
+
+        @Override
+        public <V> ScheduledFuture<V> schedule(Callable<V> callable, long delay, TimeUnit unit) {
+            java.util.Map<String, String> ctx = MdcProjectContext.snapshot();
+            Callable<V> wrapped = () -> {
+                java.util.Map<String, String> prev = MdcProjectContext.snapshot();
+                MdcProjectContext.restore(ctx);
+                try {
+                    return callable.call();
+                } finally {
+                    MdcProjectContext.restore(prev);
+                }
+            };
+            return scheduledDelegate.schedule(wrapped, delay, unit);
+        }
+
+        @Override
+        public ScheduledFuture<?> scheduleAtFixedRate(Runnable command, long initialDelay,
+                long period, TimeUnit unit) {
+            return scheduledDelegate.scheduleAtFixedRate(
+                    MdcProjectContext.wrap(command), initialDelay, period, unit);
+        }
+
+        @Override
+        public ScheduledFuture<?> scheduleWithFixedDelay(Runnable command, long initialDelay,
+                long delay, TimeUnit unit) {
+            return scheduledDelegate.scheduleWithFixedDelay(
+                    MdcProjectContext.wrap(command), initialDelay, delay, unit);
         }
     }
 }

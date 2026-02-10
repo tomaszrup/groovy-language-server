@@ -69,6 +69,7 @@ import com.tomaszrup.groovyls.providers.SpockCompletionProvider;
 import com.tomaszrup.groovyls.providers.TypeDefinitionProvider;
 import com.tomaszrup.groovyls.providers.WorkspaceSymbolProvider;
 import com.tomaszrup.groovyls.util.FileContentsTracker;
+import com.tomaszrup.groovyls.util.MdcProjectContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -144,6 +145,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		this.backgroundCompiler = executorPools.getBackgroundCompilationPool();
 		this.scopeManager = new ProjectScopeManager(factory, fileContentsTracker);
 		this.compilationService = new CompilationService(fileContentsTracker);
+		this.compilationService.setCompilationPermits(executorPools.getCompilationPermits());
 		this.fileChangeHandler = new FileChangeHandler(scopeManager, compilationService, schedulingPool);
 		this.documentResolverService = new DocumentResolverService(scopeManager);
 	}
@@ -173,10 +175,20 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		if (pending != null) {
 			pending.cancel(false);
 		}
+
+		// Dispose all project scopes to release classloaders, shared caches, etc.
+		for (ProjectScope scope : scopeManager.getProjectScopes()) {
+			try {
+				scope.dispose();
+			} catch (Exception e) {
+				logger.debug("Error disposing scope {}: {}", scope.getProjectRoot(), e.getMessage());
+			}
+		}
 	}
 
 	public void setWorkspaceRoot(Path workspaceRoot) {
 		scopeManager.setWorkspaceRoot(workspaceRoot);
+		MdcProjectContext.setWorkspaceRoot(workspaceRoot);
 	}
 
 	public Path getWorkspaceRoot() {
@@ -292,6 +304,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 				// Active scope is submitted first.
 				if (activeScope != null && scopeToResolvedURI.containsKey(activeScope)) {
 					ProjectScope first = activeScope;
+					MdcProjectContext.setProject(first.getProjectRoot());
 					backgroundCompiler.submit(() -> {
 						if (Thread.currentThread().isInterrupted()) return;
 						first.getLock().writeLock().lock();
@@ -311,6 +324,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 					if (scope == activeScope) {
 						continue; // already submitted above
 					}
+					MdcProjectContext.setProject(scope.getProjectRoot());
 					backgroundCompiler.submit(() -> {
 						if (Thread.currentThread().isInterrupted()) return;
 						scope.getLock().writeLock().lock();
@@ -324,6 +338,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 						}
 					});
 				}
+				MdcProjectContext.clear();
 			}
 
 			// For open files in scopes whose classpath has NOT been resolved
@@ -416,8 +431,12 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	public void didOpen(DidOpenTextDocumentParams params) {
 		fileContentsTracker.didOpen(params);
 		URI uri = URI.create(params.getTextDocument().getUri());
+		ProjectScope scope = scopeManager.findProjectScope(uri);
+		if (scope != null) {
+			MdcProjectContext.setProject(scope.getProjectRoot());
+		}
 		try {
-			doDidOpen(uri);
+			doDidOpen(uri, scope);
 		} catch (LinkageError e) {
 			// NoClassDefFoundError or similar — a project class could not be
 			// loaded during compilation.  Catch here so the error does NOT
@@ -426,15 +445,18 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			// cause the EPIPE seen by the VS Code client.
 			logger.warn("Classpath linkage error during didOpen for {}: {}", uri, e.toString());
 			logger.debug("didOpen LinkageError details", e);
+		} catch (VirtualMachineError e) {
+			logger.error("VirtualMachineError during didOpen for {}: {}", uri, e.toString());
+			// Swallow to keep the LSP connection alive
 		} catch (Exception e) {
 			logger.warn("Unexpected exception during didOpen for {}: {}", uri, e.getMessage());
 			logger.debug("didOpen exception details", e);
+		} finally {
+			MdcProjectContext.clear();
 		}
 	}
 
-	private void doDidOpen(URI uri) {
-		ProjectScope scope = scopeManager.findProjectScope(uri);
-
+	private void doDidOpen(URI uri, ProjectScope scope) {
 		if (scope != null && !scopeManager.isImportPendingFor(scope)) {
 			if (!scope.isClasspathResolved() && resolutionCoordinator != null) {
 				// Classpath not yet resolved — fire a quick syntax-only check
@@ -466,6 +488,14 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	public void didChange(DidChangeTextDocumentParams params) {
 		fileContentsTracker.didChange(params);
 
+		// Set MDC for the current thread so that the MDC-propagating
+		// scheduled executor captures the project context.
+		URI changeUri = URI.create(params.getTextDocument().getUri());
+		ProjectScope changeScope = scopeManager.findProjectScope(changeUri);
+		if (changeScope != null) {
+			MdcProjectContext.setProject(changeScope.getProjectRoot());
+		}
+
 		// Atomically cancel-and-reschedule to prevent the TOCTOU race where
 		// two concurrent didChange calls could both cancel the same future
 		// and both schedule new ones, causing redundant compilation.
@@ -493,6 +523,9 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			} catch (LinkageError e) {
 				logger.warn("Classpath linkage error during didChange: {}", e.toString());
 				logger.debug("didChange LinkageError details", e);
+			} catch (VirtualMachineError e) {
+				logger.error("VirtualMachineError during didChange: {}", e.toString());
+				// Swallow to keep the LSP connection alive
 			} catch (Exception e) {
 				logger.warn("Unexpected exception during didChange: {}", e.getMessage());
 				logger.debug("didChange exception details", e);
@@ -502,6 +535,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		if (prev != null) {
 			prev.cancel(false);
 		}
+		MdcProjectContext.clear();
 	}
 
 	@Override

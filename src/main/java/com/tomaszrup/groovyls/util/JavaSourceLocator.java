@@ -34,6 +34,7 @@ import java.util.Collections;
 import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -116,16 +117,57 @@ public class JavaSourceLocator {
     private final Set<Path> indexedSourceJars = new HashSet<>();
 
     /**
+     * Maximum number of entries in the decompiled content LRU cache.
+     * Each entry is a list of source lines (~1-10 KB).  With 256 entries
+     * the cache uses at most ~2.5 MB per scope instead of growing unbounded.
+     */
+    private static final int DECOMPILED_CACHE_MAX_ENTRIES = 256;
+
+    /**
      * Cache of decompiled class content, keyed by FQCN. Populated lazily
      * when a class has no source file or source JAR available.
+     * Uses a bounded LRU eviction policy to prevent unbounded memory growth
+     * in workspaces with many dependency classes.
      */
-    private final Map<String, List<String>> decompiledContentCache = new HashMap<>();
+    @SuppressWarnings("serial")
+    private final Map<String, List<String>> decompiledContentCache =
+            new LinkedHashMap<>(64, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, List<String>> eldest) {
+                    return size() > DECOMPILED_CACHE_MAX_ENTRIES;
+                }
+            };
 
-    /** Cache of FQCN → class-file URI (jar: or jrt: scheme). */
-    private final Map<String, URI> classFileURICache = new HashMap<>();
+    /**
+     * Maximum number of entries in the class-file URI and reverse-lookup
+     * caches.  These caches grow as classes are navigated to; bounding them
+     * prevents unbounded memory growth in workspaces with many dependency
+     * classes.
+     */
+    private static final int CLASS_FILE_CACHE_MAX_ENTRIES = 2000;
 
-    /** Reverse lookup: URI string → FQCN for serving decompiled content by URI. */
-    private final Map<String, String> uriToClassName = new HashMap<>();
+    /** Cache of FQCN → class-file URI (jar: or jrt: scheme). Bounded LRU. */
+    @SuppressWarnings("serial")
+    private final Map<String, URI> classFileURICache =
+            new LinkedHashMap<>(64, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, URI> eldest) {
+                    return size() > CLASS_FILE_CACHE_MAX_ENTRIES;
+                }
+            };
+
+    /** Reverse lookup: URI string → FQCN for serving decompiled content by URI. Bounded LRU. */
+    @SuppressWarnings("serial")
+    private final Map<String, String> uriToClassName =
+            new LinkedHashMap<>(64, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
+                    return size() > CLASS_FILE_CACHE_MAX_ENTRIES;
+                }
+            };
+
+    /** Shared source JAR index entry (may be null if not using shared indexing). */
+    private volatile SharedSourceJarIndex.IndexEntry sharedIndexEntry;
 
     /** The classloader used by the Groovy compiler, for locating .class files. */
     private volatile ClassLoader compilationClassLoader;
@@ -144,6 +186,21 @@ public class JavaSourceLocator {
     }
 
     public JavaSourceLocator() {
+    }
+
+    /**
+     * Release shared resources held by this locator. Call on scope disposal
+     * to decrement the shared source-JAR index ref count.
+     */
+    public void dispose() {
+        SharedSourceJarIndex.IndexEntry entry = sharedIndexEntry;
+        if (entry != null) {
+            SharedSourceJarIndex.getInstance().release(entry);
+            sharedIndexEntry = null;
+        }
+        decompiledContentCache.clear();
+        classFileURICache.clear();
+        uriToClassName.clear();
     }
 
     /**
@@ -208,37 +265,36 @@ public class JavaSourceLocator {
         }
 
         classpathEntries.addAll(classpathJars);
-        Map<String, SourceJarEntry> snapshot = new HashMap<>(classNameToSourceJar);
-        int indexed = 0;
-        for (String entry : classpathJars) {
-            Path sourceJar = findSourceJar(entry);
-            if (sourceJar != null && !indexedSourceJars.contains(sourceJar)) {
-                indexedSourceJars.add(sourceJar);
-                indexSourceJar(sourceJar, snapshot);
-                indexed++;
+
+        // Use the shared source-JAR index to avoid per-scope duplication.
+        // Release any previously held entry before acquiring a new one.
+        SharedSourceJarIndex sharedIndex = SharedSourceJarIndex.getInstance();
+        SharedSourceJarIndex.IndexEntry oldEntry = sharedIndexEntry;
+        SharedSourceJarIndex.IndexEntry newEntry = sharedIndex.acquire(new ArrayList<>(classpathEntries));
+        sharedIndexEntry = newEntry;
+        if (oldEntry != null) {
+            sharedIndex.release(oldEntry);
+        }
+
+        // Update classNameToSourceJar to point to the shared map
+        classNameToSourceJar = newEntry.getClassNameToSourceJar();
+
+        logger.info("Using shared source JAR index: {} dependency classes",
+                classNameToSourceJar.size());
+
+        // Evict stale decompiled stubs from the cache for classes that
+        // now have real source available.
+        int evicted = 0;
+        for (String className : classNameToSourceJar.keySet()) {
+            List<String> cached = decompiledContentCache.get(className);
+            if (cached != null && isDecompiledStub(cached)) {
+                decompiledContentCache.remove(className);
+                evicted++;
             }
         }
-        if (indexed > 0) {
-            classNameToSourceJar = Collections.unmodifiableMap(snapshot);
-            logger.info("Indexed {} source JARs, {} classes from dependencies",
-                    indexed, snapshot.size());
-
-            // Evict stale decompiled stubs from the cache for classes that
-            // now have real source available.  This prevents stubs cached
-            // before lazy classpath resolution from permanently shadowing
-            // real source JAR content.
-            int evicted = 0;
-            for (String className : snapshot.keySet()) {
-                List<String> cached = decompiledContentCache.get(className);
-                if (cached != null && isDecompiledStub(cached)) {
-                    decompiledContentCache.remove(className);
-                    evicted++;
-                }
-            }
-            if (evicted > 0) {
-                logger.info("Evicted {} stale decompiled stubs now covered by source JARs",
-                        evicted);
-            }
+        if (evicted > 0) {
+            logger.info("Evicted {} stale decompiled stubs now covered by source JARs",
+                    evicted);
         }
     }
 
@@ -342,6 +398,29 @@ public class JavaSourceLocator {
                         if (!classNameToSource.containsKey(fqcn)) {
                             target.putIfAbsent(fqcn, new SourceJarEntry(sourceJar, name));
                         }
+                    }
+                }
+            }
+        } catch (IOException e) {
+            logger.warn("Failed to index source JAR {}: {}", sourceJar, e.getMessage());
+        }
+    }
+
+    /**
+     * Static variant of {@link #indexSourceJar} used by
+     * {@link SharedSourceJarIndex} to build the shared index without
+     * needing an instance (no project-source precedence check).
+     */
+    static void indexSourceJarStatic(Path sourceJar, Map<String, SourceJarEntry> target) {
+        try (JarFile jar = new JarFile(sourceJar.toFile())) {
+            Enumeration<JarEntry> entries = jar.entries();
+            while (entries.hasMoreElements()) {
+                JarEntry entry = entries.nextElement();
+                String name = entry.getName();
+                if ((name.endsWith(".java") || name.endsWith(".groovy")) && !entry.isDirectory()) {
+                    String fqcn = jarEntryToClassName(name);
+                    if (fqcn != null) {
+                        target.putIfAbsent(fqcn, new SourceJarEntry(sourceJar, name));
                     }
                 }
             }

@@ -193,6 +193,9 @@ public class CompilationOrchestrator {
 			logger.warn("Classpath linkage error during AST visit "
 					+ "(a dependency may be missing or incompatible): {}", e.toString());
 			logger.debug("AST visit LinkageError details", e);
+		} catch (VirtualMachineError e) {
+			logger.error("VirtualMachineError during AST visit — returning partial visitor: {}", e.toString());
+			// Return the partial visitor so callers can still use whatever was visited
 		}
 		return astVisitor;
 	}
@@ -226,6 +229,8 @@ public class CompilationOrchestrator {
 		} catch (LinkageError e) {
 			logger.warn("Classpath linkage error during incremental AST visit: {}", e.toString());
 			logger.debug("Incremental AST visit LinkageError details", e);
+		} catch (VirtualMachineError e) {
+			logger.error("VirtualMachineError during incremental AST visit: {}", e.toString());
 		}
 		return newVisitor;
 	}
@@ -265,6 +270,10 @@ public class CompilationOrchestrator {
 					+ "(a dependency may be missing or incompatible): {}",
 					projectRoot, e.toString());
 			logger.debug("LinkageError details", e);
+		} catch (VirtualMachineError e) {
+			logger.error("VirtualMachineError during compilation for scope {}: {}",
+					projectRoot, e.toString());
+			throw e; // re-throw so callers (CompilationService) can handle
 		}
 		return compilationUnit.getErrorCollector();
 	}
@@ -304,6 +313,10 @@ public class CompilationOrchestrator {
 					+ "(a dependency may be missing or incompatible): {}",
 					projectRoot, e.toString());
 			logger.debug("LinkageError details", e);
+		} catch (VirtualMachineError e) {
+			logger.error("VirtualMachineError during incremental compile for {}: {}",
+					projectRoot, e.toString());
+			throw e;
 		}
 		return incrementalUnit.getErrorCollector();
 	}

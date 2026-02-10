@@ -47,6 +47,46 @@ const SERVER_CRASHED_MESSAGE = "The Groovy language server has crashed.";
 const LABEL_RESTART_SERVER = "Restart Server";
 const LABEL_RELOAD_WINDOW = "Reload Window";
 const MAX_SERVER_RESTARTS = 5;
+
+/**
+ * Estimate appropriate JVM heap size by counting build files in the workspace.
+ * Each Gradle/Maven project scope consumes ~30-40 MB (classloader, AST,
+ * source locator, etc.), so we scale linearly from a base.
+ *
+ * When scope eviction is enabled (TTL > 0), only a few scopes are expected
+ * to be fully loaded at any time, so we use a smaller per-project estimate
+ * capped to a maximum number of active scopes.
+ */
+async function estimateHeapSize(): Promise<number> {
+  const MIN_HEAP = 512;
+  const MAX_HEAP = 4096;
+  const BASE_HEAP = 256;
+
+  const config = vscode.workspace.getConfiguration("groovy");
+  const evictionTTL = config.get<number>("memory.scopeEvictionTTL") ?? 300;
+  const evictionEnabled = evictionTTL > 0;
+
+  // When eviction is enabled, assume at most ~5 scopes are active at once
+  const MAX_ACTIVE_SCOPES = 5;
+  const PER_PROJECT_MB = evictionEnabled ? 16 : 32;
+
+  try {
+    const buildFiles = await vscode.workspace.findFiles(
+      "**/{build.gradle,build.gradle.kts,pom.xml}",
+      "**/{build,node_modules,.gradle}/**",
+      500
+    );
+    const projectCount = buildFiles.length;
+    const effectiveCount = evictionEnabled
+      ? Math.min(projectCount, MAX_ACTIVE_SCOPES)
+      : projectCount;
+    const computed = BASE_HEAP + effectiveCount * PER_PROJECT_MB;
+    return Math.max(MIN_HEAP, Math.min(MAX_HEAP, computed));
+  } catch {
+    return MIN_HEAP;
+  }
+}
+
 let extensionContext: vscode.ExtensionContext | null = null;
 let serverCrashCount = 0;
 /** True when the user (or code) intentionally stops the server. */
@@ -55,6 +95,10 @@ let languageClient: LanguageClient | null = null;
 let javaPath: string | null = null;
 let outputChannel: vscode.OutputChannel | null = null;
 let statusBarItem: vscode.StatusBarItem | null = null;
+/** Last known memory usage string from the server (e.g. "128/512 MB"). */
+let lastMemoryText: string | null = null;
+/** Current status bar state, used to re-render when memory updates arrive. */
+let currentStatusState: "starting" | "importing" | "ready" | "error" | "stopped" = "stopped";
 
 export function activate(context: vscode.ExtensionContext) {
   extensionContext = context;
@@ -104,6 +148,8 @@ function setStatusBar(
   if (!statusBarItem) {
     return;
   }
+  currentStatusState = state;
+  const memSuffix = getMemorySuffix();
   switch (state) {
     case "starting":
       statusBarItem.text = "$(sync~spin) Groovy: Starting…";
@@ -119,7 +165,7 @@ function setStatusBar(
       break;
     }
     case "ready":
-      statusBarItem.text = "$(check) Groovy";
+      statusBarItem.text = `$(check) Groovy${memSuffix}`;
       statusBarItem.tooltip =
         "Groovy Language Server: Ready (click to show output)";
       statusBarItem.show();
@@ -134,6 +180,18 @@ function setStatusBar(
       statusBarItem.hide();
       break;
   }
+}
+
+/**
+ * Returns a formatted memory suffix for the status bar (e.g. " [128/512 MB]")
+ * if the setting is enabled and memory data is available, otherwise "".
+ */
+function getMemorySuffix(): string {
+  const config = vscode.workspace.getConfiguration("groovy");
+  if (!config.get<boolean>("showMemoryUsage") || !lastMemoryText) {
+    return "";
+  }
+  return ` [${lastMemoryText}]`;
 }
 
 /**
@@ -154,13 +212,21 @@ function onDidChangeConfiguration(event: vscode.ConfigurationChangeEvent) {
     event.affectsConfiguration("groovy.java.home") ||
     event.affectsConfiguration("groovy.java.vmargs") ||
     event.affectsConfiguration("groovy.debug.serverPort") ||
+    event.affectsConfiguration("groovy.logLevel") ||
     event.affectsConfiguration("groovy.semanticHighlighting.enabled") ||
-    event.affectsConfiguration("groovy.formatting.enabled")
+    event.affectsConfiguration("groovy.formatting.enabled") ||
+    event.affectsConfiguration("groovy.memory.scopeEvictionTTL") ||
+    event.affectsConfiguration("groovy.memory.backfillSiblingProjects")
   ) {
     javaPath = findJava();
     //we're going to try to kill the language server and then restart
     //it with the new settings
     restartLanguageServer();
+  } else if (event.affectsConfiguration("groovy.showMemoryUsage")) {
+    // Toggling memory display doesn't need a restart — just re-render
+    if (currentStatusState === "ready") {
+      setStatusBar("ready");
+    }
   }
 }
 
@@ -202,10 +268,26 @@ function buildInitializationOptions(): Record<string, unknown> {
   const config = vscode.workspace.getConfiguration("groovy");
   const options: Record<string, unknown> = {};
 
+  // Log level
+  const logLevel = config.get<string>("logLevel");
+  if (logLevel) {
+    options.logLevel = logLevel;
+  }
+
   // Enabled importers (empty array means all enabled)
   const importers = config.get<string[]>("project.importers");
   if (importers && importers.length > 0) {
     options.enabledImporters = importers;
+  }
+
+  // Memory management settings
+  const scopeEvictionTTL = config.get<number>("memory.scopeEvictionTTL");
+  if (scopeEvictionTTL !== undefined) {
+    options.scopeEvictionTTLSeconds = scopeEvictionTTL;
+  }
+  const backfillSiblings = config.get<boolean>("memory.backfillSiblingProjects");
+  if (backfillSiblings !== undefined) {
+    options.backfillSiblingProjects = backfillSiblings;
   }
 
   return options;
@@ -270,14 +352,19 @@ function startLanguageServer() {
           ];
 
           // Apply user-configurable JVM arguments (e.g. -Xmx768m).
-          // Falls back to -Xmx512m so large workspaces don't OOM-kill
-          // the server process (which the client sees as an EPIPE).
+          // When not configured, dynamically size the heap based on the
+          // number of discovered build files so large multi-project
+          // workspaces don't OOM-kill the server process.
           const vmargs = config.get<string>("java.vmargs");
           if (vmargs) {
             const vmTokens = vmargs.match(/\S+/g) || [];
             args.unshift(...vmTokens);
           } else {
-            args.unshift("-Xmx512m");
+            const heapMb = await estimateHeapSize();
+            args.unshift(`-Xmx${heapMb}m`);
+            outputChannel?.appendLine(
+              `Auto-detected heap size: -Xmx${heapMb}m`
+            );
           }
 
           //uncomment to allow a debugger to attach to the language server
@@ -468,6 +555,15 @@ function startLanguageServer() {
             } else if (state === "error") {
               setStatusBar("error");
               resolve();
+            }
+          });
+
+          // Listen for periodic memory usage reports from the server
+          languageClient.onNotification("groovy/memoryUsage", (params: { usedMB: number; maxMB: number }) => {
+            lastMemoryText = `${params.usedMB}/${params.maxMB} MB`;
+            // Re-render the status bar if we're in "ready" state
+            if (currentStatusState === "ready") {
+              setStatusBar("ready");
             }
           });
         } catch (e) {

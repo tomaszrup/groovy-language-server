@@ -165,6 +165,12 @@ public class SharedClassGraphCache {
 		} catch (ClassGraphException e) {
 			logger.warn("ClassGraph scan failed: {}", e.getMessage());
 			return null;
+		} catch (VirtualMachineError e) {
+			logger.error("VirtualMachineError during ClassGraph scan ({} URLs): {}",
+					classLoader.getURLs().length, e.toString());
+			// Attempt to free memory before propagating
+			try { System.gc(); } catch (Throwable ignored) { }
+			return null;
 		}
 	}
 

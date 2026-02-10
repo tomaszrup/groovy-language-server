@@ -40,4 +40,12 @@ public interface GroovyLanguageClient extends LanguageClient {
      */
     @JsonNotification("groovy/statusUpdate")
     void statusUpdate(StatusUpdateParams params);
+
+    /**
+     * Periodically report the server's JVM memory usage to the client.
+     *
+     * @param params a JSON object with {@code usedMB} and {@code maxMB} fields
+     */
+    @JsonNotification("groovy/memoryUsage")
+    void memoryUsage(MemoryUsageParams params);
 }

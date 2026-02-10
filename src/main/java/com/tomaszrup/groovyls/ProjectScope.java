@@ -28,6 +28,8 @@ import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import org.eclipse.lsp4j.Diagnostic;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import groovy.lang.GroovyClassLoader;
 import io.github.classgraph.ScanResult;
@@ -46,6 +48,8 @@ import com.tomaszrup.groovyls.util.JavaSourceLocator;
  * accidental mutation from external classes.</p>
  */
 public class ProjectScope {
+	private static final Logger logger = LoggerFactory.getLogger(ProjectScope.class);
+
 	private final Path projectRoot;
 	private final ICompilationUnitFactory compilationUnitFactory;
 	private GroovyLSCompilationUnit compilationUnit;
@@ -94,6 +98,28 @@ public class ProjectScope {
 	 * are upgraded later via {@code updateProjectClasspaths}.
 	 */
 	private volatile boolean classpathResolved = false;
+
+	/**
+	 * Whether compilation of this scope failed with an unrecoverable error
+	 * (typically {@link OutOfMemoryError}). When set, the scope will not
+	 * be retried until the classpath changes (which calls
+	 * {@link #resetCompilationFailed()}).
+	 */
+	private volatile boolean compilationFailed = false;
+
+	/**
+	 * Whether this scope's heavy state (AST, classloader, compilation unit)
+	 * has been evicted to reduce memory usage. Evicted scopes are
+	 * transparently reactivated on the next access.
+	 */
+	private volatile boolean evicted = false;
+
+	/**
+	 * Timestamp (millis) of the last access to this scope. Updated on
+	 * every read/write lock acquisition. Used by the eviction scheduler
+	 * to identify inactive scopes.
+	 */
+	private volatile long lastAccessedAt = System.currentTimeMillis();
 
 	public ProjectScope(Path projectRoot, ICompilationUnitFactory factory) {
 		this.projectRoot = projectRoot;
@@ -190,6 +216,24 @@ public class ProjectScope {
 		this.classpathResolved = classpathResolved;
 	}
 
+	public boolean isCompilationFailed() {
+		return compilationFailed;
+	}
+
+	public void setCompilationFailed(boolean compilationFailed) {
+		this.compilationFailed = compilationFailed;
+	}
+
+	/**
+	 * Reset the compilation-failed flag so the scope can be retried,
+	 * e.g. after a classpath change or heap increase.  Also resets
+	 * the compiled flag so the next request triggers a fresh compilation.
+	 */
+	public void resetCompilationFailed() {
+		this.compilationFailed = false;
+		this.compiled = false;
+	}
+
 	/**
 	 * Lazily initialise the ClassGraph scan result for this scope.
 	 * The scan is expensive (2–10 s for large classpaths) but is only
@@ -229,9 +273,20 @@ public class ProjectScope {
 		if (cl == null) {
 			return null;
 		}
-		com.tomaszrup.groovyls.compiler.SharedClassGraphCache sharedCache =
-				com.tomaszrup.groovyls.compiler.SharedClassGraphCache.getInstance();
-		classGraphScanResult = sharedCache.acquire(cl);
+		try {
+			com.tomaszrup.groovyls.compiler.SharedClassGraphCache sharedCache =
+					com.tomaszrup.groovyls.compiler.SharedClassGraphCache.getInstance();
+			classGraphScanResult = sharedCache.acquire(cl);
+		} catch (VirtualMachineError e) {
+			// ClassGraph scan OOM — log and return null. Completion/code
+			// actions will degrade (no classpath type suggestions) but
+			// the server survives.
+			org.slf4j.LoggerFactory.getLogger(ProjectScope.class)
+					.error("ClassGraph scan failed with {}: {} — classpath type suggestions "
+							+ "will be unavailable for {}", e.getClass().getSimpleName(),
+							e.getMessage(), projectRoot);
+			classGraphScanResult = null;
+		}
 		return classGraphScanResult;
 	}
 
@@ -244,5 +299,116 @@ public class ProjectScope {
 		if (classpathEntries != null && !classpathEntries.isEmpty() && javaSourceLocator != null) {
 			javaSourceLocator.addClasspathJars(classpathEntries);
 		}
+	}
+
+	/**
+	 * Record an access to this scope, preventing TTL-based eviction.
+	 * Called automatically when the scope's lock is acquired.
+	 */
+	public void touchAccess() {
+		lastAccessedAt = System.currentTimeMillis();
+	}
+
+	public long getLastAccessedAt() {
+		return lastAccessedAt;
+	}
+
+	public boolean isEvicted() {
+		return evicted;
+	}
+
+	/**
+	 * Evict heavy state (AST, classloader, compilation unit, scan result)
+	 * from this scope to reduce memory usage. The scope shell (project root,
+	 * factory, dependency graph) is preserved so it can be reactivated.
+	 *
+	 * <p>Must be called under the write lock.</p>
+	 */
+	public void evictHeavyState() {
+		long usedBefore = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
+
+		// Release ClassGraph scan result
+		ScanResult sr = classGraphScanResult;
+		if (sr != null) {
+			com.tomaszrup.groovyls.compiler.SharedClassGraphCache.getInstance().release(sr);
+			classGraphScanResult = null;
+		}
+
+		// Close classloader
+		GroovyClassLoader cl = classLoader;
+		if (cl != null) {
+			try {
+				cl.close();
+			} catch (Exception e) {
+				// Best effort
+			}
+			classLoader = null;
+		}
+
+		// Clear AST data and compilation unit
+		astVisitor = null;
+		compilationUnit = null;
+		prevDiagnosticsByFile = null;
+
+		// Reset compilation state so next access triggers recompilation
+		compiled = false;
+		compilationFailed = false;
+		evicted = true;
+
+		// Suggest GC to reclaim freed objects
+		System.gc();
+		long usedAfter = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
+		long freedMB = (usedBefore - usedAfter) / (1024 * 1024);
+		logger.info("Evicted heavy state for scope {} (freed ~{}MB)", projectRoot, freedMB);
+	}
+
+	/**
+	 * Clear the evicted flag, allowing the scope to be used normally.
+	 * Called after the scope is reactivated by recompilation.
+	 */
+	public void clearEvicted() {
+		evicted = false;
+		touchAccess();
+	}
+
+	/**
+	 * Release all heavy resources held by this scope. Call on server
+	 * shutdown or scope removal.
+	 * <ul>
+	 *   <li>Releases the shared ClassGraph scan result ref</li>
+	 *   <li>Disposes the Java source locator (releases shared index ref)</li>
+	 *   <li>Closes the classloader</li>
+	 *   <li>Clears AST data</li>
+	 * </ul>
+	 */
+	public void dispose() {
+		// Release ClassGraph scan result
+		ScanResult sr = classGraphScanResult;
+		if (sr != null) {
+			com.tomaszrup.groovyls.compiler.SharedClassGraphCache.getInstance().release(sr);
+			classGraphScanResult = null;
+		}
+
+		// Dispose source locator (releases shared source-JAR index)
+		JavaSourceLocator locator = javaSourceLocator;
+		if (locator != null) {
+			locator.dispose();
+		}
+
+		// Close classloader
+		GroovyClassLoader cl = classLoader;
+		if (cl != null) {
+			try {
+				cl.close();
+			} catch (Exception e) {
+				// Best effort
+			}
+			classLoader = null;
+		}
+
+		// Clear AST data
+		astVisitor = null;
+		compilationUnit = null;
+		prevDiagnosticsByFile = null;
 	}
 }
