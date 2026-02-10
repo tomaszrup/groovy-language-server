@@ -408,6 +408,81 @@ public class GradleProjectImporter implements ProjectImporter {
     }
 
     /**
+     * Download source JARs for all dependencies of the given project in the
+     * background. This is a best-effort operation — failures are logged but
+     * do not affect classpath resolution or diagnostics. Separated from
+     * {@link #resolveAllClasspathsViaInitScript} to avoid blocking the
+     * critical path to first diagnostic.
+     *
+     * @param projectRoot the project root (its Gradle root will be resolved
+     *                    automatically)
+     */
+    public void downloadSourceJarsAsync(Path projectRoot) {
+        Path gradleRoot = findGradleRoot(projectRoot);
+        logger.info("Background source JAR download for Gradle root {}", gradleRoot);
+
+        GradleConnector connector = GradleConnector.newConnector()
+                .forProjectDirectory(gradleRoot.toFile());
+        Path initScript = null;
+        try (ProjectConnection connection = connector.connect()) {
+            initScript = Files.createTempFile("groovyls-sources-init", ".gradle");
+            String initScriptContent =
+                "allprojects {\n" +
+                "    tasks.register('_groovyLSDownloadSources') {\n" +
+                "        doLast {\n" +
+                "            def allCoords = new LinkedHashSet()\n" +
+                "            ['compileClasspath', 'runtimeClasspath', 'testCompileClasspath', 'testRuntimeClasspath'].each { configName ->\n" +
+                "                def config = configurations.findByName(configName)\n" +
+                "                if (config != null && config.canBeResolved) {\n" +
+                "                    try {\n" +
+                "                        config.resolvedConfiguration.resolvedArtifacts.each { artifact ->\n" +
+                "                            def id = artifact.moduleVersion.id\n" +
+                "                            allCoords.add(\"${id.group}:${id.name}:${id.version}\")\n" +
+                "                        }\n" +
+                "                    } catch (Exception e) { /* skip */ }\n" +
+                "                }\n" +
+                "            }\n" +
+                "            if (!allCoords.isEmpty()) {\n" +
+                "                try {\n" +
+                "                    def sourceDeps = []\n" +
+                "                    allCoords.each { coord ->\n" +
+                "                        def parts = coord.split(':')\n" +
+                "                        sourceDeps.add(project.dependencies.create(\n" +
+                "                            group: parts[0], name: parts[1], version: parts[2],\n" +
+                "                            classifier: 'sources', ext: 'jar'))\n" +
+                "                    }\n" +
+                "                    def sourcesConfig = project.configurations.detachedConfiguration(\n" +
+                "                        *sourceDeps)\n" +
+                "                    sourcesConfig.transitive = false\n" +
+                "                    sourcesConfig.resolvedConfiguration.lenientConfiguration.files\n" +
+                "                } catch (Exception ignored) { /* best-effort */ }\n" +
+                "            }\n" +
+                "        }\n" +
+                "    }\n" +
+                "}\n";
+            Files.write(initScript, initScriptContent.getBytes("UTF-8"));
+
+            connection.newBuild()
+                    .forTasks("_groovyLSDownloadSources")
+                    .withArguments("--init-script", initScript.toString())
+                    .setStandardOutput(newLogOutputStream())
+                    .setStandardError(newLogOutputStream())
+                    .run();
+
+            logger.info("Background source JAR download completed for {}", gradleRoot);
+        } catch (Exception e) {
+            logger.warn("Background source JAR download failed for {}: {}", gradleRoot, e.getMessage());
+        } finally {
+            if (initScript != null) {
+                try {
+                    Files.deleteIfExists(initScript);
+                } catch (IOException ignored) {
+                }
+            }
+        }
+    }
+
+    /**
      * Resolve classpaths for ALL subprojects in one init-script invocation.
      * The output is tagged with the project directory so we can attribute
      * each classpath entry to the correct subproject.
@@ -425,7 +500,6 @@ public class GradleProjectImporter implements ProjectImporter {
                 "allprojects {\n" +
                 "    tasks.register('_groovyLSResolveClasspath') {\n" +
                 "        doLast {\n" +
-                "            def allCoords = new LinkedHashSet()\n" +
                 "            ['compileClasspath', 'runtimeClasspath', 'testCompileClasspath', 'testRuntimeClasspath'].each { configName ->\n" +
                 "                def config = configurations.findByName(configName)\n" +
                 "                if (config != null && config.canBeResolved) {\n" +
@@ -436,32 +510,6 @@ public class GradleProjectImporter implements ProjectImporter {
                 "                    } catch (Exception e) {\n" +
                 "                        // skip unresolvable configurations\n" +
                 "                    }\n" +
-                "                    try {\n" +
-                "                        config.resolvedConfiguration.resolvedArtifacts.each { artifact ->\n" +
-                "                            def id = artifact.moduleVersion.id\n" +
-                "                            allCoords.add(\"${id.group}:${id.name}:${id.version}\")\n" +
-                "                        }\n" +
-                "                    } catch (Exception e) {\n" +
-                "                        // skip\n" +
-                "                    }\n" +
-                "                }\n" +
-                "            }\n" +
-                "            // Download source JARs so Go-to-Definition shows real source\n" +
-                "            if (!allCoords.isEmpty()) {\n" +
-                "                try {\n" +
-                "                    def sourceDeps = []\n" +
-                "                    allCoords.each { coord ->\n" +
-                "                        def parts = coord.split(':')\n" +
-                "                        sourceDeps.add(project.dependencies.create(\n" +
-                "                            group: parts[0], name: parts[1], version: parts[2],\n" +
-                "                            classifier: 'sources', ext: 'jar'))\n" +
-                "                    }\n" +
-                "                    def sourcesConfig = project.configurations.detachedConfiguration(\n" +
-                "                        *sourceDeps)\n" +
-                "                    sourcesConfig.transitive = false\n" +
-                "                    sourcesConfig.resolvedConfiguration.lenientConfiguration.files\n" +
-                "                } catch (Exception ignored) {\n" +
-                "                    // Source JAR download is best-effort\n" +
                 "                }\n" +
                 "            }\n" +
                 "        }\n" +

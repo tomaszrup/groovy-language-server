@@ -417,22 +417,30 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		fileContentsTracker.didOpen(params);
 		URI uri = URI.create(params.getTextDocument().getUri());
 		ProjectScope scope = scopeManager.findProjectScope(uri);
+
 		if (scope != null && !scopeManager.isImportPendingFor(scope)) {
 			if (!scope.isClasspathResolved() && resolutionCoordinator != null) {
-				// Trigger lazy classpath resolution for this project.
-				// The coordinator will resolve, apply, compile, and backfill.
-				resolutionCoordinator.requestResolution(scope, uri);
-				// Meanwhile, provide basic syntax checking
+				// Classpath not yet resolved — fire a quick syntax-only check
+				// so the user sees parse errors immediately, then trigger lazy
+				// classpath resolution (which will compile fully once resolved).
 				backgroundCompiler.submit(() -> compilationService.syntaxCheckSingleFile(uri));
+				resolutionCoordinator.requestResolution(scope, uri);
 			} else {
+				// Classpath is resolved. Run staged compilation:
+				// Phase A (single-file) runs synchronously so that diagnostics
+				// (including unused-import hints) are published before didOpen
+				// returns. Phase B (full project) is submitted to the
+				// backgroundCompiler internally by ensureScopeCompiled.
 				scope.getLock().writeLock().lock();
 				try {
-					compilationService.ensureScopeCompiled(scope);
+					compilationService.ensureScopeCompiled(scope, uri, backgroundCompiler);
 				} finally {
 					scope.getLock().writeLock().unlock();
 				}
 			}
-		} else if (scopeManager.isImportPendingFor(scope != null ? scope : scopeManager.getDefaultScope())) {
+		} else {
+			// No matching scope or import is pending — submit a syntax-only
+			// check so the user still gets parse-error feedback.
 			backgroundCompiler.submit(() -> compilationService.syntaxCheckSingleFile(uri));
 		}
 	}
@@ -613,7 +621,8 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 
 			// Capture snapshot references before releasing the lock
 			visitor = scope.getAstVisitor();
-			scanResult = scope.getClassGraphScanResult();
+			// Lazily trigger ClassGraph scan on first completion request
+			scanResult = scope.ensureClassGraphScannedUnsafe();
 
 			if (originalSource != null) {
 				compilationService.restoreDocumentSource(scope, uri, originalSource);
@@ -856,7 +865,8 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		URI uri = URI.create(params.getTextDocument().getUri());
 		ProjectScope scope = compilationService.ensureCompiledForContext(uri, scopeManager, backgroundCompiler);
 		ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
-		ScanResult scanResult = scope != null ? scope.getClassGraphScanResult() : null;
+		// Lazily trigger ClassGraph scan on first code action request
+		ScanResult scanResult = scope != null ? scope.ensureClassGraphScanned() : null;
 		if (visitor == null) {
 			return CompletableFuture.completedFuture(Collections.emptyList());
 		}
@@ -896,7 +906,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			return CompletableFuture.completedFuture(new SemanticTokens(Collections.emptyList()));
 		}
 		URI uri = URI.create(params.getTextDocument().getUri());
-		ProjectScope scope = scopeManager.findProjectScope(uri);
+		ProjectScope scope = compilationService.ensureCompiledForContext(uri, scopeManager, backgroundCompiler);
 		ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
 		if (visitor == null) {
 			return CompletableFuture.completedFuture(new SemanticTokens(Collections.emptyList()));
@@ -912,7 +922,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			return CompletableFuture.completedFuture(new SemanticTokens(Collections.emptyList()));
 		}
 		URI uri = URI.create(params.getTextDocument().getUri());
-		ProjectScope scope = scopeManager.findProjectScope(uri);
+		ProjectScope scope = compilationService.ensureCompiledForContext(uri, scopeManager, backgroundCompiler);
 		ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
 		if (visitor == null) {
 			return CompletableFuture.completedFuture(new SemanticTokens(Collections.emptyList()));

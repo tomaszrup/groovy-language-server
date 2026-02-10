@@ -180,6 +180,19 @@ public class ClasspathResolutionCoordinator {
 
         // Schedule backfill for sibling subprojects
         scheduleBackfill(importer, projectRoot);
+
+        // Schedule low-priority background source JAR download so that
+        // Go-to-Definition can show real source.  This is NOT on the
+        // critical path to first diagnostic.
+        if (importer instanceof GradleProjectImporter) {
+            importPool.submit(() -> {
+                try {
+                    ((GradleProjectImporter) importer).downloadSourceJarsAsync(projectRoot);
+                } catch (Exception e) {
+                    logger.debug("Background source JAR download failed: {}", e.getMessage());
+                }
+            });
+        }
     }
 
     /**

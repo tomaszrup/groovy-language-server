@@ -109,7 +109,8 @@ public class CompilationService {
 		GroovyLSCompilationUnit[] cuHolder = { scope.getCompilationUnit() };
 		ASTNodeVisitor[] avHolder = { scope.getAstVisitor() };
 		ScanResult[] srHolder = { scope.getClassGraphScanResult() };
-		GroovyClassLoader[] clHolder = { scope.getClassLoader() };
+		GroovyClassLoader oldClassLoader = scope.getClassLoader();
+		GroovyClassLoader[] clHolder = { oldClassLoader };
 
 		boolean result = compilationOrchestrator.createOrUpdateCompilationUnit(
 				cuHolder, avHolder, scope.getProjectRoot(),
@@ -117,8 +118,22 @@ public class CompilationService {
 				srHolder, clHolder, additionalInvalidations);
 
 		scope.setCompilationUnit(cuHolder[0]);
-		scope.setClassGraphScanResult(srHolder[0]);
 		scope.setClassLoader(clHolder[0]);
+
+		// If the classloader changed, the lazily-acquired ClassGraph scan
+		// result is stale — release it so the next ensureClassGraphScanned()
+		// call acquires a fresh one for the new classpath.
+		if (clHolder[0] != oldClassLoader) {
+			ScanResult oldScan = scope.getClassGraphScanResult();
+			if (oldScan != null) {
+				com.tomaszrup.groovyls.compiler.SharedClassGraphCache.getInstance().release(oldScan);
+				scope.setClassGraphScanResult(null);
+			}
+		} else {
+			// Classloader unchanged — keep the existing scan result
+			scope.setClassGraphScanResult(srHolder[0]);
+		}
+
 		// Keep the source locator in sync with the compilation classloader
 		// so that "Go to Definition" can locate .class files inside JARs.
 		if (scope.getJavaSourceLocator() != null && scope.getClassLoader() != null) {
@@ -152,6 +167,31 @@ public class CompilationService {
 	 *         be compiled (e.g. classpath not yet resolved)
 	 */
 	public boolean ensureScopeCompiled(ProjectScope scope) {
+		return ensureScopeCompiled(scope, null, null);
+	}
+
+	/**
+	 * Performs the initial (deferred) compilation of a scope if it hasn't
+	 * been compiled yet.  When {@code triggerURI} is non-null and the
+	 * project has many source files, a <b>staged compilation</b> strategy
+	 * is used to reduce time to first diagnostic:
+	 * <ol>
+	 *   <li><b>Phase A</b> — compile only the trigger file (+ direct
+	 *       imports) via {@code createIncremental}, publish diagnostics
+	 *       for it immediately.</li>
+	 *   <li><b>Phase B</b> — submit full compilation to the background
+	 *       pool.  When complete, the partial AST is replaced with the
+	 *       full AST and diagnostics are republished if they changed.</li>
+	 * </ol>
+	 *
+	 * <p>Called under the scope's write lock.</p>
+	 *
+	 * @param triggerURI         the URI that triggered compilation (may be null)
+	 * @param backgroundCompiler executor for deferred full compilation (may be null)
+	 * @return {@code true} if a compilation was performed (full or staged)
+	 */
+	public boolean ensureScopeCompiled(ProjectScope scope, URI triggerURI,
+			java.util.concurrent.ExecutorService backgroundCompiler) {
 		if (scope.isCompiled()) {
 			return false;
 		}
@@ -161,6 +201,72 @@ public class CompilationService {
 			logger.debug("Skipping compilation of {} — classpath not yet resolved", scope.getProjectRoot());
 			return false;
 		}
+
+		// --- Staged compilation: fast single-file first, full compile later ---
+		// Only use staged path when we have a trigger file AND a background pool.
+		if (triggerURI != null && backgroundCompiler != null) {
+			long stageStart = System.currentTimeMillis();
+
+			// Phase A: compile just the opened file with the project's classpath
+			Set<URI> singleFile = Set.of(triggerURI);
+			GroovyLSCompilationUnit incrementalUnit = scope.getCompilationUnitFactory()
+					.createIncremental(scope.getProjectRoot(), fileContentsTracker, singleFile);
+
+			if (incrementalUnit != null) {
+				// Ensure the classloader is set for the scope (needed later)
+				if (scope.getClassLoader() == null) {
+					scope.setClassLoader(incrementalUnit.getClassLoader());
+				}
+
+				ErrorCollector collector = compilationOrchestrator.compileIncremental(
+						incrementalUnit, scope.getProjectRoot());
+				ASTNodeVisitor visitor = compilationOrchestrator.visitAST(incrementalUnit);
+				if (visitor != null) {
+					scope.setAstVisitor(visitor);
+				}
+
+				// Publish diagnostics for the single file immediately
+				if (collector != null) {
+					DiagnosticHandler.DiagnosticResult result = diagnosticHandler.handleErrorCollector(
+							incrementalUnit, collector, scope.getProjectRoot(),
+							scope.getPrevDiagnosticsByFile());
+					scope.setPrevDiagnosticsByFile(result.getDiagnosticsByFile());
+					LanguageClient client = languageClient;
+					if (client != null) {
+						result.getDiagnosticsToPublish().forEach(client::publishDiagnostics);
+					}
+				}
+
+				long stageElapsed = System.currentTimeMillis() - stageStart;
+				logger.info("Staged Phase A for {} completed in {}ms (single-file diagnostic)",
+						scope.getProjectRoot(), stageElapsed);
+			}
+
+			// Phase B: schedule full compilation in the background
+			backgroundCompiler.submit(() -> {
+				scope.getLock().writeLock().lock();
+				try {
+					doFullCompilation(scope);
+				} finally {
+					scope.getLock().writeLock().unlock();
+				}
+			});
+
+			return true;
+		}
+
+		// --- Standard full compilation path ---
+		doFullCompilation(scope);
+		return true;
+	}
+
+	/**
+	 * Performs a full compilation of the scope: creates/updates the compilation
+	 * unit, compiles, visits the AST, and builds the dependency graph.
+	 * <p><b>Caller must hold the scope's write lock.</b></p>
+	 */
+	private void doFullCompilation(ProjectScope scope) {
+		long fullStart = System.currentTimeMillis();
 		createOrUpdateCompilationUnit(scope);
 		resetChangedFilesForScope(scope);
 		compile(scope);
@@ -174,7 +280,13 @@ public class CompilationService {
 			}
 		}
 		scope.setCompiled(true);
-		return true;
+		long fullElapsed = System.currentTimeMillis() - fullStart;
+		logger.info("Full compilation of {} completed in {}ms", scope.getProjectRoot(), fullElapsed);
+		// Refresh semantic tokens after full compilation replaces the AST
+		LanguageClient client = languageClient;
+		if (client instanceof com.tomaszrup.groovyls.GroovyLanguageClient) {
+			((com.tomaszrup.groovyls.GroovyLanguageClient) client).refreshSemanticTokens();
+		}
 	}
 
 	/**

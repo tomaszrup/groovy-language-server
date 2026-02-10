@@ -19,9 +19,14 @@
 ////////////////////////////////////////////////////////////////////////////////
 package com.tomaszrup.groovyls.compiler;
 
+import java.io.IOException;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
@@ -106,8 +111,8 @@ public class SharedClassGraphCache {
 	/**
 	 * Acquire a {@link ScanResult} for the given classloader. If a cached
 	 * result already exists for the same classpath, the ref count is
-	 * incremented and the existing result is returned. Otherwise a new
-	 * ClassGraph scan is performed.
+	 * incremented and the existing result is returned. Otherwise, checks
+	 * the on-disk cache and falls back to a new ClassGraph scan.
 	 *
 	 * @param classLoader the classloader whose classpath should be scanned
 	 * @return the scan result, or {@code null} if scanning failed
@@ -122,19 +127,40 @@ public class SharedClassGraphCache {
 			return entry.scanResult;
 		}
 
+		// Try loading from disk cache
+		long loadStart = System.currentTimeMillis();
+		ScanResult scanResult = loadFromDisk(key);
+		if (scanResult != null) {
+			long loadElapsed = System.currentTimeMillis() - loadStart;
+			logger.info("SharedClassGraphCache DISK HIT for key {}… ({}ms)",
+					key.substring(0, Math.min(12, key.length())), loadElapsed);
+			entry = new CacheEntry(scanResult, key);
+			cache.put(key, entry);
+			reverseIndex.put(scanResult, key);
+			return scanResult;
+		}
+
 		// Cache miss — perform scan
 		logger.debug("SharedClassGraphCache MISS for key {}… — scanning classpath ({} URLs)",
 				key.substring(0, Math.min(12, key.length())), classLoader.getURLs().length);
 		try {
-			ScanResult scanResult = new ClassGraph()
+			long scanStart = System.currentTimeMillis();
+			scanResult = new ClassGraph()
 					.overrideClassLoaders(classLoader)
 					.enableClassInfo()
 					.enableSystemJarsAndModules()
 					.scan();
+			long scanElapsed = System.currentTimeMillis() - scanStart;
+			logger.info("ClassGraph scan completed in {}ms ({} URLs)",
+					scanElapsed, classLoader.getURLs().length);
 			entry = new CacheEntry(scanResult, key);
 			cache.put(key, entry);
 			reverseIndex.put(scanResult, key);
 			logger.debug("SharedClassGraphCache stored new entry, cache size={}", cache.size());
+
+			// Persist to disk for future server starts
+			saveToDisk(key, scanResult);
+
 			return scanResult;
 		} catch (ClassGraphException e) {
 			logger.warn("ClassGraph scan failed: {}", e.getMessage());
@@ -254,5 +280,71 @@ public class SharedClassGraphCache {
 		cache.clear();
 		reverseIndex.clear();
 		logger.info("SharedClassGraphCache cleared");
+	}
+
+	// --- On-disk persistence ---
+
+	/**
+	 * Directory for persisted ClassGraph scan results.
+	 * Stored under {@code ~/.groovyls/cache/classgraph/}.
+	 */
+	private static Path getDiskCacheDir() {
+		String home = System.getProperty("user.home");
+		return Paths.get(home, ".groovyls", "cache", "classgraph");
+	}
+
+	/**
+	 * Load a previously cached scan result from disk.
+	 *
+	 * @param classpathKey the SHA-256 hash of the classpath
+	 * @return the deserialized {@link ScanResult}, or {@code null} if not found
+	 *         or corrupt
+	 */
+	private ScanResult loadFromDisk(String classpathKey) {
+		Path cacheFile = getDiskCacheDir().resolve(classpathKey + ".json");
+		if (!Files.isRegularFile(cacheFile)) {
+			return null;
+		}
+		try {
+			String json = Files.readString(cacheFile, StandardCharsets.UTF_8);
+			ScanResult result = ScanResult.fromJSON(json);
+			return result;
+		} catch (Exception e) {
+			logger.debug("Failed to load ClassGraph cache from disk for key {}…: {}",
+					classpathKey.substring(0, Math.min(12, classpathKey.length())),
+					e.getMessage());
+			// Delete corrupt cache file
+			try {
+				Files.deleteIfExists(cacheFile);
+			} catch (IOException ignored) {
+			}
+			return null;
+		}
+	}
+
+	/**
+	 * Persist a scan result to disk atomically (write-to-temp then rename).
+	 *
+	 * @param classpathKey the SHA-256 hash of the classpath
+	 * @param scanResult   the scan result to persist
+	 */
+	private void saveToDisk(String classpathKey, ScanResult scanResult) {
+		try {
+			Path cacheDir = getDiskCacheDir();
+			Files.createDirectories(cacheDir);
+			Path cacheFile = cacheDir.resolve(classpathKey + ".json");
+			Path tempFile = cacheDir.resolve(classpathKey + ".tmp");
+
+			String json = scanResult.toJSON();
+			Files.writeString(tempFile, json, StandardCharsets.UTF_8);
+			Files.move(tempFile, cacheFile, StandardCopyOption.REPLACE_EXISTING,
+					StandardCopyOption.ATOMIC_MOVE);
+			logger.debug("Persisted ClassGraph scan to disk for key {}…",
+					classpathKey.substring(0, Math.min(12, classpathKey.length())));
+		} catch (Exception e) {
+			logger.debug("Failed to persist ClassGraph scan to disk for key {}…: {}",
+					classpathKey.substring(0, Math.min(12, classpathKey.length())),
+					e.getMessage());
+		}
 	}
 }

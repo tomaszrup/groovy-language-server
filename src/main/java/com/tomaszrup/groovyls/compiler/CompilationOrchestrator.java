@@ -137,8 +137,11 @@ public class CompilationOrchestrator {
 			if (targetDirectory != null && !targetDirectory.exists() && !targetDirectory.mkdirs()) {
 				logger.error("Failed to create target directory: {}", targetDirectory.getAbsolutePath());
 			}
-			GroovyClassLoader newClassLoader = compilationUnit.getClassLoader();
-			updateClassGraphScan(newClassLoader, scanResultHolder, classLoaderHolder);
+			// ClassGraph scan is deferred — not needed for compilation or
+			// diagnostics. It will be triggered lazily via
+			// ProjectScope.ensureClassGraphScanned() when a provider
+			// (completion, code action) first needs it.
+			classLoaderHolder[0] = compilationUnit.getClassLoader();
 		} else {
 			if (scanResultHolder[0] != null) {
 				sharedScanCache.release(scanResultHolder[0]);

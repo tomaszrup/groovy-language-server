@@ -191,6 +191,51 @@ public class ProjectScope {
 	}
 
 	/**
+	 * Lazily initialise the ClassGraph scan result for this scope.
+	 * The scan is expensive (2–10 s for large classpaths) but is only
+	 * needed by providers that enumerate classpath types (completion,
+	 * code actions).  Compilation and diagnostic generation do NOT
+	 * need it, so deferring the scan significantly reduces time to
+	 * first diagnostic.
+	 *
+	 * <p>Thread-safe: uses double-checked locking on the scope's write
+	 * lock.  Callers that already hold the write lock should use
+	 * {@link #ensureClassGraphScannedUnsafe()} instead.</p>
+	 *
+	 * @return the scan result, or {@code null} if the classloader is
+	 *         not yet available
+	 */
+	public ScanResult ensureClassGraphScanned() {
+		if (classGraphScanResult != null) {
+			return classGraphScanResult;
+		}
+		lock.writeLock().lock();
+		try {
+			return ensureClassGraphScannedUnsafe();
+		} finally {
+			lock.writeLock().unlock();
+		}
+	}
+
+	/**
+	 * Same as {@link #ensureClassGraphScanned()} but assumes the caller
+	 * already holds the write lock.
+	 */
+	public ScanResult ensureClassGraphScannedUnsafe() {
+		if (classGraphScanResult != null) {
+			return classGraphScanResult;
+		}
+		GroovyClassLoader cl = classLoader;
+		if (cl == null) {
+			return null;
+		}
+		com.tomaszrup.groovyls.compiler.SharedClassGraphCache sharedCache =
+				com.tomaszrup.groovyls.compiler.SharedClassGraphCache.getInstance();
+		classGraphScanResult = sharedCache.acquire(cl);
+		return classGraphScanResult;
+	}
+
+	/**
 	 * Update the Java source locator with classpath entries so that
 	 * "Go to Definition" can navigate into dependency source JARs.
 	 * This should be called whenever the classpath is resolved or updated.

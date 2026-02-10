@@ -71,8 +71,12 @@ public class ExecutorPools {
     private final ExecutorService importPool;
 
     /**
-     * Single-threaded executor for background compilation work.
-     * Serializes AST compilation to avoid concurrent mutation.
+     * Small fixed-size pool for background compilation work.
+     * Independent project scopes can compile in parallel since each
+     * scope has its own CompilationUnit, ClassLoader, and ASTNodeVisitor.
+     * Thread safety is ensured by per-scope write locks.
+     * Using 2 threads balances parallelism with memory pressure from
+     * concurrent Groovy compilations.
      */
     private final ExecutorService backgroundCompilationPool;
 
@@ -90,7 +94,8 @@ public class ExecutorPools {
                     return t;
                 });
 
-        this.backgroundCompilationPool = Executors.newSingleThreadExecutor(r -> {
+        int bgCompileThreads = Math.min(2, Runtime.getRuntime().availableProcessors());
+        this.backgroundCompilationPool = Executors.newFixedThreadPool(bgCompileThreads, r -> {
             Thread t = new Thread(r, "groovyls-bg-compile");
             t.setDaemon(true);
             return t;
@@ -107,7 +112,7 @@ public class ExecutorPools {
         return importPool;
     }
 
-    /** Single-threaded executor for background AST compilation. */
+    /** Fixed-size pool for background AST compilation (parallel for independent scopes). */
     public ExecutorService getBackgroundCompilationPool() {
         return backgroundCompilationPool;
     }
