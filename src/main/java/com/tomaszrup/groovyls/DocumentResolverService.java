@@ -95,7 +95,7 @@ public class DocumentResolverService {
 
 		// Search all scopes for matching AST node to retrieve documentation
 		for (ProjectScope scope : scopeManager.getAllScopes()) {
-			ASTNodeVisitor visitor = scope.astVisitor;
+			ASTNodeVisitor visitor = scope.getAstVisitor();
 			if (visitor == null) {
 				continue;
 			}
@@ -234,10 +234,10 @@ public class DocumentResolverService {
 	 */
 	private String resolveJavadocFromClasspath(ProjectScope scope, String label, CompletionItemKind kind,
 			String signature, String declaringClassName) {
-		if (scope.compilationUnit == null || declaringClassName == null) {
+		if (scope.getCompilationUnit() == null || declaringClassName == null) {
 			return null;
 		}
-		List<String> classpathList = scope.compilationUnit.getConfiguration().getClasspath();
+		List<String> classpathList = scope.getCompilationUnit().getConfiguration().getClasspath();
 		if (classpathList == null) {
 			return null;
 		}

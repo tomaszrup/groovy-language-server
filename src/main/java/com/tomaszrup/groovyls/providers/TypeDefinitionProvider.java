@@ -32,11 +32,13 @@ import org.codehaus.groovy.ast.Variable;
 import org.eclipse.lsp4j.Location;
 import org.eclipse.lsp4j.LocationLink;
 import org.eclipse.lsp4j.Position;
+import org.eclipse.lsp4j.Range;
 import org.eclipse.lsp4j.TextDocumentIdentifier;
 import org.eclipse.lsp4j.jsonrpc.messages.Either;
 
 import com.tomaszrup.groovyls.compiler.ast.ASTNodeVisitor;
 import com.tomaszrup.groovyls.compiler.util.GroovyASTUtils;
+import com.tomaszrup.groovyls.util.ClassNodeDecompiler;
 import com.tomaszrup.groovyls.util.GroovyLanguageServerUtils;
 import com.tomaszrup.groovyls.util.JavaSourceLocator;
 
@@ -97,23 +99,11 @@ public class TypeDefinitionProvider {
 		if (javaSourceLocator == null || definitionNode == null) {
 			return null;
 		}
-		if (definitionNode instanceof ClassNode) {
-			ClassNode classNode = (ClassNode) definitionNode;
-			return javaSourceLocator.findLocationForClass(classNode.getName());
-		}
-		if (definitionNode instanceof MethodNode) {
-			MethodNode method = (MethodNode) definitionNode;
-			ClassNode returnType = method.getReturnType();
-			if (returnType != null) {
-				return javaSourceLocator.findLocationForClass(returnType.getName());
-			}
-		}
-		if (definitionNode instanceof Variable) {
-			Variable variable = (Variable) definitionNode;
-			ClassNode originType = variable.getOriginType();
-			if (originType != null) {
-				return javaSourceLocator.findLocationForClass(originType.getName());
-			}
+		ClassNode typeClass = extractTypeClass(definitionNode);
+		if (typeClass != null) {
+			Location loc = javaSourceLocator.findLocationForClass(typeClass.getName());
+			if (loc != null) return loc;
+			return decompileAndLocateClass(typeClass);
 		}
 		return null;
 	}
@@ -131,17 +121,41 @@ public class TypeDefinitionProvider {
 		if (defNode == null) {
 			return null;
 		}
-		ClassNode typeClass = null;
-		if (defNode instanceof MethodNode) {
-			typeClass = ((MethodNode) defNode).getReturnType();
-		} else if (defNode instanceof Variable) {
-			typeClass = ((Variable) defNode).getOriginType();
-		} else if (defNode instanceof ClassNode) {
-			typeClass = (ClassNode) defNode;
-		}
+		ClassNode typeClass = extractTypeClass(defNode);
 		if (typeClass != null) {
-			return javaSourceLocator.findLocationForClass(typeClass.getName());
+			Location loc = javaSourceLocator.findLocationForClass(typeClass.getName());
+			if (loc != null) return loc;
+			return decompileAndLocateClass(typeClass);
 		}
 		return null;
+	}
+
+	private ClassNode extractTypeClass(ASTNode node) {
+		if (node instanceof ClassNode) {
+			return (ClassNode) node;
+		}
+		if (node instanceof MethodNode) {
+			return ((MethodNode) node).getReturnType();
+		}
+		if (node instanceof Variable) {
+			return ((Variable) node).getOriginType();
+		}
+		return null;
+	}
+
+	private Location decompileAndLocateClass(ClassNode classNode) {
+		if (javaSourceLocator == null || classNode == null) return null;
+		String className = classNode.getName();
+		// If real source is now available (e.g. source JARs indexed after
+		// lazy classpath resolution), skip decompilation entirely.
+		if (javaSourceLocator.hasSource(className)) {
+			Location loc = javaSourceLocator.findLocationForClass(className);
+			if (loc != null) return loc;
+		}
+		List<String> lines = ClassNodeDecompiler.decompile(classNode);
+		URI uri = javaSourceLocator.registerDecompiledContent(className, lines);
+		int line = ClassNodeDecompiler.getClassDeclarationLine(classNode);
+		return new Location(uri.toString(),
+				new Range(new Position(line, 0), new Position(line, 0)));
 	}
 }

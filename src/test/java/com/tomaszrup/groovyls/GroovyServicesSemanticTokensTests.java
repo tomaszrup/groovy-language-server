@@ -28,9 +28,12 @@ import java.util.concurrent.CompletableFuture;
 import org.eclipse.lsp4j.DidOpenTextDocumentParams;
 import org.eclipse.lsp4j.MessageActionItem;
 import org.eclipse.lsp4j.MessageParams;
+import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.PublishDiagnosticsParams;
+import org.eclipse.lsp4j.Range;
 import org.eclipse.lsp4j.SemanticTokens;
 import org.eclipse.lsp4j.SemanticTokensParams;
+import org.eclipse.lsp4j.SemanticTokensRangeParams;
 import org.eclipse.lsp4j.ShowMessageRequestParams;
 import org.eclipse.lsp4j.TextDocumentIdentifier;
 import org.eclipse.lsp4j.TextDocumentItem;
@@ -385,5 +388,222 @@ class GroovyServicesSemanticTokensTests {
 			Assertions.assertTrue(data.get(i + 1) >= 0, "deltaStartChar should be non-negative at index " + (i + 1));
 			Assertions.assertTrue(data.get(i + 2) > 0, "length should be positive at index " + (i + 2));
 		}
+	}
+
+	@Test
+	void testSemanticTokensRangeReturnsOnlyVisibleTokens() throws Exception {
+		Path filePath = srcRoot.resolve("SemanticRange.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		// Line 0: class First {
+		// Line 1:   void firstMethod() {}
+		// Line 2: }
+		// Line 3: class Second {
+		// Line 4:   void secondMethod() {}
+		// Line 5: }
+		contents.append("class First {\n");
+		contents.append("  void firstMethod() {}\n");
+		contents.append("}\n");
+		contents.append("class Second {\n");
+		contents.append("  void secondMethod() {}\n");
+		contents.append("}");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+
+		// Request range covering only the second class (lines 3-5, 0-based)
+		Range range = new Range(new Position(3, 0), new Position(5, 1));
+		SemanticTokensRangeParams rangeParams = new SemanticTokensRangeParams(textDocument, range);
+		SemanticTokens rangeResult = services.semanticTokensRange(rangeParams).get();
+		Assertions.assertNotNull(rangeResult);
+		List<Integer> rangeData = rangeResult.getData();
+		Assertions.assertNotNull(rangeData);
+		Assertions.assertEquals(0, rangeData.size() % 5, "Range token data should be a multiple of 5");
+
+		// Should find 'Second' class declaration but NOT 'First'
+		boolean foundSecond = false;
+		boolean foundFirst = false;
+		for (int i = 0; i + 4 < rangeData.size(); i += 5) {
+			int tokenType = rangeData.get(i + 3);
+			int length = rangeData.get(i + 2);
+			if (tokenType == SemanticTokensProvider.TOKEN_TYPES.indexOf("class")
+					&& length == "Second".length()) {
+				foundSecond = true;
+			}
+			if (tokenType == SemanticTokensProvider.TOKEN_TYPES.indexOf("class")
+					&& length == "First".length()) {
+				foundFirst = true;
+			}
+		}
+		Assertions.assertTrue(foundSecond, "Should find class token for 'Second' in range");
+		Assertions.assertFalse(foundFirst, "Should NOT find class token for 'First' outside range");
+
+		// Also verify full tokens contain both
+		SemanticTokens fullResult = services.semanticTokensFull(new SemanticTokensParams(textDocument)).get();
+		List<Integer> fullData = fullResult.getData();
+		boolean fullHasFirst = false;
+		boolean fullHasSecond = false;
+		for (int i = 0; i + 4 < fullData.size(); i += 5) {
+			int tokenType = fullData.get(i + 3);
+			int length = fullData.get(i + 2);
+			if (tokenType == SemanticTokensProvider.TOKEN_TYPES.indexOf("class")
+					&& length == "First".length()) {
+				fullHasFirst = true;
+			}
+			if (tokenType == SemanticTokensProvider.TOKEN_TYPES.indexOf("class")
+					&& length == "Second".length()) {
+				fullHasSecond = true;
+			}
+		}
+		Assertions.assertTrue(fullHasFirst, "Full tokens should contain 'First'");
+		Assertions.assertTrue(fullHasSecond, "Full tokens should contain 'Second'");
+	}
+
+	@Test
+	void testSemanticTokensRangeEmptyRange() throws Exception {
+		Path filePath = srcRoot.resolve("SemanticRangeEmpty.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("class OnlyClass {\n");
+		contents.append("  void myMethod() {}\n");
+		contents.append("}");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+
+		// Request a range that covers no code (far beyond file end)
+		Range range = new Range(new Position(100, 0), new Position(200, 0));
+		SemanticTokensRangeParams rangeParams = new SemanticTokensRangeParams(textDocument, range);
+		SemanticTokens result = services.semanticTokensRange(rangeParams).get();
+		Assertions.assertNotNull(result);
+		Assertions.assertNotNull(result.getData());
+		Assertions.assertTrue(result.getData().isEmpty(), "Range beyond file should return empty tokens");
+	}
+
+	@Test
+	void testSemanticTokensMethodReturnType() throws Exception {
+		Path filePath = srcRoot.resolve("SemanticReturnType.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("class ReturnTypeTest {\n");
+		contents.append("  String getName() {\n");
+		contents.append("    return 'hello'\n");
+		contents.append("  }\n");
+		contents.append("}");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+
+		SemanticTokens result = services.semanticTokensFull(new SemanticTokensParams(textDocument)).get();
+		List<Integer> data = result.getData();
+		Assertions.assertFalse(data.isEmpty());
+		// Should find a class token for 'String' (the return type)
+		int classTypeIndex = SemanticTokensProvider.TOKEN_TYPES.indexOf("class");
+		boolean foundReturnType = false;
+		for (int i = 0; i + 4 < data.size(); i += 5) {
+			int tokenType = data.get(i + 3);
+			int length = data.get(i + 2);
+			if (tokenType == classTypeIndex && length == "String".length()) {
+				foundReturnType = true;
+				break;
+			}
+		}
+		Assertions.assertTrue(foundReturnType, "Should find a type token for return type 'String'");
+	}
+
+	@Test
+	void testSemanticTokensParameterType() throws Exception {
+		Path filePath = srcRoot.resolve("SemanticParamType.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("class ParamTypeTest {\n");
+		contents.append("  void process(String input) {\n");
+		contents.append("  }\n");
+		contents.append("}");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+
+		SemanticTokens result = services.semanticTokensFull(new SemanticTokensParams(textDocument)).get();
+		List<Integer> data = result.getData();
+		Assertions.assertFalse(data.isEmpty());
+		// Should find a class token for 'String' (the parameter type)
+		int classTypeIndex = SemanticTokensProvider.TOKEN_TYPES.indexOf("class");
+		boolean foundParamType = false;
+		for (int i = 0; i + 4 < data.size(); i += 5) {
+			int tokenType = data.get(i + 3);
+			int length = data.get(i + 2);
+			if (tokenType == classTypeIndex && length == "String".length()) {
+				foundParamType = true;
+				break;
+			}
+		}
+		Assertions.assertTrue(foundParamType, "Should find a type token for parameter type 'String'");
+	}
+
+	@Test
+	void testSemanticTokensTypeParameter() throws Exception {
+		Path filePath = srcRoot.resolve("SemanticGeneric.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("class Container<T> {\n");
+		contents.append("  T value\n");
+		contents.append("}");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+
+		SemanticTokens result = services.semanticTokensFull(new SemanticTokensParams(textDocument)).get();
+		List<Integer> data = result.getData();
+		Assertions.assertFalse(data.isEmpty());
+		// Should find a typeParameter token for 'T'
+		int typeParamIndex = SemanticTokensProvider.TOKEN_TYPES.indexOf("typeParameter");
+		boolean foundTypeParam = false;
+		for (int i = 0; i + 4 < data.size(); i += 5) {
+			int tokenType = data.get(i + 3);
+			int length = data.get(i + 2);
+			if (tokenType == typeParamIndex && length == "T".length()) {
+				foundTypeParam = true;
+				break;
+			}
+		}
+		Assertions.assertTrue(foundTypeParam, "Should find a typeParameter token for 'T'");
+	}
+
+	@Test
+	void testSemanticTokensImportNamespace() throws Exception {
+		Path filePath = srcRoot.resolve("SemanticImportNs.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("import java.util.List\n");
+		contents.append("class ImportTest {\n");
+		contents.append("  List items\n");
+		contents.append("}");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+
+		SemanticTokens result = services.semanticTokensFull(new SemanticTokensParams(textDocument)).get();
+		List<Integer> data = result.getData();
+		Assertions.assertFalse(data.isEmpty());
+		// Should find namespace tokens for 'java' and 'util' in the import
+		int nsIndex = SemanticTokensProvider.TOKEN_TYPES.indexOf("namespace");
+		boolean foundNamespace = false;
+		for (int i = 0; i + 4 < data.size(); i += 5) {
+			int tokenType = data.get(i + 3);
+			int length = data.get(i + 2);
+			if (tokenType == nsIndex && (length == "java".length() || length == "util".length())) {
+				foundNamespace = true;
+				break;
+			}
+		}
+		Assertions.assertTrue(foundNamespace, "Should find namespace tokens for import package segments");
+	}
+
+	@Test
+	void testSemanticTokensTypeParameterIndex() throws Exception {
+		// Verify that typeParameter index is 13
+		Assertions.assertEquals(13, SemanticTokensProvider.TOKEN_TYPES.indexOf("typeParameter"),
+				"typeParameter should be at index 13 in TOKEN_TYPES");
 	}
 }

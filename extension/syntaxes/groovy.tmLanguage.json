@@ -16,6 +16,8 @@
     { "include": "#storage" },
     { "include": "#method-declaration" },
     { "include": "#closure-params" },
+    { "include": "#constructor-type" },
+    { "include": "#type-reference" },
     { "include": "#method-call" },
     { "include": "#operators" },
     { "include": "#braces" }
@@ -220,8 +222,13 @@
           "match": "\\b(as|in|instanceof|new)\\b"
         },
         {
-          "name": "keyword.other.import.groovy",
-          "match": "\\b(import)\\b"
+          "comment": "import statement with class name highlighting",
+          "match": "\\b(import)\\s+(static\\s+)?([A-Za-z_][\\w.]*\\.)?([A-Z]\\w*|\\*)",
+          "captures": {
+            "1": { "name": "keyword.other.import.groovy" },
+            "2": { "name": "storage.modifier.groovy" },
+            "4": { "name": "entity.name.type.class.groovy" }
+          }
         },
         {
           "name": "keyword.other.package.groovy",
@@ -293,16 +300,44 @@
       }
     },
     "method-declaration": {
-      "match": "(?:[A-Za-z_]\\w*(?:<[^>]+>)?(?:\\[\\])*\\s+|\\b(?:def|void)\\s+)([A-Za-z_]\\w*)\\s*(?=\\()",
-      "captures": {
-        "1": { "name": "entity.name.function.groovy" }
-      }
+      "patterns": [
+        {
+          "comment": "Method with uppercase return type: String getName()",
+          "match": "\\b([A-Z]\\w*(?:<[^>]+>)?(?:\\[\\])*)\\s+([A-Za-z_]\\w*)\\s*(?=\\()",
+          "captures": {
+            "1": { "name": "support.type.groovy" },
+            "2": { "name": "entity.name.function.groovy" }
+          }
+        },
+        {
+          "comment": "Method with def/void or lowercase return type",
+          "match": "(?:[a-z_]\\w*(?:<[^>]+>)?(?:\\[\\])*\\s+|\\b(?:def|void)\\s+)([A-Za-z_]\\w*)\\s*(?=\\()",
+          "captures": {
+            "1": { "name": "entity.name.function.groovy" }
+          }
+        }
+      ]
     },
     "closure-params": {
       "match": "([A-Za-z_]\\w*(?:\\s*,\\s*[A-Za-z_]\\w*)*)\\s*(->)",
       "captures": {
         "1": { "name": "variable.parameter.closure.groovy" },
         "2": { "name": "storage.type.function.arrow.groovy" }
+      }
+    },
+    "constructor-type": {
+      "comment": "Type name after 'new' keyword: new MyClass() or new ArrayList<String>()",
+      "match": "\\b(new)\\s+([A-Z]\\w*)",
+      "captures": {
+        "1": { "name": "keyword.operator.groovy" },
+        "2": { "name": "entity.name.type.class.groovy" }
+      }
+    },
+    "type-reference": {
+      "comment": "Uppercase type before a variable name: String name, MyClass obj, List<T> items",
+      "match": "\\b([A-Z]\\w*(?:<[^>]+>)?(?:\\[\\])*)\\s+(?=[a-z_]\\w*\\s*[=,;){}\\n])",
+      "captures": {
+        "1": { "name": "support.type.groovy" }
       }
     },
     "method-call": {

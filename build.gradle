@@ -16,11 +16,22 @@ ext.mainClass = "com.tomaszrup.groovyls.GroovyLanguageServer"
 
 tasks.build.dependsOn tasks.shadowJar
 
+// Smoke-test the shadow JAR to catch class-stripping issues that unit tests
+// (which run against the full classpath) cannot detect.
+task shadowJarSmokeTest(type: JavaExec) {
+  dependsOn shadowJar
+  description = 'Verifies the shadow JAR can create a Groovy CompilationUnit and compile to SEMANTIC_ANALYSIS'
+  classpath = files(shadowJar.archiveFile)
+  mainClass = 'ShadowJarSmokeTest'
+  jvmArgs = ['-Dsource.encoding=UTF-8']
+}
+tasks.build.dependsOn shadowJarSmokeTest
+
 shadowJar {
   archiveBaseName.set("groovy-language-server")
 
   minimize {
-    // Keep dependencies that use reflection / ServiceLoader
+    // Keep dependencies that use reflection / ServiceLoader / static initializers
     exclude(dependency('org.slf4j:.*'))
     exclude(dependency('org.eclipse.lsp4j:.*'))
     exclude(dependency('com.google.code.gson:gson'))
@@ -32,7 +43,66 @@ shadowJar {
   exclude 'META-INF/LICENSE*'
   exclude 'META-INF/NOTICE*'
   exclude 'META-INF/DEPENDENCIES'
+  exclude 'META-INF/*.SF'
+  exclude 'META-INF/*.DSA'
+  exclude 'META-INF/*.RSA'
+  exclude 'META-INF/INDEX.LIST'
+  exclude 'META-INF/versions/**'
   exclude '**/*.html'
+
+  // Unused Groovy subsystems (project only uses AST/compiler APIs)
+  // Note: groovy/grape is kept because it's registered in META-INF/services
+  // as a global AST transformation and Groovy's compiler loads it via ServiceLoader
+  exclude 'groovy/ui/**'
+  exclude 'groovy/servlet/**'
+  exclude 'groovy/sql/**'
+  exclude 'groovy/swing/**'
+  exclude 'groovy/cli/**'
+  exclude 'groovy/console/**'
+  exclude 'groovy/ant/**'
+  exclude 'groovy/xml/**'
+  exclude 'groovy/json/**'
+  exclude 'groovy/yaml/**'
+  exclude 'groovy/toml/**'
+  exclude 'groovy/test/**'
+  exclude 'groovy/jmx/**'
+  exclude 'groovy/nio/**'
+  exclude 'groovy/inspect/**'
+  exclude 'groovy/dateutil/**'
+  exclude 'org/apache/groovy/json/**'
+  exclude 'org/apache/groovy/yaml/**'
+  exclude 'org/apache/groovy/toml/**'
+  exclude 'org/apache/groovy/swing/**'
+  exclude 'org/apache/groovy/sql/**'
+  exclude 'org/apache/groovy/nio/**'
+  exclude 'org/apache/groovy/ginq/**'
+  exclude 'org/apache/groovy/xml/**'
+  exclude 'org/apache/groovy/contracts/**'
+  exclude 'org/apache/groovy/antlib/**'
+
+  // DGM (DefaultGroovyMethods) generated math classes — keep genDgmMath
+  // as DefaultGroovyMethods.<clinit> references dgmimpl classes at startup
+  exclude 'META-INF/dgminfo'
+
+  // ANTLR4 tool/codegen/GUI classes bundled inside Groovy — only the
+  // ANTLR runtime is needed to run the already-generated Groovy parser
+  exclude 'groovyjarjarantlr4/v4/gui/**'
+  exclude 'groovyjarjarantlr4/v4/codegen/**'
+  exclude 'groovyjarjarantlr4/v4/tool/**'
+  exclude 'groovyjarjarantlr4/v4/semantics/**'
+  exclude 'groovyjarjarantlr4/v4/parse/**'
+  exclude 'groovyjarjarantlr4/v4/automata/**'
+  exclude 'groovyjarjarantlr4/v4/analysis/**'
+  exclude 'groovyjarjarantlr4/v4/unicode/**'
+  exclude 'groovyjarjarantlr4/v4/misc/**'
+  exclude 'groovyjarjarantlr4/v4/Tool*'
+  exclude 'groovyjarjarantlr4/runtime/debug/**'
+
+  // Picocli CLI framework bundled inside Groovy — only needed for
+  // GroovyCLI applications, not for the language server
+  exclude 'groovyjarjarpicocli/**'
+
+
 
   manifest {
     attributes "Main-Class": "com.tomaszrup.groovyls.GroovyLanguageServer"

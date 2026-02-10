@@ -131,6 +131,79 @@ public class GradleProjectImporter implements ProjectImporter {
         return doImportProjects(projectRoots, false);
     }
 
+    /**
+     * Resolve classpath for a <b>single</b> Gradle subproject without
+     * compiling.  Opens a Tooling API connection to the Gradle root
+     * (found via {@link #findGradleRoot(Path)}) and runs the init-script
+     * classpath task, but only parses entries matching this subproject's
+     * directory.
+     *
+     * <p>This is the lazy on-demand variant called when the user opens a
+     * file in a project whose classpath hasn't been resolved yet.</p>
+     */
+    @Override
+    public List<String> resolveClasspath(Path projectRoot) {
+        Path gradleRoot = findGradleRoot(projectRoot);
+        logger.info("Lazy-resolving classpath for single project {} via Gradle root {}", projectRoot, gradleRoot);
+
+        GradleConnector connector = GradleConnector.newConnector()
+                .forProjectDirectory(gradleRoot.toFile());
+        try (ProjectConnection connection = connector.connect()) {
+            Map<String, List<String>> classpathsByProjectDir = resolveAllClasspathsViaInitScript(connection);
+
+            List<String> cp = new ArrayList<>();
+            String normSub = normalise(projectRoot);
+
+            List<String> resolved = classpathsByProjectDir.get(normSub);
+            if (resolved != null) {
+                cp.addAll(resolved);
+            } else {
+                logger.warn("No classpath resolved for project {} (normalised: {})", projectRoot, normSub);
+            }
+
+            try {
+                cp.addAll(discoverClassDirs(projectRoot));
+            } catch (IOException e) {
+                logger.warn("Could not discover class dirs for {}: {}", projectRoot, e.getMessage());
+            }
+
+            // Deduplicate
+            cp = new ArrayList<>(new LinkedHashSet<>(cp));
+            logger.info("Lazy-resolved classpath for {}: {} entries", projectRoot, cp.size());
+            return cp;
+        } catch (Exception e) {
+            logger.error("Failed to resolve classpath for {}: {}", projectRoot, e.getMessage(), e);
+            return new ArrayList<>();
+        }
+    }
+
+    /**
+     * Resolve classpaths for multiple subprojects sharing the same Gradle root
+     * in a single Tooling API connection. Used by the backfill mechanism after
+     * a lazy single-project resolve completes.
+     *
+     * @param gradleRoot   the Gradle root directory (with settings.gradle)
+     * @param subprojects  the subprojects to resolve
+     * @return map from subproject root to its classpath entries
+     */
+    public Map<Path, List<String>> resolveClasspathsForRoot(Path gradleRoot, List<Path> subprojects) {
+        logger.info("Backfill: resolving classpaths for {} subproject(s) under Gradle root {}",
+                subprojects.size(), gradleRoot);
+        try {
+            return importBatch(gradleRoot, subprojects, false);
+        } catch (Exception e) {
+            logger.error("Backfill batch failed for Gradle root {}: {}", gradleRoot, e.getMessage(), e);
+            return new LinkedHashMap<>();
+        }
+    }
+
+    /**
+     * Expose Gradle root lookup for use by the resolution coordinator.
+     */
+    public Path getGradleRoot(Path projectRoot) {
+        return findGradleRoot(projectRoot);
+    }
+
     private Map<Path, List<String>> doImportProjects(List<Path> projectRoots, boolean compile) {
         Map<Path, List<String>> result = new LinkedHashMap<>();
 
@@ -352,6 +425,7 @@ public class GradleProjectImporter implements ProjectImporter {
                 "allprojects {\n" +
                 "    tasks.register('_groovyLSResolveClasspath') {\n" +
                 "        doLast {\n" +
+                "            def allCoords = new LinkedHashSet()\n" +
                 "            ['compileClasspath', 'runtimeClasspath', 'testCompileClasspath', 'testRuntimeClasspath'].each { configName ->\n" +
                 "                def config = configurations.findByName(configName)\n" +
                 "                if (config != null && config.canBeResolved) {\n" +
@@ -362,6 +436,32 @@ public class GradleProjectImporter implements ProjectImporter {
                 "                    } catch (Exception e) {\n" +
                 "                        // skip unresolvable configurations\n" +
                 "                    }\n" +
+                "                    try {\n" +
+                "                        config.resolvedConfiguration.resolvedArtifacts.each { artifact ->\n" +
+                "                            def id = artifact.moduleVersion.id\n" +
+                "                            allCoords.add(\"${id.group}:${id.name}:${id.version}\")\n" +
+                "                        }\n" +
+                "                    } catch (Exception e) {\n" +
+                "                        // skip\n" +
+                "                    }\n" +
+                "                }\n" +
+                "            }\n" +
+                "            // Download source JARs so Go-to-Definition shows real source\n" +
+                "            if (!allCoords.isEmpty()) {\n" +
+                "                try {\n" +
+                "                    def sourceDeps = []\n" +
+                "                    allCoords.each { coord ->\n" +
+                "                        def parts = coord.split(':')\n" +
+                "                        sourceDeps.add(project.dependencies.create(\n" +
+                "                            group: parts[0], name: parts[1], version: parts[2],\n" +
+                "                            classifier: 'sources', ext: 'jar'))\n" +
+                "                    }\n" +
+                "                    def sourcesConfig = project.configurations.detachedConfiguration(\n" +
+                "                        *sourceDeps)\n" +
+                "                    sourcesConfig.transitive = false\n" +
+                "                    sourcesConfig.resolvedConfiguration.lenientConfiguration.files\n" +
+                "                } catch (Exception ignored) {\n" +
+                "                    // Source JAR download is best-effort\n" +
                 "                }\n" +
                 "            }\n" +
                 "        }\n" +

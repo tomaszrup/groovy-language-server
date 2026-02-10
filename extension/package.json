@@ -2,7 +2,7 @@
   "name": "groovy-spock-support",
   "displayName": "Groovy & Spock Language Support",
   "description": "Language support for Groovy and Spock",
-  "version": "0.0.16",
+  "version": "0.1.0",
   "publisher": "TomaszRup",
   "homepage": "https://github.com/tomaszrup/groovy-language-server",
   "repository": {
@@ -71,6 +71,27 @@
         "language": "groovy",
         "scopeName": "source.groovy",
         "path": "./syntaxes/groovy.tmLanguage.json"
+      }
+    ],
+    "semanticTokenScopes": [
+      {
+        "language": "groovy",
+        "scopes": {
+          "namespace": ["entity.name.type.module.groovy"],
+          "type": ["entity.name.type.groovy"],
+          "class": ["entity.name.type.class.groovy"],
+          "interface": ["entity.name.type.interface.groovy"],
+          "enum": ["entity.name.type.enum.groovy"],
+          "typeParameter": ["entity.name.type.type-parameter.groovy"],
+          "parameter": ["variable.parameter.groovy"],
+          "variable": ["variable.other.local.groovy"],
+          "property": ["variable.other.property.groovy"],
+          "function": ["entity.name.function.groovy"],
+          "method": ["entity.name.function.member.groovy"],
+          "decorator": ["entity.name.function.decorator.groovy"],
+          "enumMember": ["variable.other.enummember.groovy"],
+          "keyword": ["keyword.other.groovy"]
+        }
       }
     ],
     "commands": [

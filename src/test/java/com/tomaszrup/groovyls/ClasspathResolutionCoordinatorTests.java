@@ -1,0 +1,217 @@
+////////////////////////////////////////////////////////////////////////////////
+// Copyright 2026 Tomasz Rup
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License
+////////////////////////////////////////////////////////////////////////////////
+package com.tomaszrup.groovyls;
+
+import java.net.URI;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import com.tomaszrup.groovyls.config.CompilationUnitFactory;
+import com.tomaszrup.groovyls.importers.ProjectImporter;
+import com.tomaszrup.groovyls.util.FileContentsTracker;
+
+/**
+ * Unit tests for {@link ClasspathResolutionCoordinator}: lazy resolution
+ * requests, duplicate suppression, shutdown, and backfill scheduling.
+ */
+class ClasspathResolutionCoordinatorTests {
+
+	private ProjectScopeManager scopeManager;
+	private CompilationService compilationService;
+	private FileContentsTracker fileContentsTracker;
+	private ClasspathResolutionCoordinator coordinator;
+	private Map<Path, ProjectImporter> importerMap;
+
+	private static final Path ROOT = Paths.get("/workspace").toAbsolutePath();
+	private static final Path PROJECT_A = Paths.get("/workspace/projectA").toAbsolutePath();
+	private static final Path PROJECT_B = Paths.get("/workspace/projectB").toAbsolutePath();
+
+	@BeforeEach
+	void setup() {
+		fileContentsTracker = new FileContentsTracker();
+		CompilationUnitFactory defaultFactory = new CompilationUnitFactory();
+		scopeManager = new ProjectScopeManager(defaultFactory, fileContentsTracker);
+		compilationService = new CompilationService(fileContentsTracker);
+		importerMap = new HashMap<>();
+		coordinator = new ClasspathResolutionCoordinator(scopeManager, compilationService, importerMap, new ExecutorPools());
+	}
+
+	@AfterEach
+	void tearDown() {
+		coordinator.shutdown();
+	}
+
+	// --- requestResolution: null / already-resolved guards ---
+
+	@Test
+	void testRequestResolutionNullScope() {
+		// Should be a no-op
+		coordinator.requestResolution(null, URI.create("file:///test.groovy"));
+	}
+
+	@Test
+	void testRequestResolutionAlreadyResolved() {
+		scopeManager.registerDiscoveredProjects(Arrays.asList(PROJECT_A));
+		ProjectScope scope = scopeManager.findProjectScopeByRoot(PROJECT_A);
+		scope.setClasspathResolved(true);
+
+		// Should be a no-op for an already-resolved scope
+		coordinator.requestResolution(scope, URI.create("file:///test.groovy"));
+		// markResolutionStarted should NOT have been called
+		Assertions.assertFalse(scopeManager.isResolutionInFlight(PROJECT_A));
+	}
+
+	@Test
+	void testRequestResolutionNullProjectRoot() {
+		ProjectScope scope = scopeManager.getDefaultScope();
+		// Default scope has null projectRoot — should be a no-op
+		coordinator.requestResolution(scope, URI.create("file:///test.groovy"));
+	}
+
+	// --- requestResolution: duplicate suppression ---
+
+	@Test
+	void testRequestResolutionDuplicateSuppressed() {
+		scopeManager.registerDiscoveredProjects(Arrays.asList(PROJECT_A));
+		ProjectScope scope = scopeManager.findProjectScopeByRoot(PROJECT_A);
+
+		// Manually mark as in-flight to simulate a prior request
+		scopeManager.markResolutionStarted(PROJECT_A);
+
+		// This second request should be suppressed
+		coordinator.requestResolution(scope, PROJECT_A.resolve("src/Foo.groovy").toUri());
+
+		// Still in-flight from the first mark
+		Assertions.assertTrue(scopeManager.isResolutionInFlight(PROJECT_A));
+	}
+
+	// --- requestResolution: async resolution with stub importer ---
+
+	@Test
+	void testRequestResolutionTriggersAsyncResolve() throws Exception {
+		CountDownLatch resolveCalled = new CountDownLatch(1);
+		CountDownLatch resolutionComplete = new CountDownLatch(1);
+		List<String> resolvedClasspath = Arrays.asList("/lib/resolved.jar");
+
+		// Stub importer that signals when resolve is called
+		ProjectImporter stubImporter = new ProjectImporter() {
+			@Override public String getName() { return "StubImporter"; }
+			@Override public List<Path> discoverProjects(Path root) { return Collections.emptyList(); }
+			@Override public List<String> importProject(Path root) { return resolvedClasspath; }
+			@Override public List<String> resolveClasspath(Path root) {
+				resolveCalled.countDown();
+				return resolvedClasspath;
+			}
+			@Override public void recompile(Path root) {}
+			@Override public boolean isProjectFile(String path) { return false; }
+		};
+		importerMap.put(PROJECT_A, stubImporter);
+
+		scopeManager.registerDiscoveredProjects(Arrays.asList(PROJECT_A));
+		ProjectScope scope = scopeManager.findProjectScopeByRoot(PROJECT_A);
+		Assertions.assertFalse(scope.isClasspathResolved());
+
+		URI triggerUri = PROJECT_A.resolve("src/Main.groovy").toUri();
+		coordinator.requestResolution(scope, triggerUri);
+
+		// Wait for the resolve call to happen
+		boolean called = resolveCalled.await(10, TimeUnit.SECONDS);
+		Assertions.assertTrue(called, "resolveClasspath should be called within timeout");
+
+		// Wait for the full async task to finish (including scope update)
+		// Poll for completion since the task runs after resolveClasspath returns
+		long deadline = System.currentTimeMillis() + 10_000;
+		while (!scope.isClasspathResolved() && System.currentTimeMillis() < deadline) {
+			Thread.sleep(100);
+		}
+		Assertions.assertTrue(scope.isClasspathResolved(),
+				"Scope classpath should be resolved after async task completes");
+
+		// Resolution in-flight flag should be cleared
+		deadline = System.currentTimeMillis() + 5_000;
+		while (scopeManager.isResolutionInFlight(PROJECT_A) && System.currentTimeMillis() < deadline) {
+			Thread.sleep(100);
+		}
+		Assertions.assertFalse(scopeManager.isResolutionInFlight(PROJECT_A));
+	}
+
+	// --- shutdown ---
+
+	@Test
+	void testShutdown() {
+		coordinator.shutdown();
+		// Should not throw even when called multiple times
+		coordinator.shutdown();
+	}
+
+	// --- setters ---
+
+	@Test
+	void testSetLanguageClient() {
+		coordinator.setLanguageClient(null);
+		// No exception
+	}
+
+	@Test
+	void testSetWorkspaceRoot() {
+		coordinator.setWorkspaceRoot(ROOT);
+		// No exception
+	}
+
+	@Test
+	void testSetAllDiscoveredRoots() {
+		coordinator.setAllDiscoveredRoots(Arrays.asList(PROJECT_A, PROJECT_B));
+		// No exception
+	}
+
+	@Test
+	void testSetClasspathCacheEnabled() {
+		coordinator.setClasspathCacheEnabled(false);
+		coordinator.setClasspathCacheEnabled(true);
+		// No exception
+	}
+
+	// --- requestResolution: no importer found ---
+
+	@Test
+	void testRequestResolutionNoImporter() throws Exception {
+		// No importer registered for PROJECT_A
+		scopeManager.registerDiscoveredProjects(Arrays.asList(PROJECT_A));
+		ProjectScope scope = scopeManager.findProjectScopeByRoot(PROJECT_A);
+
+		coordinator.requestResolution(scope, PROJECT_A.resolve("src/Foo.groovy").toUri());
+
+		// Give async task time to run
+		Thread.sleep(500);
+
+		// Resolution completes (fails gracefully) but scope stays unresolved
+		Assertions.assertFalse(scope.isClasspathResolved());
+		Assertions.assertFalse(scopeManager.isResolutionInFlight(PROJECT_A));
+	}
+
+}

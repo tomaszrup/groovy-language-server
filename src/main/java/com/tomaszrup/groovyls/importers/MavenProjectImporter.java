@@ -49,8 +49,24 @@ public class MavenProjectImporter implements ProjectImporter {
     /** Optional override for the Maven home directory (set from VS Code setting). */
     private String mavenHome;
 
+    /**
+     * Optional shared import pool for parallel Maven operations.
+     * If set, {@link #doImportProjects} uses this pool instead of creating
+     * a new throw-away pool per call.
+     */
+    private volatile ExecutorService sharedImportPool;
+
     public void setMavenHome(String mavenHome) {
         this.mavenHome = mavenHome;
+    }
+
+    /**
+     * Set the shared import pool for parallel Maven operations.
+     * When set, {@link #doImportProjects} submits tasks to this pool
+     * instead of creating a new thread pool per invocation.
+     */
+    public void setImportPool(ExecutorService pool) {
+        this.sharedImportPool = pool;
     }
 
     @Override
@@ -74,7 +90,7 @@ public class MavenProjectImporter implements ProjectImporter {
         compileProject(projectRoot);
 
         // 2. Resolve dependency classpath via mvn dependency:build-classpath
-        classpathList.addAll(resolveClasspath(projectRoot));
+        classpathList.addAll(resolveClasspathInternal(projectRoot));
 
         // 3. Add compiled class output directories
         classpathList.addAll(discoverClassDirs(projectRoot));
@@ -105,12 +121,16 @@ public class MavenProjectImporter implements ProjectImporter {
 
     private Map<Path, List<String>> doImportProjects(List<Path> projectRoots, boolean compile) {
         Map<Path, List<String>> result = new ConcurrentHashMap<>();
-        int parallelism = Math.max(2, Runtime.getRuntime().availableProcessors());
-        ExecutorService pool = Executors.newFixedThreadPool(parallelism, r -> {
-            Thread t = new Thread(r, "groovyls-maven-import");
-            t.setDaemon(true);
-            return t;
-        });
+        ExecutorService pool = sharedImportPool;
+        boolean ownPool = (pool == null);
+        if (ownPool) {
+            int parallelism = Math.max(2, Runtime.getRuntime().availableProcessors());
+            pool = Executors.newFixedThreadPool(parallelism, r -> {
+                Thread t = new Thread(r, "groovyls-maven-import");
+                t.setDaemon(true);
+                return t;
+            });
+        }
         try {
             List<Future<?>> futures = new ArrayList<>();
             for (Path root : projectRoots) {
@@ -120,7 +140,7 @@ public class MavenProjectImporter implements ProjectImporter {
                         if (compile) {
                             compileProject(root);
                         }
-                        cp.addAll(resolveClasspath(root));
+                        cp.addAll(resolveClasspathInternal(root));
                         cp.addAll(discoverClassDirs(root));
                         logger.info("Classpath for Maven project {}: {} entries (compile={})",
                                 root, cp.size(), compile);
@@ -142,7 +162,9 @@ public class MavenProjectImporter implements ProjectImporter {
                 }
             }
         } finally {
-            pool.shutdownNow();
+            if (ownPool) {
+                pool.shutdownNow();
+            }
         }
         // Preserve insertion order
         Map<Path, List<String>> ordered = new LinkedHashMap<>();
@@ -199,8 +221,14 @@ public class MavenProjectImporter implements ProjectImporter {
     /**
      * Resolve the full dependency classpath by running
      * {@code mvn dependency:build-classpath} and writing output to a temp file.
+     * Also triggers downloading of source JARs (best-effort) so that
+     * "Go to Definition" can show real source instead of decompiled stubs.
      */
-    private List<String> resolveClasspath(Path projectRoot) {
+    private List<String> resolveClasspathInternal(Path projectRoot) {
+        // Best-effort: download source JARs into ~/.m2/repository
+        // so findSourceJar() can discover them via sibling convention.
+        downloadSourceJars(projectRoot);
+
         List<String> classpathEntries = new ArrayList<>();
         Path cpFile = null;
         try {
@@ -241,6 +269,38 @@ public class MavenProjectImporter implements ProjectImporter {
             }
         }
         return classpathEntries;
+    }
+
+    /**
+     * Download source JARs for all dependencies (best-effort).
+     * <p>
+     * Runs {@code mvn dependency:sources} to download {@code *-sources.jar}
+     * artifacts into the local Maven repository ({@code ~/.m2/repository}).
+     * The existing {@code findSourceJar()} sibling-convention lookup in
+     * {@link com.tomaszrup.groovyls.util.JavaSourceLocator} will then discover
+     * them automatically. Failures are logged but never fatal — classpath
+     * resolution proceeds regardless.
+     */
+    private void downloadSourceJars(Path projectRoot) {
+        try {
+            logger.info("Downloading source JARs for Maven project {}", projectRoot);
+            int exitCode = runMaven(projectRoot,
+                    "dependency:sources",
+                    "-DincludeScope=test",
+                    "-DfailOnMissingClassifierArtifact=false",
+                    "-q");
+            if (exitCode == 0) {
+                logger.info("Source JARs downloaded for {}", projectRoot);
+            } else {
+                logger.debug("mvn dependency:sources exited with code {} for {} (non-fatal)",
+                        exitCode, projectRoot);
+            }
+        } catch (IOException e) {
+            logger.debug("Could not download source JARs for {}: {}", projectRoot, e.getMessage());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            logger.debug("Source JAR download interrupted for {}", projectRoot);
+        }
     }
 
     /**

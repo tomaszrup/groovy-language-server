@@ -29,6 +29,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
@@ -68,6 +69,12 @@ public class ProjectScopeManager {
 	private volatile boolean formattingEnabled = true;
 
 	/**
+	 * Tracks project roots whose classpath resolution is currently in-flight
+	 * to prevent duplicate concurrent resolution requests for the same scope.
+	 */
+	private final Set<Path> resolutionInFlight = ConcurrentHashMap.newKeySet();
+
+	/**
 	 * Guards mutations to the {@link #projectScopes} list and
 	 * {@link #defaultScope} reference. Held very briefly—only while
 	 * swapping the list reference, not during compilation.
@@ -84,7 +91,7 @@ public class ProjectScopeManager {
 		this.defaultScope = new ProjectScope(null, defaultFactory);
 		// The default scope is not managed by a build tool, so its classpath
 		// is always "resolved" (user-configured or empty).
-		this.defaultScope.classpathResolved = true;
+		this.defaultScope.setClasspathResolved(true);
 	}
 
 	// --- Accessors ---
@@ -96,9 +103,9 @@ public class ProjectScopeManager {
 	public void setWorkspaceRoot(Path workspaceRoot) {
 		synchronized (scopesMutationLock) {
 			this.workspaceRoot = workspaceRoot;
-			ProjectScope ds = new ProjectScope(workspaceRoot, defaultScope.compilationUnitFactory);
-			ds.compiled = false;
-			ds.classpathResolved = true;
+			ProjectScope ds = new ProjectScope(workspaceRoot, defaultScope.getCompilationUnitFactory());
+			ds.setCompiled(false);
+			ds.setClasspathResolved(true);
 			this.defaultScope = ds;
 		}
 	}
@@ -143,8 +150,8 @@ public class ProjectScopeManager {
 		if (!projectScopes.isEmpty() && uri != null) {
 			Path filePath = Paths.get(uri);
 			for (ProjectScope scope : projectScopes) {
-				if (scope.projectRoot != null && filePath.startsWith(scope.projectRoot)) {
-					logger.debug("findProjectScope({}) -> {}", uri, scope.projectRoot);
+				if (scope.getProjectRoot() != null && filePath.startsWith(scope.getProjectRoot())) {
+					logger.debug("findProjectScope({}) -> {}", uri, scope.getProjectRoot());
 					return scope;
 				}
 			}
@@ -159,7 +166,7 @@ public class ProjectScopeManager {
 	 */
 	public ProjectScope findProjectScopeByRoot(Path root) {
 		for (ProjectScope scope : getAllScopes()) {
-			if (root.equals(scope.projectRoot)) {
+			if (root.equals(scope.getProjectRoot())) {
 				return scope;
 			}
 		}
@@ -178,27 +185,48 @@ public class ProjectScopeManager {
 	}
 
 	/**
-	 * Returns true if a background import is in progress and the given scope
-	 * should not yet be compiled:
-	 * <ul>
-	 *   <li>The default scope before any project scopes are registered.</li>
-	 *   <li>Any project scope whose classpath has not been resolved yet
-	 *       (scopes are registered early with empty classpaths).</li>
-	 * </ul>
+	 * Returns true if the given scope should not yet be compiled because
+	 * project discovery itself is still running.
+	 * <p>
+	 * This only gates during the <em>pre-discovery</em> phase (the default
+	 * scope before any project scopes are registered and the background
+	 * import thread is still running).  After discovery completes, scopes
+	 * whose classpath has not been resolved yet are handled by the lazy
+	 * resolution path in {@code didOpen()}/{@code didChange()} — they must
+	 * <b>not</b> be blocked here, otherwise the coordinator's
+	 * {@code requestResolution()} call is never reached.
 	 */
 	public boolean isImportPendingFor(ProjectScope scope) {
-		if (!importInProgress) {
-			return false;
-		}
-		// Pre-discovery phase: only the default scope exists
-		if (scope == defaultScope && projectScopes.isEmpty()) {
-			return true;
-		}
-		// Post-discovery, pre-classpath-resolution: scope exists but has no classpath
-		if (scope != null && scope != defaultScope && !scope.classpathResolved) {
+		// Pre-discovery phase: only the default scope exists and import is running
+		if (importInProgress && scope == defaultScope && projectScopes.isEmpty()) {
 			return true;
 		}
 		return false;
+	}
+
+	/**
+	 * Mark a project root as having classpath resolution in-flight.
+	 * Returns {@code true} if the root was not already in-flight (i.e.
+	 * the caller should proceed with resolution). Returns {@code false}
+	 * if resolution is already in progress for this root.
+	 */
+	public boolean markResolutionStarted(Path projectRoot) {
+		return resolutionInFlight.add(projectRoot);
+	}
+
+	/**
+	 * Mark a project root's classpath resolution as complete.
+	 */
+	public void markResolutionComplete(Path projectRoot) {
+		resolutionInFlight.remove(projectRoot);
+	}
+
+	/**
+	 * Returns true if classpath resolution is currently in-flight for the
+	 * given project root.
+	 */
+	public boolean isResolutionInFlight(Path projectRoot) {
+		return resolutionInFlight.contains(projectRoot);
 	}
 
 	// --- Project registration ---
@@ -227,7 +255,7 @@ public class ProjectScopeManager {
 				newScopes.add(new ProjectScope(projectRoot, factory));
 			}
 
-			newScopes.sort((a, b) -> b.projectRoot.toString().length() - a.projectRoot.toString().length());
+			newScopes.sort((a, b) -> b.getProjectRoot().toString().length() - a.getProjectRoot().toString().length());
 			projectScopes = Collections.unmodifiableList(newScopes);
 		}
 
@@ -245,28 +273,66 @@ public class ProjectScopeManager {
 		List<ProjectScope> scopes = projectScopes;
 
 		for (ProjectScope scope : scopes) {
-			List<String> classpath = projectClasspaths.get(scope.projectRoot);
+			List<String> classpath = projectClasspaths.get(scope.getProjectRoot());
 			if (classpath != null) {
-				scope.lock.writeLock().lock();
+				scope.getLock().writeLock().lock();
 				try {
-					scope.compilationUnitFactory
+					scope.getCompilationUnitFactory()
 							.setAdditionalClasspathList(classpath);
-					scope.classpathResolved = true;
+					scope.setClasspathResolved(true);
+					// Index dependency source JARs for Go to Definition
+					scope.updateSourceLocatorClasspath(classpath);
 					// Classpath changed — evict stale Javadoc cache entries
 					JavadocResolver.clearCache();
 
-					if (scope.compiled) {
+					if (scope.isCompiled()) {
 						logger.info("Forcing recompilation of {} with resolved classpath",
-								scope.projectRoot);
-						scope.compiled = false;
-						scope.compilationUnit = null;
-						scope.astVisitor = null;
+								scope.getProjectRoot());
+						scope.setCompiled(false);
+						scope.setCompilationUnit(null);
+						scope.setAstVisitor(null);
 					}
 				} finally {
-					scope.lock.writeLock().unlock();
+					scope.getLock().writeLock().unlock();
 				}
 			}
 		}
+	}
+
+	/**
+	 * Update a single project scope with its resolved classpath.
+	 * Called by the lazy on-demand resolution path when a user opens a file
+	 * in a project whose classpath wasn't yet resolved.
+	 *
+	 * @param projectRoot the project root
+	 * @param classpath   the resolved classpath entries
+	 * @return the updated scope, or {@code null} if no matching scope was found
+	 */
+	public ProjectScope updateProjectClasspath(Path projectRoot, List<String> classpath) {
+		ProjectScope scope = findProjectScopeByRoot(projectRoot);
+		if (scope == null) {
+			logger.warn("updateProjectClasspath: no scope found for {}", projectRoot);
+			return null;
+		}
+		scope.getLock().writeLock().lock();
+		try {
+			scope.getCompilationUnitFactory().setAdditionalClasspathList(classpath);
+			scope.setClasspathResolved(true);
+			// Index dependency source JARs for Go to Definition
+			scope.updateSourceLocatorClasspath(classpath);
+			JavadocResolver.clearCache();
+
+			if (scope.isCompiled()) {
+				logger.info("Forcing recompilation of {} with newly resolved classpath", projectRoot);
+				scope.setCompiled(false);
+				scope.setCompilationUnit(null);
+				scope.setAstVisitor(null);
+			}
+		} finally {
+			scope.getLock().writeLock().unlock();
+		}
+		logger.info("Updated classpath for project {} ({} entries)", projectRoot, classpath.size());
+		return scope;
 	}
 
 	/**
@@ -285,7 +351,8 @@ public class ProjectScopeManager {
 			List<ProjectScope> newScopes = new ArrayList<>();
 			for (Path projectRoot : projectRoots) {
 				CompilationUnitFactory factory = new CompilationUnitFactory();
-				factory.setAdditionalClasspathList(projectClasspaths.get(projectRoot));
+				List<String> classpath = projectClasspaths.get(projectRoot);
+				factory.setAdditionalClasspathList(classpath);
 
 				List<Path> excludedRoots = new ArrayList<>();
 				for (Path other : projectRoots) {
@@ -298,11 +365,13 @@ public class ProjectScopeManager {
 				factory.setExcludedSubRoots(excludedRoots);
 
 				ProjectScope scope = new ProjectScope(projectRoot, factory);
-				scope.classpathResolved = true;
+				scope.setClasspathResolved(true);
+				// Index dependency source JARs for Go to Definition
+				scope.updateSourceLocatorClasspath(classpath);
 				newScopes.add(scope);
 			}
 
-			newScopes.sort((a, b) -> b.projectRoot.toString().length() - a.projectRoot.toString().length());
+			newScopes.sort((a, b) -> b.getProjectRoot().toString().length() - a.getProjectRoot().toString().length());
 			projectScopes = Collections.unmodifiableList(newScopes);
 		}
 
@@ -362,16 +431,16 @@ public class ProjectScopeManager {
 		}
 		if (importInProgress) {
 			logger.info("updateClasspath() deferred — project import in progress");
-			defaultScope.compilationUnitFactory.setAdditionalClasspathList(classpathList);
+			defaultScope.getCompilationUnitFactory().setAdditionalClasspathList(classpathList);
 			return;
 		}
 		// Store the classpath but don't compile — the caller (CompilationService)
 		// handles compilation when needed.
 		ProjectScope ds = defaultScope;
-		if (!classpathList.equals(ds.compilationUnitFactory.getAdditionalClasspathList())) {
-			ds.compilationUnitFactory.setAdditionalClasspathList(classpathList);
+		if (!classpathList.equals(ds.getCompilationUnitFactory().getAdditionalClasspathList())) {
+			ds.getCompilationUnitFactory().setAdditionalClasspathList(classpathList);
 			// Mark as needing recompilation
-			ds.compiled = false;
+			ds.setCompiled(false);
 		}
 	}
 
@@ -379,7 +448,7 @@ public class ProjectScopeManager {
 	 * Returns true if the default scope classpath actually changed.
 	 */
 	public boolean hasClasspathChanged(List<String> classpathList) {
-		return !classpathList.equals(defaultScope.compilationUnitFactory.getAdditionalClasspathList());
+		return !classpathList.equals(defaultScope.getCompilationUnitFactory().getAdditionalClasspathList());
 	}
 
 	// --- Diagnostics helpers ---
@@ -389,12 +458,12 @@ public class ProjectScopeManager {
 	 * reported errors on, so the client clears them.
 	 */
 	public void clearDefaultScopeDiagnostics() {
-		if (defaultScope.prevDiagnosticsByFile != null && languageClient != null) {
-			for (URI uri : defaultScope.prevDiagnosticsByFile.keySet()) {
+		if (defaultScope.getPrevDiagnosticsByFile() != null && languageClient != null) {
+			for (URI uri : defaultScope.getPrevDiagnosticsByFile().keySet()) {
 				languageClient.publishDiagnostics(
 						new PublishDiagnosticsParams(uri.toString(), new ArrayList<>()));
 			}
-			defaultScope.prevDiagnosticsByFile = null;
+			defaultScope.setPrevDiagnosticsByFile(null);
 		}
 	}
 }

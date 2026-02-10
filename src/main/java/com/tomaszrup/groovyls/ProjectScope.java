@@ -41,11 +41,14 @@ import com.tomaszrup.groovyls.util.JavaSourceLocator;
  * Holds all per-project state: compilation unit, AST visitor, classpath, etc.
  * Each build-tool project (Gradle/Maven) in the workspace gets its own scope
  * so that classpaths don't leak between independent projects.
+ *
+ * <p>All mutable state is encapsulated behind accessors to prevent
+ * accidental mutation from external classes.</p>
  */
 public class ProjectScope {
-	Path projectRoot;
-	final ICompilationUnitFactory compilationUnitFactory;
-	GroovyLSCompilationUnit compilationUnit;
+	private final Path projectRoot;
+	private final ICompilationUnitFactory compilationUnitFactory;
+	private GroovyLSCompilationUnit compilationUnit;
 
 	/**
 	 * The latest AST visitor snapshot.  Published via volatile write after
@@ -54,17 +57,17 @@ public class ProjectScope {
 	 * Writers produce a <em>new</em> visitor via copy-on-write rather than
 	 * mutating this reference in place.
 	 */
-	volatile ASTNodeVisitor astVisitor;
+	private volatile ASTNodeVisitor astVisitor;
 
-	Map<URI, List<Diagnostic>> prevDiagnosticsByFile;
+	private Map<URI, List<Diagnostic>> prevDiagnosticsByFile;
 
 	/** Published via volatile write when the classloader changes. */
-	volatile ScanResult classGraphScanResult;
+	private volatile ScanResult classGraphScanResult;
 
-	GroovyClassLoader classLoader;
-	volatile URI previousContext;
-	volatile JavaSourceLocator javaSourceLocator;
-	final DependencyGraph dependencyGraph = new DependencyGraph();
+	private GroovyClassLoader classLoader;
+	private volatile URI previousContext;
+	private volatile JavaSourceLocator javaSourceLocator;
+	private final DependencyGraph dependencyGraph = new DependencyGraph();
 
 	/**
 	 * Per-project lock. Write-lock is acquired for compilation and AST
@@ -74,7 +77,7 @@ public class ProjectScope {
 	 * that need to coordinate with the write-lock (e.g. workspace
 	 * symbols aggregation).
 	 */
-	final ReadWriteLock lock = new ReentrantReadWriteLock();
+	private final ReadWriteLock lock = new ReentrantReadWriteLock();
 
 	/**
 	 * Whether this scope has been compiled at least once. Used for
@@ -82,7 +85,7 @@ public class ProjectScope {
 	 * are not compiled eagerly — compilation is deferred until the first
 	 * request that actually needs the AST.
 	 */
-	volatile boolean compiled = false;
+	private volatile boolean compiled = false;
 
 	/**
 	 * Whether this scope's classpath has been resolved (dependency JARs
@@ -90,7 +93,7 @@ public class ProjectScope {
 	 * start with empty classpaths ({@code classpathResolved = false}) and
 	 * are upgraded later via {@code updateProjectClasspaths}.
 	 */
-	volatile boolean classpathResolved = false;
+	private volatile boolean classpathResolved = false;
 
 	public ProjectScope(Path projectRoot, ICompilationUnitFactory factory) {
 		this.projectRoot = projectRoot;
@@ -98,6 +101,103 @@ public class ProjectScope {
 		this.javaSourceLocator = new JavaSourceLocator();
 		if (projectRoot != null) {
 			this.javaSourceLocator.addProjectRoot(projectRoot);
+		}
+	}
+
+	// --- Accessors ---
+
+	public Path getProjectRoot() {
+		return projectRoot;
+	}
+
+	public ICompilationUnitFactory getCompilationUnitFactory() {
+		return compilationUnitFactory;
+	}
+
+	public GroovyLSCompilationUnit getCompilationUnit() {
+		return compilationUnit;
+	}
+
+	public void setCompilationUnit(GroovyLSCompilationUnit compilationUnit) {
+		this.compilationUnit = compilationUnit;
+	}
+
+	public ASTNodeVisitor getAstVisitor() {
+		return astVisitor;
+	}
+
+	public void setAstVisitor(ASTNodeVisitor astVisitor) {
+		this.astVisitor = astVisitor;
+	}
+
+	public Map<URI, List<Diagnostic>> getPrevDiagnosticsByFile() {
+		return prevDiagnosticsByFile;
+	}
+
+	public void setPrevDiagnosticsByFile(Map<URI, List<Diagnostic>> prevDiagnosticsByFile) {
+		this.prevDiagnosticsByFile = prevDiagnosticsByFile;
+	}
+
+	public ScanResult getClassGraphScanResult() {
+		return classGraphScanResult;
+	}
+
+	public void setClassGraphScanResult(ScanResult classGraphScanResult) {
+		this.classGraphScanResult = classGraphScanResult;
+	}
+
+	public GroovyClassLoader getClassLoader() {
+		return classLoader;
+	}
+
+	public void setClassLoader(GroovyClassLoader classLoader) {
+		this.classLoader = classLoader;
+	}
+
+	public URI getPreviousContext() {
+		return previousContext;
+	}
+
+	public void setPreviousContext(URI previousContext) {
+		this.previousContext = previousContext;
+	}
+
+	public JavaSourceLocator getJavaSourceLocator() {
+		return javaSourceLocator;
+	}
+
+	public DependencyGraph getDependencyGraph() {
+		return dependencyGraph;
+	}
+
+	public ReadWriteLock getLock() {
+		return lock;
+	}
+
+	public boolean isCompiled() {
+		return compiled;
+	}
+
+	public void setCompiled(boolean compiled) {
+		this.compiled = compiled;
+	}
+
+	public boolean isClasspathResolved() {
+		return classpathResolved;
+	}
+
+	public void setClasspathResolved(boolean classpathResolved) {
+		this.classpathResolved = classpathResolved;
+	}
+
+	/**
+	 * Update the Java source locator with classpath entries so that
+	 * "Go to Definition" can navigate into dependency source JARs.
+	 * This should be called whenever the classpath is resolved or updated.
+	 */
+	void updateSourceLocatorClasspath(List<String> classpathEntries) {
+		if (classpathEntries != null && !classpathEntries.isEmpty() && javaSourceLocator != null) {
+			javaSourceLocator.addClasspathJars(classpathEntries);
 		}
 	}
 }

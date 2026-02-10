@@ -124,6 +124,7 @@ The extension ships a `language-configuration.json` that enables rich editing su
 | `groovy.semanticHighlighting.enabled` | `boolean` | Enable or disable semantic syntax highlighting (default: `true`) |
 | `groovy.formatting.enabled` | `boolean` | Enable or disable document formatting (default: `true`) |
 | `groovy.maven.home` | `string` | Path to a Maven installation (used when `mvn` is not on `PATH` and no Maven Wrapper is present) |
+| `groovy.project.importers` | `string[]` | Limit which build-tool importers are active during project discovery. Valid values: `"Gradle"`, `"Maven"`. An empty array (default) enables all importers. |
 
 
 ## Build

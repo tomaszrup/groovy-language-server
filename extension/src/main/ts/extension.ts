@@ -306,27 +306,71 @@ function startLanguageServer() {
 
         try {
           await languageClient.start();
+
+          // Register a content provider for the "decompiled:" URI scheme so
+          // that "Go to Definition" on classes from external JARs opens a
+          // read-only view of the decompiled skeleton source.
+          const decompiledProvider = vscode.workspace.registerTextDocumentContentProvider(
+            "decompiled",
+            {
+              provideTextDocumentContent(
+                uri: vscode.Uri
+              ): Thenable<string> {
+                if (!languageClient) {
+                  return Promise.resolve("");
+                }
+                return languageClient.sendRequest<string>(
+                  "groovy/getDecompiledContent",
+                  { uri: uri.toString() }
+                ).then((content) => content ?? "// No decompiled content available");
+              },
+            }
+          );
+          extensionContext!.subscriptions.push(decompiledProvider);
+
+          // Register content providers for "jar:" and "jrt:" URI schemes.
+          // "Go to Definition" on external classes returns jar: URIs
+          // (e.g. jar:file:///path/to/dep.jar!/com/example/Foo.class)
+          // and JDK classes return jrt: URIs on Java 9+.
+          // VS Code needs content providers for these schemes to display
+          // the decompiled class skeleton or source JAR content.
+          for (const scheme of ["jar", "jrt"]) {
+            const provider = vscode.workspace.registerTextDocumentContentProvider(
+              scheme,
+              {
+                provideTextDocumentContent(
+                  uri: vscode.Uri
+                ): Thenable<string> {
+                  if (!languageClient) {
+                    return Promise.resolve("");
+                  }
+                  // Reconstruct the full URI (jar:file:///... or jrt:/...)
+                  // vscode.Uri.toString() for the "jar" scheme produces
+                  // "jar:file:///path!/entry" from the parsed components.
+                  const fullUri = uri.toString();
+                  return languageClient.sendRequest<string>(
+                    "groovy/getDecompiledContent",
+                    { uri: fullUri }
+                  ).then((content) => content ?? "// No decompiled content available");
+                },
+              }
+            );
+            extensionContext!.subscriptions.push(provider);
+          }
+
           // The server starts a background import (Gradle/Maven) after
-          // initialization.  Listen for log messages to track progress
-          // and transition the status bar from "importing" to "ready".
+          // initialization.  Listen for structured status notifications to
+          // transition the status bar.  This replaces the previous approach
+          // of parsing window/logMessage text with fragile string-prefix matching.
           setStatusBar("importing");
-          languageClient.onNotification("window/logMessage", (params: { type: number; message: string }) => {
-            const msg = params.message;
-            if (msg.startsWith("Using cached ")) {
-              // Cache hit — show a brief "cached" indicator then transition to ready
-              setStatusBar("importing", msg);
-            } else if (msg.startsWith("Discovering ") || msg.startsWith("Importing ") ||
-                msg.startsWith("Batch-importing ") ||
-                msg.startsWith("Found ") || msg.startsWith("Resolved ") ||
-                msg.startsWith("Compiling ") || msg.startsWith("Resolving ") ||
-                msg.startsWith("Discovery completed") ||
-                msg.startsWith("Classpath resolution completed") ||
-                msg.startsWith("Discovered ") || msg.startsWith("Updating classpaths") ||
-                msg.startsWith("Gradle import ") || msg.startsWith("Maven import ") ||
-                msg.startsWith("No Gradle ") || msg.startsWith("No Maven ")) {
-              setStatusBar("importing", msg);
-            } else if (msg.startsWith("Project import complete") || msg.startsWith("Project import failed")) {
+          languageClient.onNotification("groovy/statusUpdate", (params: { state: string; message?: string }) => {
+            const state = params.state;
+            if (state === "importing") {
+              setStatusBar("importing", params.message);
+            } else if (state === "ready") {
               setStatusBar("ready");
+            } else if (state === "error") {
+              setStatusBar("error");
             }
           });
         } catch (e) {

@@ -35,6 +35,7 @@ import org.codehaus.groovy.ast.AnnotationNode;
 import org.codehaus.groovy.ast.ClassNode;
 import org.codehaus.groovy.ast.ConstructorNode;
 import org.codehaus.groovy.ast.FieldNode;
+import org.codehaus.groovy.ast.GenericsType;
 import org.codehaus.groovy.ast.ImportNode;
 import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.Parameter;
@@ -49,6 +50,7 @@ import org.codehaus.groovy.ast.expr.PropertyExpression;
 import org.codehaus.groovy.ast.expr.StaticMethodCallExpression;
 import org.codehaus.groovy.ast.expr.VariableExpression;
 import org.codehaus.groovy.transform.trait.Traits;
+import org.eclipse.lsp4j.Range;
 import org.eclipse.lsp4j.SemanticTokens;
 import org.eclipse.lsp4j.SemanticTokensLegend;
 import org.eclipse.lsp4j.TextDocumentIdentifier;
@@ -64,19 +66,20 @@ public class SemanticTokensProvider {
 
 	// Token types — order matters, indices are used in the encoding
 	public static final List<String> TOKEN_TYPES = Collections.unmodifiableList(Arrays.asList(
-			"namespace",   // 0
-			"type",        // 1
-			"class",       // 2
-			"interface",   // 3
-			"enum",        // 4
-			"parameter",   // 5
-			"variable",    // 6
-			"property",    // 7
-			"function",    // 8
-			"method",      // 9
-			"decorator",   // 10
-			"enumMember",  // 11
-			"keyword"      // 12
+			"namespace",      // 0
+			"type",           // 1
+			"class",          // 2
+			"interface",      // 3
+			"enum",           // 4
+			"parameter",      // 5
+			"variable",       // 6
+			"property",       // 7
+			"function",       // 8
+			"method",         // 9
+			"decorator",      // 10
+			"enumMember",     // 11
+			"keyword",        // 12
+			"typeParameter"   // 13
 	));
 
 	// Token modifiers — bit flags
@@ -102,6 +105,7 @@ public class SemanticTokensProvider {
 	private static final int TYPE_DECORATOR = 10;
 	private static final int TYPE_ENUM_MEMBER = 11;
 	private static final int TYPE_KEYWORD = 12;
+	private static final int TYPE_TYPE_PARAMETER = 13;
 
 	private static final int MOD_DECLARATION = 1;       // bit 0
 	private static final int MOD_STATIC = 1 << 1;       // bit 1
@@ -135,13 +139,63 @@ public class SemanticTokensProvider {
 		String source = fileContentsTracker != null ? fileContentsTracker.getContents(uri) : null;
 		this.sourceLines = source != null ? source.split("\n", -1) : new String[0];
 
-		// Precompute set of declared classes for O(1) lookup
-		this.classNodeSet = new HashSet<>(ast.getClassNodes());
+		// Precompute set of declared classes for O(1) lookup (scoped to this file)
+		this.classNodeSet = new HashSet<>(ast.getClassNodes(uri));
 
 		List<ASTNode> nodes = ast.getNodes(uri);
 		List<SemanticToken> tokens = new ArrayList<>();
 
 		for (ASTNode node : nodes) {
+			addTokensForNode(node, uri, tokens);
+		}
+
+		// Sort tokens by position (line, then column)
+		tokens.sort(Comparator.comparingInt((SemanticToken t) -> t.line)
+				.thenComparingInt(t -> t.column));
+
+		// Deduplicate overlapping tokens
+		tokens = deduplicateTokens(tokens);
+
+		// Encode into the LSP relative format
+		List<Integer> data = encodeTokens(tokens);
+		return CompletableFuture.completedFuture(new SemanticTokens(data));
+	}
+
+	/**
+	 * Provides semantic tokens for a specific range of a Groovy source file.
+	 * Only AST nodes whose line range intersects the requested range are processed,
+	 * which is significantly faster for large files when only the viewport is needed.
+	 */
+	public CompletableFuture<SemanticTokens> provideSemanticTokensRange(TextDocumentIdentifier textDocument, Range range) {
+		if (ast == null) {
+			return CompletableFuture.completedFuture(new SemanticTokens(Collections.emptyList()));
+		}
+
+		URI uri = URI.create(textDocument.getUri());
+
+		// Load source lines for accurate name position lookup
+		String source = fileContentsTracker != null ? fileContentsTracker.getContents(uri) : null;
+		this.sourceLines = source != null ? source.split("\n", -1) : new String[0];
+
+		// Precompute set of declared classes for O(1) lookup (scoped to this file)
+		this.classNodeSet = new HashSet<>(ast.getClassNodes(uri));
+
+		// LSP Range uses 0-based lines; Groovy AST uses 1-based lines
+		int rangeStartLine = range.getStart().getLine();
+		int rangeEndLine = range.getEnd().getLine();
+
+		List<ASTNode> nodes = ast.getNodes(uri);
+		List<SemanticToken> tokens = new ArrayList<>();
+
+		for (ASTNode node : nodes) {
+			int nodeStartLine = node.getLineNumber() - 1;     // convert to 0-based
+			int nodeEndLine = node.getLastLineNumber() - 1;   // convert to 0-based
+
+			// Skip nodes entirely outside the requested range
+			if (nodeStartLine > rangeEndLine || nodeEndLine < rangeStartLine) {
+				continue;
+			}
+
 			addTokensForNode(node, uri, tokens);
 		}
 
@@ -260,6 +314,11 @@ public class SemanticTokensProvider {
 
 		addToken(tokens, line, column, name.length(), tokenType, modifiers);
 
+		// Emit type parameter tokens for generic class declarations (e.g. <T, E> in 'class Foo<T, E>')
+		if (isClassDeclaration(node)) {
+			addClassGenericTypeParameterTokens(node, tokens);
+		}
+
 		// Emit keyword tokens for 'extends' and 'implements' in class declarations
 		// so they match the 'class'/'trait' keyword coloring.
 		if (isClassDeclaration(node)) {
@@ -359,6 +418,14 @@ public class SemanticTokensProvider {
 			column = nameCol;
 		}
 
+		// Emit a type token for the method's return type (e.g. 'String' in 'String getName()')
+		if (!(node instanceof ConstructorNode)) {
+			addMethodReturnTypeToken(node, line, column, tokens);
+		}
+
+		// Emit type parameter tokens for generic method declarations (e.g. <T> in '<T> T find()')
+		addGenericTypeParameterTokens(node.getGenericsTypes(), tokens);
+
 		addToken(tokens, line, column, name.length(), tokenType, modifiers);
 	}
 
@@ -455,6 +522,9 @@ public class SemanticTokensProvider {
 		}
 
 		addToken(tokens, line, column, name.length(), TYPE_PARAMETER, MOD_DECLARATION);
+
+		// Emit a type token for the parameter's declared type (e.g. 'String' in 'String name')
+		addParameterTypeToken(node, line, column, tokens);
 	}
 
 	private void addVariableExpressionToken(VariableExpression node, List<SemanticToken> tokens) {
@@ -594,6 +664,11 @@ public class SemanticTokensProvider {
 			// the name length gives the 1-based start of the class name.
 			int line = node.getLastLineNumber();
 			int column = node.getLastColumnNumber() - name.length();
+
+			// Emit namespace tokens for the package segments before the class name.
+			// For 'import com.example.Foo', highlight 'com.example' as namespace.
+			addImportPackageNamespaceTokens(node, type, line, column, tokens);
+
 			// Use generic "type" for all imports so they have consistent coloring
 			addToken(tokens, line, column, name.length(), TYPE_TYPE, 0);
 		}
@@ -674,6 +749,295 @@ public class SemanticTokensProvider {
 		}
 		int tokenType = classNodeToTokenType(originType);
 		addToken(tokens, originType.getLineNumber(), originType.getColumnNumber(), typeName.length(), tokenType, 0);
+	}
+
+	/**
+	 * Adds a semantic token for the return type of a method declaration.
+	 * For example, in {@code String getName()}, this highlights {@code String}
+	 * as a type reference. Primitive return types are skipped (handled by TextMate).
+	 */
+	private void addMethodReturnTypeToken(MethodNode node, int nameLine, int nameColumn,
+			List<SemanticToken> tokens) {
+		if (node.isDynamicReturnType()) {
+			return; // 'def' return type — no explicit type to highlight
+		}
+		ClassNode returnType = node.getReturnType();
+		if (returnType == null || returnType.getLineNumber() == -1) {
+			return;
+		}
+		String typeName = returnType.getNameWithoutPackage();
+		if (isPrimitiveType(typeName)) {
+			return;
+		}
+		// Verify the return type position is before the method name
+		if (returnType.getLineNumber() > nameLine
+				|| (returnType.getLineNumber() == nameLine && returnType.getColumnNumber() >= nameColumn)) {
+			return;
+		}
+		int tokenType = classNodeToTokenType(returnType);
+		addToken(tokens, returnType.getLineNumber(), returnType.getColumnNumber(), typeName.length(), tokenType, 0);
+
+		// Also emit tokens for generic type arguments in the return type (e.g. List<String>)
+		addGenericTypeParameterTokens(returnType.getGenericsTypes(), tokens);
+	}
+
+	/**
+	 * Adds a semantic token for the type of a parameter declaration.
+	 * For example, in {@code void foo(String name)}, this highlights {@code String}
+	 * as a type reference. Primitive parameter types are skipped (handled by TextMate).
+	 */
+	private void addParameterTypeToken(Parameter node, int nameLine, int nameColumn,
+			List<SemanticToken> tokens) {
+		if (node.isDynamicTyped()) {
+			return;
+		}
+		ClassNode paramType = node.getOriginType();
+		if (paramType == null || paramType.getLineNumber() == -1) {
+			return;
+		}
+		String typeName = paramType.getNameWithoutPackage();
+		if (isPrimitiveType(typeName)) {
+			return;
+		}
+		// Verify the type position is before the parameter name
+		if (paramType.getLineNumber() > nameLine
+				|| (paramType.getLineNumber() == nameLine && paramType.getColumnNumber() >= nameColumn)) {
+			return;
+		}
+		int tokenType = classNodeToTokenType(paramType);
+		addToken(tokens, paramType.getLineNumber(), paramType.getColumnNumber(), typeName.length(), tokenType, 0);
+
+		// Also emit tokens for generic type arguments (e.g. List<String>)
+		addGenericTypeParameterTokens(paramType.getGenericsTypes(), tokens);
+	}
+
+	/**
+	 * Emits {@code typeParameter} tokens for generic type parameters.
+	 * For example, in {@code class Foo<T, E extends Comparable>}, this highlights
+	 * {@code T} and {@code E} as type parameters. Also handles generic type arguments
+	 * like {@code String} in {@code List<String>}.
+	 *
+	 * <p>Groovy's AST often does not provide position information for
+	 * {@code GenericsType} nodes, so this method first tries the AST positions
+	 * and falls back to scanning the source line when positions are missing.</p>
+	 */
+	private void addGenericTypeParameterTokens(GenericsType[] genericsTypes, List<SemanticToken> tokens) {
+		if (genericsTypes == null) {
+			return;
+		}
+		for (GenericsType gt : genericsTypes) {
+			ClassNode gtType = gt.getType();
+			if (gtType == null) {
+				continue;
+			}
+
+			// For placeholder type parameters (e.g. T), use the GenericsType name
+			// because gtType may resolve to Object losing the original name.
+			String name;
+			if (gt.isPlaceholder() || gt.isWildcard()) {
+				name = gt.getName();
+			} else {
+				name = gtType.getNameWithoutPackage();
+			}
+			if (name == null || name.isEmpty()) {
+				continue;
+			}
+
+			int gtLine = gt.getLineNumber();
+			int gtColumn = gt.getColumnNumber();
+
+			// Groovy's AST often doesn't set positions on GenericsType nodes.
+			// Fall back to the enclosing type's position if available,
+			// but NOT for placeholder types (T) since gtType resolves to Object
+			// and its position is from the JDK, not the source file.
+			if (gtLine == -1 && !gt.isPlaceholder() && !gt.isWildcard()
+					&& gtType.getLineNumber() > 0) {
+				gtLine = gtType.getLineNumber();
+				gtColumn = gtType.getColumnNumber();
+			}
+
+			if (gtLine == -1) {
+				continue;
+			}
+
+			if (gt.isPlaceholder() || gt.isWildcard()) {
+				// Type parameter declaration (e.g. T in <T>) — emit as typeParameter
+				addToken(tokens, gtLine, gtColumn, name.length(), TYPE_TYPE_PARAMETER, 0);
+			} else {
+				// Concrete type argument (e.g. String in List<String>) — emit as type
+				if (!isPrimitiveType(name)) {
+					int tokenType = classNodeToTokenType(gtType);
+					addToken(tokens, gtLine, gtColumn, name.length(), tokenType, 0);
+				}
+			}
+
+			// Recurse into nested generics (e.g. Map<String, List<Integer>>)
+			addGenericTypeParameterTokens(gtType.getGenericsTypes(), tokens);
+
+			// Handle bounds (e.g. T extends Comparable)
+			ClassNode[] upperBounds = gt.getUpperBounds();
+			if (upperBounds != null) {
+				for (ClassNode bound : upperBounds) {
+					if (bound.getLineNumber() != -1) {
+						String boundName = bound.getNameWithoutPackage();
+						if (!isPrimitiveType(boundName)) {
+							int boundTokenType = classNodeToTokenType(bound);
+							addToken(tokens, bound.getLineNumber(), bound.getColumnNumber(),
+									boundName.length(), boundTokenType, 0);
+						}
+					}
+				}
+			}
+		}
+	}
+
+	/**
+	 * Emits {@code typeParameter} tokens for generic type parameters in a class
+	 * declaration by scanning the source line. This is used as the primary strategy
+	 * because Groovy's AST frequently does not set position information on
+	 * {@code GenericsType} nodes for class declarations.
+	 *
+	 * <p>For {@code class Foo<T, E>}, finds the {@code <...>} portion after the
+	 * class name and emits typeParameter tokens for each identifier found inside.</p>
+	 */
+	private void addClassGenericTypeParameterTokens(ClassNode node, List<SemanticToken> tokens) {
+		GenericsType[] genericsTypes = node.getGenericsTypes();
+		if (genericsTypes == null || genericsTypes.length == 0) {
+			return;
+		}
+
+		// For class declaration type parameters, check if the GenericsType nodes
+		// themselves have real position info (not inherited from resolved types).
+		// Placeholder type params (like T) often have their Type resolved to Object,
+		// which inherits Object's position — that's not useful.
+		boolean hasRealPositionInfo = false;
+		for (GenericsType gt : genericsTypes) {
+			if (gt.getLineNumber() > 0) {
+				hasRealPositionInfo = true;
+				break;
+			}
+		}
+		if (hasRealPositionInfo) {
+			addGenericTypeParameterTokens(genericsTypes, tokens);
+			return;
+		}
+
+		// Fallback: scan source line for <...> after the class name
+		int line = node.getLineNumber();
+		if (sourceLines == null || line <= 0 || line > sourceLines.length) {
+			return;
+		}
+		String sourceLine = sourceLines[line - 1];
+		String className = node.getNameWithoutPackage();
+		int nameIdx = sourceLine.indexOf(className);
+		if (nameIdx < 0) {
+			return;
+		}
+		int afterName = nameIdx + className.length();
+		int angleBracketStart = sourceLine.indexOf('<', afterName);
+		if (angleBracketStart < 0) {
+			return;
+		}
+		int angleBracketEnd = sourceLine.indexOf('>', angleBracketStart);
+		if (angleBracketEnd < 0) {
+			return;
+		}
+
+		// Parse the content between < and >
+		String genericsContent = sourceLine.substring(angleBracketStart + 1, angleBracketEnd);
+		int contentOffset = angleBracketStart + 1; // 0-based offset in source line
+		int pos = 0;
+		while (pos < genericsContent.length()) {
+			char c = genericsContent.charAt(pos);
+			if (Character.isJavaIdentifierStart(c)) {
+				int start = pos;
+				while (pos < genericsContent.length() && Character.isJavaIdentifierPart(genericsContent.charAt(pos))) {
+					pos++;
+				}
+				String ident = genericsContent.substring(start, pos);
+				// Skip keywords like 'extends', 'super'
+				if (!"extends".equals(ident) && !"super".equals(ident)) {
+					// Determine if this is a type parameter or a concrete type
+					boolean isTypeParam = false;
+					for (GenericsType gt : genericsTypes) {
+						if (gt.getType() != null && ident.equals(gt.getType().getNameWithoutPackage())
+								&& (gt.isPlaceholder() || gt.isWildcard())) {
+							isTypeParam = true;
+							break;
+						}
+					}
+					int tokenType = isTypeParam ? TYPE_TYPE_PARAMETER : TYPE_CLASS;
+					// Convert to 1-based column
+					addToken(tokens, line, contentOffset + start + 1, ident.length(), tokenType, 0);
+				}
+			} else {
+				pos++;
+			}
+		}
+	}
+
+	/**
+	 * Emits {@code namespace} tokens for the package segments in an import statement.
+	 * For example, in {@code import com.example.Foo}, this highlights {@code com.example}
+	 * as namespace. Each dot-separated segment is emitted as its own token.
+	 */
+	private void addImportPackageNamespaceTokens(ImportNode importNode, ClassNode type,
+			int classNameLine, int classNameColumn, List<SemanticToken> tokens) {
+		if (sourceLines == null) {
+			return;
+		}
+		String packageName = type.getPackageName();
+		if (packageName == null || packageName.isEmpty()) {
+			return;
+		}
+
+		// Find the start of the fully qualified name in the import line
+		// The FQN starts after 'import' (and optional 'static') keyword
+		int importLine = importNode.getLineNumber();
+		if (importLine <= 0 || importLine > sourceLines.length) {
+			return;
+		}
+		String sourceLine = sourceLines[importLine - 1];
+
+		// The classNameColumn is 1-based; package segments are everything before it
+		// (minus the dot before the class name). Find start of package name in the line.
+		int fqnStart = -1;
+		String importKeyword = "import";
+		int importIdx = sourceLine.indexOf(importKeyword);
+		if (importIdx >= 0) {
+			fqnStart = importIdx + importKeyword.length();
+			// Skip whitespace and optional 'static' keyword
+			while (fqnStart < sourceLine.length() && Character.isWhitespace(sourceLine.charAt(fqnStart))) {
+				fqnStart++;
+			}
+			if (sourceLine.startsWith("static", fqnStart)) {
+				fqnStart += "static".length();
+				while (fqnStart < sourceLine.length() && Character.isWhitespace(sourceLine.charAt(fqnStart))) {
+					fqnStart++;
+				}
+			}
+		}
+		if (fqnStart < 0) {
+			return;
+		}
+
+		// Now emit namespace tokens for each package segment
+		// packageName is like "com.example." — segments are split by '.'
+		String[] segments = packageName.split("\\.");
+		int currentCol = fqnStart; // 0-based
+		for (String segment : segments) {
+			if (segment.isEmpty()) {
+				continue;
+			}
+			// Find the segment in the source line starting from currentCol
+			int segIdx = sourceLine.indexOf(segment, currentCol);
+			if (segIdx < 0) {
+				break;
+			}
+			// Emit namespace token (convert to 1-based column)
+			addToken(tokens, importLine, segIdx + 1, segment.length(), TYPE_NAMESPACE, 0);
+			currentCol = segIdx + segment.length() + 1; // skip segment + '.'
+		}
 	}
 
 	/**
@@ -818,6 +1182,8 @@ public class SemanticTokensProvider {
 			case TYPE_CLASS: return 6;
 			case TYPE_INTERFACE: return 6;
 			case TYPE_ENUM: return 6;
+			case TYPE_TYPE_PARAMETER: return 5;
+			case TYPE_NAMESPACE: return 1;
 			default: return 0;
 		}
 	}

@@ -52,7 +52,7 @@ public class ClasspathCache {
     private static final Logger logger = LoggerFactory.getLogger(ClasspathCache.class);
 
     /** Bump when the JSON schema changes to force cache invalidation. */
-    private static final int CACHE_VERSION = 2;
+    private static final int CACHE_VERSION = 3;
 
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 
@@ -72,18 +72,47 @@ public class ClasspathCache {
 
     // ---- Serialized model ----
 
+    /**
+     * Per-project cache entry (v3). Each project stores its own build-file
+     * stamps and classpath independently, so a change in one project's
+     * {@code build.gradle} invalidates only that project's cache.
+     */
+    public static class ProjectCacheEntry {
+        /** Build-file stamps for this project only (key → stamp). */
+        public Map<String, String> stamps;
+        /** Resolved classpath entries for this project. */
+        public List<String> classpath;
+
+        public ProjectCacheEntry() {}
+
+        public ProjectCacheEntry(Map<String, String> stamps, List<String> classpath) {
+            this.stamps = stamps;
+            this.classpath = classpath;
+        }
+    }
+
     /** JSON-serializable cache entry. */
     public static class CacheData {
         public int version;
         public long timestamp;
         /**
-         * Relative path → file stamp ({@code "<lastModified>:<size>"}) of
-         * each build file that existed at cache time.  Changed from SHA-256
-         * content hashes in v2 to avoid reading entire files on startup.
+         * <b>v2 (legacy):</b> global build-file stamps. Retained for
+         * backward-compatible loading; new caches use per-project stamps
+         * inside {@link #projects}.
          */
         public Map<String, String> buildFileHashes;
-        /** Normalised project root path → list of classpath entry strings. */
+        /**
+         * <b>v2 (legacy):</b> global classpath map. Retained for
+         * backward-compatible loading; new caches use per-project entries
+         * inside {@link #projects}.
+         */
         public Map<String, List<String>> classpaths;
+        /**
+         * <b>v3:</b> Per-project cache entries keyed by normalised absolute
+         * project root path. Each entry contains its own build-file stamps
+         * and classpath so validation and invalidation are per-project.
+         */
+        public Map<String, ProjectCacheEntry> projects;
         /**
          * Discovered project root paths (absolute, normalised).  Persisted so
          * that the expensive {@code Files.walk()} discovery phase can be
@@ -110,9 +139,13 @@ public class ClasspathCache {
         }
         try (Reader reader = Files.newBufferedReader(cacheFile, StandardCharsets.UTF_8)) {
             CacheData data = GSON.fromJson(reader, CacheData.class);
-            if (data == null || data.version != CACHE_VERSION
-                    || data.buildFileHashes == null || data.classpaths == null) {
+            if (data == null || data.version != CACHE_VERSION) {
                 logger.info("Classpath cache version mismatch or corrupt — will re-import");
+                return Optional.empty();
+            }
+            // v3 requires the projects map
+            if (data.projects == null || data.projects.isEmpty()) {
+                logger.info("Classpath cache missing per-project data — will re-import");
                 return Optional.empty();
             }
             return Optional.of(data);
@@ -142,13 +175,23 @@ public class ClasspathCache {
             CacheData data = new CacheData();
             data.version = CACHE_VERSION;
             data.timestamp = System.currentTimeMillis();
+
+            // Build per-project entries (v3)
+            data.projects = new LinkedHashMap<>();
+            for (Map.Entry<Path, List<String>> entry : classpaths.entrySet()) {
+                String rootKey = entry.getKey().toAbsolutePath().normalize().toString();
+                Map<String, String> projectStamps = computeBuildFileStampsForProject(entry.getKey());
+                data.projects.put(rootKey, new ProjectCacheEntry(projectStamps, entry.getValue()));
+            }
+
+            // Also persist the legacy fields for diagnostic / tooling purposes
             data.buildFileHashes = buildFileHashes;
-            // Normalise paths to strings for JSON portability
             data.classpaths = new LinkedHashMap<>();
             for (Map.Entry<Path, List<String>> entry : classpaths.entrySet()) {
                 data.classpaths.put(entry.getKey().toAbsolutePath().normalize().toString(),
                         entry.getValue());
             }
+
             // Persist discovered project roots so discovery can be skipped
             if (discoveredProjects != null) {
                 data.discoveredProjects = new ArrayList<>();
@@ -168,6 +211,85 @@ public class ClasspathCache {
             logger.info("Classpath cache saved to {}", cacheFile);
         } catch (IOException e) {
             logger.warn("Failed to write classpath cache: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Merge a single project's classpath into the existing cache, updating
+     * only that project's entry without affecting others.  If no cache file
+     * exists, a new one is created.
+     *
+     * @param workspaceRoot      the workspace root
+     * @param projectRoot        the project to update
+     * @param classpath          the resolved classpath entries
+     * @param discoveredProjects all discovered project root paths (may be {@code null})
+     */
+    public static void mergeProject(Path workspaceRoot,
+                                    Path projectRoot,
+                                    List<String> classpath,
+                                    List<Path> discoveredProjects) {
+        Path cacheFile = getCacheFile(workspaceRoot);
+        try {
+            Files.createDirectories(cacheFile.getParent());
+
+            // Load existing cache (or start fresh)
+            CacheData data;
+            if (Files.isRegularFile(cacheFile)) {
+                try (Reader reader = Files.newBufferedReader(cacheFile, StandardCharsets.UTF_8)) {
+                    data = GSON.fromJson(reader, CacheData.class);
+                    if (data == null || data.version != CACHE_VERSION) {
+                        data = new CacheData();
+                        data.version = CACHE_VERSION;
+                    }
+                } catch (Exception e) {
+                    data = new CacheData();
+                    data.version = CACHE_VERSION;
+                }
+            } else {
+                data = new CacheData();
+                data.version = CACHE_VERSION;
+            }
+            data.timestamp = System.currentTimeMillis();
+
+            if (data.projects == null) {
+                data.projects = new LinkedHashMap<>();
+            }
+            if (data.classpaths == null) {
+                data.classpaths = new LinkedHashMap<>();
+            }
+
+            String rootKey = projectRoot.toAbsolutePath().normalize().toString();
+            Map<String, String> projectStamps = computeBuildFileStampsForProject(projectRoot);
+            data.projects.put(rootKey, new ProjectCacheEntry(projectStamps, classpath));
+            data.classpaths.put(rootKey, classpath);
+
+            // Rebuild global stamps from all per-project stamps
+            Map<String, String> allStamps = new TreeMap<>();
+            for (ProjectCacheEntry pce : data.projects.values()) {
+                if (pce.stamps != null) {
+                    allStamps.putAll(pce.stamps);
+                }
+            }
+            data.buildFileHashes = allStamps;
+
+            if (discoveredProjects != null) {
+                data.discoveredProjects = new ArrayList<>();
+                for (Path p : discoveredProjects) {
+                    data.discoveredProjects.add(p.toAbsolutePath().normalize().toString());
+                }
+            }
+
+            // Atomic write
+            Path tmp = cacheFile.resolveSibling(cacheFile.getFileName() + ".tmp");
+            try (Writer writer = Files.newBufferedWriter(tmp, StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
+                GSON.toJson(data, writer);
+            }
+            Files.move(tmp, cacheFile, StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE);
+            logger.info("Classpath cache merged for project {} → {}", projectRoot, cacheFile);
+        } catch (IOException e) {
+            logger.warn("Failed to merge classpath cache for {}: {}", projectRoot, e.getMessage());
         }
     }
 
@@ -193,7 +315,66 @@ public class ClasspathCache {
      * @return {@code true} if every hash matches (no build file has changed)
      */
     public static boolean isValid(CacheData cached, Map<String, String> currentHashes) {
-        return cached.buildFileHashes.equals(currentHashes);
+        if (cached.buildFileHashes != null) {
+            return cached.buildFileHashes.equals(currentHashes);
+        }
+        // v3 cache without legacy hashes — validate per-project
+        if (cached.projects == null) return false;
+        Map<String, String> allStamps = new TreeMap<>();
+        for (ProjectCacheEntry pce : cached.projects.values()) {
+            if (pce.stamps != null) allStamps.putAll(pce.stamps);
+        }
+        return allStamps.equals(currentHashes);
+    }
+
+    /**
+     * Check whether a single project's cache entry is still valid by comparing
+     * its stored build-file stamps against the current state on disk.
+     *
+     * @param cached      the full cache data
+     * @param projectRoot the project root to validate
+     * @return {@code true} if the project's stamps match and its cached
+     *         classpath entries still exist; {@code false} otherwise
+     */
+    public static boolean isValidForProject(CacheData cached, Path projectRoot) {
+        if (cached.projects == null) return false;
+        String key = projectRoot.toAbsolutePath().normalize().toString();
+        ProjectCacheEntry entry = cached.projects.get(key);
+        if (entry == null || entry.stamps == null || entry.classpath == null) {
+            return false;
+        }
+        // Check stamps match current disk state
+        Map<String, String> currentStamps = computeBuildFileStampsForProject(projectRoot);
+        if (!entry.stamps.equals(currentStamps)) {
+            logger.debug("Cache stale for project {} — stamps mismatch", projectRoot);
+            return false;
+        }
+        // Spot-check that a few classpath entries still exist
+        if (!entry.classpath.isEmpty()) {
+            int toCheck = Math.min(3, entry.classpath.size());
+            int missing = 0;
+            for (int i = 0; i < toCheck; i++) {
+                if (!Files.exists(Paths.get(entry.classpath.get(i)))) {
+                    missing++;
+                }
+            }
+            if (missing > 0 && missing > toCheck / 2) {
+                logger.debug("Cache stale for project {} — classpath entries missing", projectRoot);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Get the cached classpath for a single project, or empty if not cached.
+     */
+    public static Optional<List<String>> getProjectClasspath(CacheData cached, Path projectRoot) {
+        if (cached.projects == null) return Optional.empty();
+        String key = projectRoot.toAbsolutePath().normalize().toString();
+        ProjectCacheEntry entry = cached.projects.get(key);
+        if (entry == null || entry.classpath == null) return Optional.empty();
+        return Optional.of(entry.classpath);
     }
 
     /**
@@ -284,13 +465,33 @@ public class ClasspathCache {
     }
 
     /**
+     * Compute build-file stamps for a single project root.
+     *
+     * @param projectRoot the project root directory
+     * @return map from key to stamp string for this project's build files
+     */
+    public static Map<String, String> computeBuildFileStampsForProject(Path projectRoot) {
+        return computeBuildFileStamps(Collections.singletonList(projectRoot));
+    }
+
+    /**
      * Convert cached classpath data back into the {@code Map<Path, List<String>>}
      * format expected by {@code GroovyServices.addProjects()}.
      */
     public static Map<Path, List<String>> toClasspathMap(CacheData data) {
         Map<Path, List<String>> result = new LinkedHashMap<>();
-        for (Map.Entry<String, List<String>> entry : data.classpaths.entrySet()) {
-            result.put(Paths.get(entry.getKey()), entry.getValue());
+        // Prefer v3 per-project entries
+        if (data.projects != null && !data.projects.isEmpty()) {
+            for (Map.Entry<String, ProjectCacheEntry> entry : data.projects.entrySet()) {
+                if (entry.getValue().classpath != null) {
+                    result.put(Paths.get(entry.getKey()), entry.getValue().classpath);
+                }
+            }
+        } else if (data.classpaths != null) {
+            // Fallback to legacy v2 format
+            for (Map.Entry<String, List<String>> entry : data.classpaths.entrySet()) {
+                result.put(Paths.get(entry.getKey()), entry.getValue());
+            }
         }
         return result;
     }

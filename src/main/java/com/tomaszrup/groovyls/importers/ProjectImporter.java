@@ -90,6 +90,24 @@ public interface ProjectImporter {
     }
 
     /**
+     * Resolve the classpath for a <b>single</b> project <b>without compiling</b>.
+     * This is the lazy on-demand variant used when the user opens a file in a
+     * project whose classpath hasn't been resolved yet.
+     *
+     * <p>The default implementation delegates to
+     * {@link #resolveClasspaths(List)} with a single-element list.
+     * Subclasses may override to provide a more targeted (and faster) approach,
+     * e.g. Gradle can run a targeted init-script task for just one subproject.</p>
+     *
+     * @param projectRoot the project root to resolve
+     * @return the list of classpath entries, or an empty list on failure
+     */
+    default List<String> resolveClasspath(Path projectRoot) {
+        Map<Path, List<String>> result = resolveClasspaths(java.util.Collections.singletonList(projectRoot));
+        return result.getOrDefault(projectRoot, java.util.Collections.emptyList());
+    }
+
+    /**
      * Recompile Java sources after file changes so that the Groovy compilation
      * unit picks up updated classes.
      */

@@ -110,12 +110,12 @@ public class FileChangeHandler {
 					|| path.endsWith("pom.xml"))) {
 				Path filePath = Paths.get(changedUri);
 				for (ProjectScope scope : scopes) {
-					if (scope.projectRoot != null && filePath.startsWith(scope.projectRoot)) {
-						if (path.endsWith(".java") && isBuildOutputFile(filePath, scope.projectRoot)) {
+					if (scope.getProjectRoot() != null && filePath.startsWith(scope.getProjectRoot())) {
+						if (path.endsWith(".java") && isBuildOutputFile(filePath, scope.getProjectRoot())) {
 							logger.debug("Ignoring build-output Java file: {}", filePath);
 							break;
 						}
-						projectsNeedingRecompile.add(scope.projectRoot);
+						projectsNeedingRecompile.add(scope.getProjectRoot());
 						break;
 					}
 				}
@@ -134,11 +134,11 @@ public class FileChangeHandler {
 			String uriPath = changedUri.getPath();
 			if (uriPath != null && uriPath.endsWith(".java")) {
 				for (ProjectScope scope : scopeManager.getAllScopes()) {
-					if (scope.projectRoot != null && scope.javaSourceLocator != null) {
+					if (scope.getProjectRoot() != null && scope.getJavaSourceLocator() != null) {
 						Path filePath = Paths.get(changedUri);
-						if (filePath.startsWith(scope.projectRoot)
-								&& !isBuildOutputFile(filePath, scope.projectRoot)) {
-							scope.javaSourceLocator.refresh();
+						if (filePath.startsWith(scope.getProjectRoot())
+								&& !isBuildOutputFile(filePath, scope.getProjectRoot())) {
+							scope.getJavaSourceLocator().refresh();
 							break;
 						}
 					}
@@ -157,14 +157,14 @@ public class FileChangeHandler {
 		boolean noProjectScopes = scopes.isEmpty();
 
 		for (ProjectScope scope : scopesToProcess) {
-			if (projectsNeedingRecompile.contains(scope.projectRoot)) {
+			if (projectsNeedingRecompile.contains(scope.getProjectRoot())) {
 				continue; // handled by scheduleJavaRecompile
 			}
 			// Skip scopes whose classpath hasn't been resolved yet — compiling
 			// them would produce thousands of false-positive diagnostics.
-			if (!scope.classpathResolved && scope.projectRoot != null) {
+			if (!scope.isClasspathResolved() && scope.getProjectRoot() != null) {
 				logger.debug("Skipping watcher-triggered compile for {} — classpath not yet resolved",
-						scope.projectRoot);
+						scope.getProjectRoot());
 				continue;
 			}
 
@@ -174,12 +174,12 @@ public class FileChangeHandler {
 			} else {
 				scopeUris = allChangedUris.stream()
 						.filter(uri -> {
-							if (scope.projectRoot == null) return false;
+							if (scope.getProjectRoot() == null) return false;
 							Path fp = Paths.get(uri);
-							if (!fp.startsWith(scope.projectRoot)) return false;
+							if (!fp.startsWith(scope.getProjectRoot())) return false;
 							String p = uri.getPath();
 							if (p != null && p.endsWith(".java")
-									&& isBuildOutputFile(fp, scope.projectRoot)) {
+									&& isBuildOutputFile(fp, scope.getProjectRoot())) {
 								logger.debug("Ignoring build-output file in watched-files processing: {}", fp);
 								return false;
 							}
@@ -188,9 +188,9 @@ public class FileChangeHandler {
 						.collect(Collectors.toSet());
 			}
 			if (!scopeUris.isEmpty()) {
-				scope.lock.writeLock().lock();
+				scope.getLock().writeLock().lock();
 				try {
-					scope.compilationUnitFactory.invalidateFileCache();
+					scope.getCompilationUnitFactory().invalidateFileCache();
 
 					// Handle .groovy file deletions: remove from dependency graph
 					for (URI changedUri : scopeUris) {
@@ -198,7 +198,7 @@ public class FileChangeHandler {
 						if (uriPath != null && uriPath.endsWith(".groovy")) {
 							try {
 								if (!Files.exists(Paths.get(changedUri))) {
-									scope.dependencyGraph.removeFile(changedUri);
+									scope.getDependencyGraph().removeFile(changedUri);
 								}
 							} catch (Exception e) {
 								// ignore URIs that can't be converted to Path
@@ -220,7 +220,7 @@ public class FileChangeHandler {
 						compilationService.updateDependencyGraph(scope, scopeUris);
 					}
 				} finally {
-					scope.lock.writeLock().unlock();
+					scope.getLock().writeLock().unlock();
 				}
 			}
 		}
@@ -277,11 +277,11 @@ public class FileChangeHandler {
 			return;
 		}
 
-		scope.lock.writeLock().lock();
+		scope.getLock().writeLock().lock();
 		try {
 			compilationService.recompileAfterJavaChange(scope);
 		} finally {
-			scope.lock.writeLock().unlock();
+			scope.getLock().writeLock().unlock();
 		}
 	}
 }

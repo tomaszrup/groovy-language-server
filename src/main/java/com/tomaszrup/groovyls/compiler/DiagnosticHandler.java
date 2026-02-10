@@ -26,6 +26,7 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -127,6 +128,21 @@ public class DiagnosticHandler {
 						logger.debug("  Diagnostic [{}] in {}: {}", projectRoot, uri, cause.getMessage());
 						diagnosticsByFile.computeIfAbsent(uri, (key) -> new ArrayList<>()).add(diagnostic);
 					});
+		}
+
+		// Deduplicate diagnostics per file — the Groovy compiler can report
+		// the same error in multiple compilation phases because
+		// LanguageServerErrorCollector.failIfErrors() is a no-op.
+		for (Map.Entry<URI, List<Diagnostic>> entry : diagnosticsByFile.entrySet()) {
+			List<Diagnostic> unique = new ArrayList<>();
+			Set<String> seen = new HashSet<>();
+			for (Diagnostic d : entry.getValue()) {
+				String key = d.getRange() + "|" + d.getMessage() + "|" + d.getSeverity();
+				if (seen.add(key)) {
+					unique.add(d);
+				}
+			}
+			entry.setValue(unique);
 		}
 
 		Set<PublishDiagnosticsParams> result = diagnosticsByFile.entrySet().stream()

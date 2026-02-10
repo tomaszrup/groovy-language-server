@@ -364,4 +364,161 @@ class JavaSourceLocatorTests {
 		URI uri = locator.findSourceURI("TopLevel");
 		Assertions.assertNotNull(uri, "Should find default-package class");
 	}
+
+	// ------------------------------------------------------------------
+	// Stub vs real source: race condition regression tests
+	// ------------------------------------------------------------------
+
+	/**
+	 * Helper to create a source JAR containing a single Java source entry.
+	 */
+	private Path createSourceJar(String jarName, String entryName, String sourceContent) throws Exception {
+		Path jarPath = tempProjectRoot.resolve(jarName);
+		Files.createDirectories(jarPath.getParent());
+		try (java.util.jar.JarOutputStream jos = new java.util.jar.JarOutputStream(
+				java.nio.file.Files.newOutputStream(jarPath))) {
+			jos.putNextEntry(new java.util.jar.JarEntry(entryName));
+			jos.write(sourceContent.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+			jos.closeEntry();
+		}
+		return jarPath;
+	}
+
+	/**
+	 * Helper to create a regular (non-source) JAR so that findSourceJar()
+	 * can locate the sibling -sources.jar by naming convention.
+	 */
+	private Path createDummyJar(String jarName) throws Exception {
+		Path jarPath = tempProjectRoot.resolve(jarName);
+		Files.createDirectories(jarPath.getParent());
+		try (java.util.jar.JarOutputStream jos = new java.util.jar.JarOutputStream(
+				java.nio.file.Files.newOutputStream(jarPath))) {
+			jos.putNextEntry(new java.util.jar.JarEntry("META-INF/MANIFEST.MF"));
+			jos.write("Manifest-Version: 1.0\n".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+			jos.closeEntry();
+		}
+		return jarPath;
+	}
+
+	@Test
+	void testRegisterDecompiledContentDoesNotOverwriteRealSource() throws Exception {
+		// Set up: a classpath JAR has a sibling -sources.jar with real source
+		String realSource = "package com.example;\n\npublic class Lib {\n    public void doWork() {}\n}\n";
+		Path dummyJar = createDummyJar("libs/mylib-1.0.jar");
+		createSourceJar("libs/mylib-1.0-sources.jar", "com/example/Lib.java", realSource);
+
+		// Index the source JARs via addClasspathJars
+		locator.addClasspathJars(java.util.Collections.singletonList(dummyJar.toString()));
+		Assertions.assertTrue(locator.hasSource("com.example.Lib"),
+				"Source JAR should be indexed for com.example.Lib");
+
+		// Now simulate the decompilation fallback trying to register a stub
+		java.util.List<String> stubLines = java.util.Arrays.asList(
+				"// Decompiled from bytecode — source not available",
+				"",
+				"package com.example;",
+				"",
+				"public class Lib {",
+				"    public void doWork() { }",
+				"}");
+		URI resultURI = locator.registerDecompiledContent("com.example.Lib", stubLines);
+
+		// The cached content should be the REAL source, not the stub
+		String content = locator.getDecompiledContent("com.example.Lib");
+		Assertions.assertNotNull(content, "Content should be cached");
+		Assertions.assertFalse(content.contains("Decompiled from bytecode"),
+				"Should serve real source, not decompiled stub");
+		Assertions.assertTrue(content.contains("public void doWork()"),
+				"Should contain real source content");
+	}
+
+	@Test
+	void testGetDecompiledContentByURIRefreshesStaleStub() throws Exception {
+		// Step 1: Register a decompiled stub (simulating the race: definition
+		// requested BEFORE classpath is resolved)
+		java.util.List<String> stubLines = java.util.Arrays.asList(
+				"// Decompiled from bytecode — source not available",
+				"",
+				"package com.dep;",
+				"",
+				"public class Service {",
+				"    public void serve() { }",
+				"}");
+		URI stubURI = locator.registerDecompiledContent("com.dep.Service", stubLines);
+
+		// Verify the stub is cached
+		String initialContent = locator.getDecompiledContentByURI(stubURI.toString());
+		Assertions.assertNotNull(initialContent);
+		Assertions.assertTrue(initialContent.contains("Decompiled from bytecode"));
+
+		// Step 2: Now classpath resolves and source JAR is indexed
+		String realSource = "package com.dep;\n\n/**\n * Real implementation.\n */\npublic class Service {\n    public void serve() {\n        System.out.println(\"serving\");\n    }\n}\n";
+		Path dummyJar = createDummyJar("cache/service-2.0.jar");
+		createSourceJar("cache/service-2.0-sources.jar", "com/dep/Service.java", realSource);
+		locator.addClasspathJars(java.util.Collections.singletonList(dummyJar.toString()));
+
+		// Step 3: Next time content is requested by URI, it should serve real source
+		String refreshedContent = locator.getDecompiledContentByURI(stubURI.toString());
+		Assertions.assertNotNull(refreshedContent);
+		Assertions.assertFalse(refreshedContent.contains("Decompiled from bytecode"),
+				"Should serve real source after classpath resolves, not stale stub");
+		Assertions.assertTrue(refreshedContent.contains("Real implementation"),
+				"Should contain content from -sources.jar");
+	}
+
+	@Test
+	void testAddClasspathJarsEvictsStaleStubs() throws Exception {
+		// Pre-populate the cache with a decompiled stub
+		java.util.List<String> stubLines = java.util.Arrays.asList(
+				"// Decompiled from bytecode — source not available",
+				"",
+				"package org.lib;",
+				"",
+				"public class Helper {",
+				"}");
+		locator.registerDecompiledContent("org.lib.Helper", stubLines);
+
+		String beforeContent = locator.getDecompiledContent("org.lib.Helper");
+		Assertions.assertTrue(beforeContent.contains("Decompiled from bytecode"),
+				"Before: should have stub content");
+
+		// Index source JARs that cover the same class
+		String realSource = "package org.lib;\n\npublic class Helper {\n    public static void help() {}\n}\n";
+		Path dummyJar = createDummyJar("repo/helper-3.0.jar");
+		createSourceJar("repo/helper-3.0-sources.jar", "org/lib/Helper.java", realSource);
+		locator.addClasspathJars(java.util.Collections.singletonList(dummyJar.toString()));
+
+		// The stale stub should have been evicted
+		String afterContent = locator.getDecompiledContent("org.lib.Helper");
+		// After eviction, getDecompiledContent returns null (cache entry removed)
+		// OR on next resolveSource call it will be re-populated with real source
+		Assertions.assertTrue(afterContent == null || !afterContent.contains("Decompiled from bytecode"),
+				"After source JAR indexing, stub should be evicted from cache");
+	}
+
+	@Test
+	void testFindLocationForClassPrefersSourceJarOverStub() throws Exception {
+		// Register stub first (simulating race)
+		java.util.List<String> stubLines = java.util.Arrays.asList(
+				"// Decompiled from bytecode — source not available",
+				"",
+				"package com.api;",
+				"",
+				"public class Client {",
+				"}");
+		locator.registerDecompiledContent("com.api.Client", stubLines);
+
+		// Now index source JARs
+		String realSource = "package com.api;\n\n/** HTTP client. */\npublic class Client {\n    public void get(String url) {}\n}\n";
+		Path dummyJar = createDummyJar("deps/api-1.0.jar");
+		createSourceJar("deps/api-1.0-sources.jar", "com/api/Client.java", realSource);
+		locator.addClasspathJars(java.util.Collections.singletonList(dummyJar.toString()));
+
+		// findLocationForClass should use source JAR, not stub
+		Location loc = locator.findLocationForClass("com.api.Client");
+		Assertions.assertNotNull(loc, "Should find location from source JAR");
+		// The class declaration "public class Client" is on line 3 (0-indexed)
+		Assertions.assertEquals(3, loc.getRange().getStart().getLine(),
+				"Should point to real class declaration in source JAR");
+	}
 }

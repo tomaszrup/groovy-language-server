@@ -30,10 +30,10 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import com.google.gson.JsonObject;
 
@@ -50,6 +50,7 @@ import io.github.classgraph.ScanResult;
 
 import com.tomaszrup.groovyls.compiler.ast.ASTNodeVisitor;
 import com.tomaszrup.groovyls.config.ICompilationUnitFactory;
+import com.tomaszrup.groovyls.util.JavaSourceLocator;
 import com.tomaszrup.groovyls.providers.CodeActionProvider;
 import com.tomaszrup.groovyls.providers.CompletionProvider;
 import com.tomaszrup.groovyls.providers.DefinitionProvider;
@@ -117,39 +118,42 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 
 	private volatile LanguageClient languageClient;
 	private SettingsChangeListener settingsChangeListener;
+	private volatile ClasspathResolutionCoordinator resolutionCoordinator;
 
-	// Debounce scheduler for didChange recompilation
-	private final ScheduledExecutorService debounceExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
-		Thread t = new Thread(r, "groovyls-debounce");
-		t.setDaemon(true);
-		return t;
-	});
-	private volatile ScheduledFuture<?> pendingDebounce;
+	// --- Shared executor pools (owned by GroovyLanguageServer) ---
 
-	/**
-	 * Executor for debounced Java/build-file recompile scheduling.
-	 */
-	private final ScheduledExecutorService javaRecompileExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
-		Thread t = new Thread(r, "groovyls-java-recompile");
-		t.setDaemon(true);
-		return t;
-	});
+	private final ExecutorPools executorPools;
+
+	/** Shared scheduling pool used for debounce timers. */
+	private final ScheduledExecutorService schedulingPool;
+
+	/** Shared background compilation pool. */
+	private final ExecutorService backgroundCompiler;
 
 	/**
-	 * Single-threaded executor for background compilations triggered by
-	 * {@code didOpen} and {@code didClose}.
+	 * Atomic holder for the pending debounce future. Uses
+	 * {@link AtomicReference#compareAndSet} to prevent the TOCTOU race
+	 * where two concurrent {@code didChange} calls could both cancel the
+	 * same future and both schedule new ones, causing redundant compilation.
 	 */
-	private final ExecutorService backgroundCompiler = Executors.newSingleThreadExecutor(r -> {
-		Thread t = new Thread(r, "groovyls-bg-compile");
-		t.setDaemon(true);
-		return t;
-	});
+	private final AtomicReference<ScheduledFuture<?>> pendingDebounce = new AtomicReference<>();
 
-	public GroovyServices(ICompilationUnitFactory factory) {
+	public GroovyServices(ICompilationUnitFactory factory, ExecutorPools executorPools) {
+		this.executorPools = executorPools;
+		this.schedulingPool = executorPools.getSchedulingPool();
+		this.backgroundCompiler = executorPools.getBackgroundCompilationPool();
 		this.scopeManager = new ProjectScopeManager(factory, fileContentsTracker);
 		this.compilationService = new CompilationService(fileContentsTracker);
-		this.fileChangeHandler = new FileChangeHandler(scopeManager, compilationService, javaRecompileExecutor);
+		this.fileChangeHandler = new FileChangeHandler(scopeManager, compilationService, schedulingPool);
 		this.documentResolverService = new DocumentResolverService(scopeManager);
+	}
+
+	/**
+	 * Convenience constructor that creates its own {@link ExecutorPools}.
+	 * Used by tests and standalone scenarios where shared pools are not needed.
+	 */
+	public GroovyServices(ICompilationUnitFactory factory) {
+		this(factory, new ExecutorPools());
 	}
 
 	// --- Lifecycle / wiring ---
@@ -162,15 +166,12 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	}
 
 	public void shutdown() {
-		debounceExecutor.shutdownNow();
-		javaRecompileExecutor.shutdownNow();
-		backgroundCompiler.shutdownNow();
-		try {
-			debounceExecutor.awaitTermination(5, TimeUnit.SECONDS);
-			javaRecompileExecutor.awaitTermination(5, TimeUnit.SECONDS);
-			backgroundCompiler.awaitTermination(5, TimeUnit.SECONDS);
-		} catch (InterruptedException e) {
-			Thread.currentThread().interrupt();
+		// Pool shutdown is handled centrally by ExecutorPools.shutdownAll()
+		// called from GroovyLanguageServer.shutdown().
+		// Cancel any pending debounce to avoid stale tasks.
+		ScheduledFuture<?> pending = pendingDebounce.getAndSet(null);
+		if (pending != null) {
+			pending.cancel(false);
 		}
 	}
 
@@ -186,20 +187,69 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		scopeManager.setImportInProgress(inProgress);
 	}
 
+	/**
+	 * Look up decompiled content across all project scopes.
+	 * Returns the content for the first matching scope, or {@code null}
+	 * if no scope has decompiled content for the given class.
+	 *
+	 * @param className fully-qualified class name
+	 * @return decompiled source text, or {@code null}
+	 */
+	public String getDecompiledContent(String className) {
+		for (ProjectScope scope : scopeManager.getProjectScopes()) {
+			JavaSourceLocator locator = scope.getJavaSourceLocator();
+			if (locator != null) {
+				String content = locator.getDecompiledContent(className);
+				if (content != null) {
+					return content;
+				}
+			}
+		}
+		ProjectScope ds = scopeManager.getDefaultScope();
+		if (ds != null && ds.getJavaSourceLocator() != null) {
+			return ds.getJavaSourceLocator().getDecompiledContent(className);
+		}
+		return null;
+	}
+
+	/**
+	 * Look up decompiled content by URI string across all project scopes.
+	 * Supports {@code decompiled:}, {@code jar:}, and {@code jrt:} URIs.
+	 *
+	 * @param uri the URI string
+	 * @return decompiled source text, or {@code null}
+	 */
+	public String getDecompiledContentByURI(String uri) {
+		for (ProjectScope scope : scopeManager.getProjectScopes()) {
+			JavaSourceLocator locator = scope.getJavaSourceLocator();
+			if (locator != null) {
+				String content = locator.getDecompiledContentByURI(uri);
+				if (content != null) {
+					return content;
+				}
+			}
+		}
+		ProjectScope ds = scopeManager.getDefaultScope();
+		if (ds != null && ds.getJavaSourceLocator() != null) {
+			return ds.getJavaSourceLocator().getDecompiledContentByURI(uri);
+		}
+		return null;
+	}
+
 	public void onImportComplete() {
 		scopeManager.setImportInProgress(false);
 		List<ProjectScope> scopes = scopeManager.getProjectScopes();
 		if (scopes.isEmpty()) {
 			// No build-tool projects found — compile the default scope
 			ProjectScope ds = scopeManager.getDefaultScope();
-			ds.lock.writeLock().lock();
+			ds.getLock().writeLock().lock();
 			try {
 				Set<URI> openURIs = fileContentsTracker.getOpenURIs();
 				for (URI uri : openURIs) {
 					compilationService.compileAndVisitAST(ds, uri);
 				}
 			} finally {
-				ds.lock.writeLock().unlock();
+				ds.getLock().writeLock().unlock();
 			}
 			if (languageClient != null) {
 				languageClient.refreshSemanticTokens();
@@ -216,31 +266,44 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		if (!openURIs.isEmpty()) {
 			// Deduplicate: only compile each scope once, even if multiple
 			// files are open in the same project.
-			Map<ProjectScope, URI> scopeToURI = new java.util.LinkedHashMap<>();
+			Map<ProjectScope, URI> scopeToResolvedURI = new java.util.LinkedHashMap<>();
+			Map<ProjectScope, URI> scopeToUnresolvedURI = new java.util.LinkedHashMap<>();
 			for (URI uri : openURIs) {
 				ProjectScope scope = scopeManager.findProjectScope(uri);
-				if (scope != null && scope.classpathResolved) {
-					scopeToURI.putIfAbsent(scope, uri);
+				if (scope != null && scope.isClasspathResolved()) {
+					scopeToResolvedURI.putIfAbsent(scope, uri);
+				} else if (scope != null && !scope.isClasspathResolved()) {
+					scopeToUnresolvedURI.putIfAbsent(scope, uri);
 				}
 			}
 
-			if (!scopeToURI.isEmpty()) {
+			if (!scopeToResolvedURI.isEmpty()) {
 				logger.info("Scheduling background compilation for {} scope(s) with open files",
-						scopeToURI.size());
+						scopeToResolvedURI.size());
 				backgroundCompiler.submit(() -> {
-					for (Map.Entry<ProjectScope, URI> entry : scopeToURI.entrySet()) {
+					for (Map.Entry<ProjectScope, URI> entry : scopeToResolvedURI.entrySet()) {
 						ProjectScope scope = entry.getKey();
-						scope.lock.writeLock().lock();
-						try {
-							compilationService.ensureScopeCompiled(scope);
-						} finally {
-							scope.lock.writeLock().unlock();
+					scope.getLock().writeLock().lock();
+					try {
+						compilationService.ensureScopeCompiled(scope);
+					} finally {
+						scope.getLock().writeLock().unlock();
 						}
 					}
 					if (languageClient != null) {
 						languageClient.refreshSemanticTokens();
 					}
 				});
+			}
+
+			// For open files in scopes whose classpath has NOT been resolved
+			// yet, trigger lazy resolution now so the user gets diagnostics.
+			if (!scopeToUnresolvedURI.isEmpty() && resolutionCoordinator != null) {
+				logger.info("Triggering lazy classpath resolution for {} scope(s) with open files",
+						scopeToUnresolvedURI.size());
+				for (Map.Entry<ProjectScope, URI> entry : scopeToUnresolvedURI.entrySet()) {
+					resolutionCoordinator.requestResolution(entry.getKey(), entry.getValue());
+				}
 			}
 		}
 	}
@@ -251,6 +314,18 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 
 	public void setSettingsChangeListener(SettingsChangeListener listener) {
 		this.settingsChangeListener = listener;
+	}
+
+	public void setResolutionCoordinator(ClasspathResolutionCoordinator coordinator) {
+		this.resolutionCoordinator = coordinator;
+	}
+
+	public ProjectScopeManager getScopeManager() {
+		return scopeManager;
+	}
+
+	public CompilationService getCompilationService() {
+		return compilationService;
 	}
 
 	// --- Project registration (delegated to scopeManager + compilationService) ---
@@ -283,14 +358,14 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		for (Map.Entry<ProjectScope, URI> entry : scopeToRepresentativeURI.entrySet()) {
 			ProjectScope scope = entry.getKey();
 			URI uri = entry.getValue();
-			scope.lock.writeLock().lock();
+			scope.getLock().writeLock().lock();
 			try {
 				boolean didFullCompile = compilationService.ensureScopeCompiled(scope);
 				if (!didFullCompile) {
 					compilationService.compileAndVisitAST(scope, uri);
 				}
 			} finally {
-				scope.lock.writeLock().unlock();
+				scope.getLock().writeLock().unlock();
 			}
 		}
 
@@ -313,17 +388,19 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		URI uri = URI.create(params.getTextDocument().getUri());
 		ProjectScope scope = scopeManager.findProjectScope(uri);
 		if (scope != null && !scopeManager.isImportPendingFor(scope)) {
-			scope.lock.writeLock().lock();
-			try {
-				// Ensure the scope is compiled at least once (lazy first compile).
-				// Do NOT trigger compileAndVisitAST here — opening a file is not
-				// a content change. The AST from initial compilation (disk-based)
-				// is correct. Actual edits trigger recompilation via didChange().
-				// Code-intelligence requests (hover, completion) also lazily
-				// recompile if changes are pending via ensureCompiledForContext().
-				compilationService.ensureScopeCompiled(scope);
-			} finally {
-				scope.lock.writeLock().unlock();
+			if (!scope.isClasspathResolved() && resolutionCoordinator != null) {
+				// Trigger lazy classpath resolution for this project.
+				// The coordinator will resolve, apply, compile, and backfill.
+				resolutionCoordinator.requestResolution(scope, uri);
+				// Meanwhile, provide basic syntax checking
+				backgroundCompiler.submit(() -> compilationService.syntaxCheckSingleFile(uri));
+			} else {
+				scope.getLock().writeLock().lock();
+				try {
+					compilationService.ensureScopeCompiled(scope);
+				} finally {
+					scope.getLock().writeLock().unlock();
+				}
 			}
 		} else if (scopeManager.isImportPendingFor(scope != null ? scope : scopeManager.getDefaultScope())) {
 			backgroundCompiler.submit(() -> compilationService.syntaxCheckSingleFile(uri));
@@ -334,25 +411,34 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	public void didChange(DidChangeTextDocumentParams params) {
 		fileContentsTracker.didChange(params);
 
-		ScheduledFuture<?> prev = pendingDebounce;
-		if (prev != null) {
-			prev.cancel(false);
-		}
-		pendingDebounce = debounceExecutor.schedule(() -> {
+		// Atomically cancel-and-reschedule to prevent the TOCTOU race where
+		// two concurrent didChange calls could both cancel the same future
+		// and both schedule new ones, causing redundant compilation.
+		ScheduledFuture<?> newFuture = schedulingPool.schedule(() -> {
 			URI uri = URI.create(params.getTextDocument().getUri());
 			ProjectScope scope = scopeManager.findProjectScope(uri);
 			if (scope != null && !scopeManager.isImportPendingFor(scope)) {
-				scope.lock.writeLock().lock();
-				try {
-					boolean didFullCompile = compilationService.ensureScopeCompiled(scope);
-					if (!didFullCompile) {
-						compilationService.compileAndVisitAST(scope, uri);
+				if (!scope.isClasspathResolved() && resolutionCoordinator != null) {
+					// Classpath not yet resolved — request lazy resolution.
+					// Don't attempt full compilation without classpath.
+					resolutionCoordinator.requestResolution(scope, uri);
+				} else {
+					scope.getLock().writeLock().lock();
+					try {
+						boolean didFullCompile = compilationService.ensureScopeCompiled(scope);
+						if (!didFullCompile) {
+							compilationService.compileAndVisitAST(scope, uri);
+						}
+					} finally {
+						scope.getLock().writeLock().unlock();
 					}
-				} finally {
-					scope.lock.writeLock().unlock();
 				}
 			}
 		}, DEBOUNCE_DELAY_MS, TimeUnit.MILLISECONDS);
+		ScheduledFuture<?> prev = pendingDebounce.getAndSet(newFuture);
+		if (prev != null) {
+			prev.cancel(false);
+		}
 	}
 
 	@Override
@@ -398,18 +484,18 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		}
 		if (scopeManager.isImportInProgress()) {
 			logger.info("updateClasspath() deferred — project import in progress");
-			scopeManager.getDefaultScope().compilationUnitFactory.setAdditionalClasspathList(classpathList);
+			scopeManager.getDefaultScope().getCompilationUnitFactory().setAdditionalClasspathList(classpathList);
 			return;
 		}
 		ProjectScope ds = scopeManager.getDefaultScope();
-		ds.lock.writeLock().lock();
+		ds.getLock().writeLock().lock();
 		try {
-			if (!classpathList.equals(ds.compilationUnitFactory.getAdditionalClasspathList())) {
-				ds.compilationUnitFactory.setAdditionalClasspathList(classpathList);
+			if (!classpathList.equals(ds.getCompilationUnitFactory().getAdditionalClasspathList())) {
+				ds.getCompilationUnitFactory().setAdditionalClasspathList(classpathList);
 				compilationService.recompileForClasspathChange(ds);
 			}
 		} finally {
-			ds.lock.writeLock().unlock();
+			ds.getLock().writeLock().unlock();
 		}
 	}
 
@@ -435,7 +521,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	public CompletableFuture<Hover> hover(HoverParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
 		ProjectScope scope = compilationService.ensureCompiledForContext(uri, scopeManager, backgroundCompiler);
-		ASTNodeVisitor visitor = scope != null ? scope.astVisitor : null;
+		ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
 		if (visitor == null) {
 			return CompletableFuture.completedFuture(null);
 		}
@@ -455,61 +541,67 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			return CompletableFuture.completedFuture(Either.forRight(new CompletionList()));
 		}
 
-		scope.lock.writeLock().lock();
+		// Capture AST snapshot under write-lock, then run providers lock-free.
+		ASTNodeVisitor visitor;
+		ScanResult scanResult;
+		scope.getLock().writeLock().lock();
 		try {
 			compilationService.ensureScopeCompiled(scope);
-			if (scope.astVisitor == null) {
+			if (scope.getAstVisitor() == null) {
 				return CompletableFuture.completedFuture(Either.forRight(new CompletionList()));
 			}
-			if (!fileContentsTracker.hasChangedURIsUnder(scope.projectRoot)) {
+			if (!fileContentsTracker.hasChangedURIsUnder(scope.getProjectRoot())) {
 				compilationService.recompileIfContextChanged(scope, uri);
 			} else {
 				compilationService.compileAndVisitAST(scope, uri);
 			}
 
 			String originalSource = null;
-			ASTNode offsetNode = scope.astVisitor.getNodeAtLineAndColumn(uri, position.getLine(),
+			ASTNode offsetNode = scope.getAstVisitor().getNodeAtLineAndColumn(uri, position.getLine(),
 					position.getCharacter());
 			if (offsetNode == null) {
 				originalSource = compilationService.injectCompletionPlaceholder(scope, uri, position);
 			}
 
-			CompletableFuture<Either<List<CompletionItem>, CompletionList>> result;
-			try {
-				CompletionProvider provider = new CompletionProvider(scope.astVisitor, scope.classGraphScanResult);
-				result = provider.provideCompletion(params.getTextDocument(), params.getPosition(),
+			// Capture snapshot references before releasing the lock
+			visitor = scope.getAstVisitor();
+			scanResult = scope.getClassGraphScanResult();
+
+			if (originalSource != null) {
+				compilationService.restoreDocumentSource(scope, uri, originalSource);
+			}
+		} finally {
+			scope.getLock().writeLock().unlock();
+		}
+
+		// Provider logic runs lock-free on the captured AST snapshot
+		CompletionProvider provider = new CompletionProvider(visitor, scanResult);
+		CompletableFuture<Either<List<CompletionItem>, CompletionList>> result =
+				provider.provideCompletion(params.getTextDocument(), params.getPosition(),
 						params.getContext());
 
-				SpockCompletionProvider spockProvider = new SpockCompletionProvider(scope.astVisitor);
-				ASTNode currentNode = scope.astVisitor.getNodeAtLineAndColumn(uri, position.getLine(),
-						position.getCharacter());
-				if (currentNode != null) {
-					List<CompletionItem> spockItems = spockProvider.provideSpockCompletions(uri, position,
-							currentNode);
-					if (!spockItems.isEmpty()) {
-						result = result.thenApply(either -> {
-							if (either.isLeft()) {
-								List<CompletionItem> combined = new ArrayList<>(either.getLeft());
-								combined.addAll(spockItems);
-								return Either.forLeft(combined);
-							} else {
-								CompletionList list = either.getRight();
-								list.getItems().addAll(spockItems);
-								return Either.forRight(list);
-							}
-						});
+		SpockCompletionProvider spockProvider = new SpockCompletionProvider(visitor);
+		ASTNode currentNode = visitor.getNodeAtLineAndColumn(uri, position.getLine(),
+				position.getCharacter());
+		if (currentNode != null) {
+			List<CompletionItem> spockItems = spockProvider.provideSpockCompletions(uri, position,
+					currentNode);
+			if (!spockItems.isEmpty()) {
+				result = result.thenApply(either -> {
+					if (either.isLeft()) {
+						List<CompletionItem> combined = new ArrayList<>(either.getLeft());
+						combined.addAll(spockItems);
+						return Either.forLeft(combined);
+					} else {
+						CompletionList list = either.getRight();
+						list.getItems().addAll(spockItems);
+						return Either.forRight(list);
 					}
-				}
-			} finally {
-				if (originalSource != null) {
-					compilationService.restoreDocumentSource(scope, uri, originalSource);
-				}
+				});
 			}
-
-			return result;
-		} finally {
-			scope.lock.writeLock().unlock();
 		}
+
+		return result;
 	}
 
 	@Override
@@ -517,12 +609,12 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			DefinitionParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
 		ProjectScope scope = compilationService.ensureCompiledForContext(uri, scopeManager, backgroundCompiler);
-		ASTNodeVisitor visitor = scope != null ? scope.astVisitor : null;
+		ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
 		if (visitor == null) {
 			return CompletableFuture.completedFuture(Either.forLeft(Collections.emptyList()));
 		}
 
-		DefinitionProvider provider = new DefinitionProvider(visitor, scope.javaSourceLocator);
+		DefinitionProvider provider = new DefinitionProvider(visitor, scope.getJavaSourceLocator());
 		return provider.provideDefinition(params.getTextDocument(), params.getPosition());
 	}
 
@@ -537,36 +629,40 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			return CompletableFuture.completedFuture(new SignatureHelp());
 		}
 
-		scope.lock.writeLock().lock();
+		// Capture AST snapshot under write-lock, then run provider lock-free.
+		ASTNodeVisitor visitor;
+		scope.getLock().writeLock().lock();
 		try {
 			compilationService.ensureScopeCompiled(scope);
-			if (scope.astVisitor == null) {
+			if (scope.getAstVisitor() == null) {
 				return CompletableFuture.completedFuture(new SignatureHelp());
 			}
-			if (!fileContentsTracker.hasChangedURIsUnder(scope.projectRoot)) {
+			if (!fileContentsTracker.hasChangedURIsUnder(scope.getProjectRoot())) {
 				compilationService.recompileIfContextChanged(scope, uri);
 			} else {
 				compilationService.compileAndVisitAST(scope, uri);
 			}
 
 			String originalSource = null;
-			ASTNode offsetNode = scope.astVisitor.getNodeAtLineAndColumn(uri, position.getLine(),
+			ASTNode offsetNode = scope.getAstVisitor().getNodeAtLineAndColumn(uri, position.getLine(),
 					position.getCharacter());
 			if (offsetNode == null) {
 				originalSource = compilationService.injectSignatureHelpPlaceholder(scope, uri, position);
 			}
 
-			try {
-				SignatureHelpProvider provider = new SignatureHelpProvider(scope.astVisitor);
-				return provider.provideSignatureHelp(params.getTextDocument(), params.getPosition());
-			} finally {
-				if (originalSource != null) {
-					compilationService.restoreDocumentSource(scope, uri, originalSource);
-				}
+			// Capture snapshot reference before releasing the lock
+			visitor = scope.getAstVisitor();
+
+			if (originalSource != null) {
+				compilationService.restoreDocumentSource(scope, uri, originalSource);
 			}
 		} finally {
-			scope.lock.writeLock().unlock();
+			scope.getLock().writeLock().unlock();
 		}
+
+		// Provider logic runs lock-free on the captured AST snapshot
+		SignatureHelpProvider provider = new SignatureHelpProvider(visitor);
+		return provider.provideSignatureHelp(params.getTextDocument(), params.getPosition());
 	}
 
 	@Override
@@ -574,12 +670,12 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			TypeDefinitionParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
 		ProjectScope scope = compilationService.ensureCompiledForContext(uri, scopeManager, backgroundCompiler);
-		ASTNodeVisitor visitor = scope != null ? scope.astVisitor : null;
+		ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
 		if (visitor == null) {
 			return CompletableFuture.completedFuture(Either.forLeft(Collections.emptyList()));
 		}
 
-		TypeDefinitionProvider provider = new TypeDefinitionProvider(visitor, scope.javaSourceLocator);
+		TypeDefinitionProvider provider = new TypeDefinitionProvider(visitor, scope.getJavaSourceLocator());
 		return provider.provideTypeDefinition(params.getTextDocument(), params.getPosition());
 	}
 
@@ -588,7 +684,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			ImplementationParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
 		ProjectScope scope = compilationService.ensureCompiledForContext(uri, scopeManager, backgroundCompiler);
-		ASTNodeVisitor visitor = scope != null ? scope.astVisitor : null;
+		ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
 		if (visitor == null) {
 			return CompletableFuture.completedFuture(Either.forLeft(Collections.emptyList()));
 		}
@@ -601,7 +697,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	public CompletableFuture<List<? extends DocumentHighlight>> documentHighlight(DocumentHighlightParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
 		ProjectScope scope = compilationService.ensureCompiledForContext(uri, scopeManager, backgroundCompiler);
-		ASTNodeVisitor visitor = scope != null ? scope.astVisitor : null;
+		ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
 		if (visitor == null) {
 			return CompletableFuture.completedFuture(Collections.emptyList());
 		}
@@ -614,7 +710,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	public CompletableFuture<List<? extends Location>> references(ReferenceParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
 		ProjectScope scope = compilationService.ensureCompiledForContext(uri, scopeManager, backgroundCompiler);
-		ASTNodeVisitor visitor = scope != null ? scope.astVisitor : null;
+		ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
 		if (visitor == null) {
 			return CompletableFuture.completedFuture(Collections.emptyList());
 		}
@@ -628,7 +724,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			DocumentSymbolParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
 		ProjectScope scope = compilationService.ensureCompiledForContext(uri, scopeManager, backgroundCompiler);
-		ASTNodeVisitor visitor = scope != null ? scope.astVisitor : null;
+		ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
 		if (visitor == null) {
 			return CompletableFuture.completedFuture(Collections.emptyList());
 		}
@@ -643,11 +739,11 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		// Ensure all scopes are compiled and up-to-date before querying —
 		// workspace symbol is a cross-scope request with no single context URI.
 		for (ProjectScope scope : scopeManager.getAllScopes()) {
-			if (!scope.compiled || fileContentsTracker.hasChangedURIsUnder(scope.projectRoot)) {
-				scope.lock.writeLock().lock();
+			if (!scope.isCompiled() || fileContentsTracker.hasChangedURIsUnder(scope.getProjectRoot())) {
+				scope.getLock().writeLock().lock();
 				try {
 					boolean didFull = compilationService.ensureScopeCompiled(scope);
-					if (!didFull && fileContentsTracker.hasChangedURIsUnder(scope.projectRoot)) {
+					if (!didFull && fileContentsTracker.hasChangedURIsUnder(scope.getProjectRoot())) {
 						Set<URI> pending = fileContentsTracker.getChangedURIs();
 						URI representative = pending.isEmpty() ? null : pending.iterator().next();
 						if (representative != null) {
@@ -655,14 +751,14 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 						}
 					}
 				} finally {
-					scope.lock.writeLock().unlock();
+					scope.getLock().writeLock().unlock();
 				}
 			}
 		}
 
 		List<CompletableFuture<List<? extends SymbolInformation>>> futures = new ArrayList<>();
 		for (ProjectScope scope : scopeManager.getAllScopes()) {
-			ASTNodeVisitor visitor = scope.astVisitor;
+			ASTNodeVisitor visitor = scope.getAstVisitor();
 			if (visitor != null) {
 				WorkspaceSymbolProvider provider = new WorkspaceSymbolProvider(visitor);
 				futures.add(provider.provideWorkspaceSymbols(params.getQuery()));
@@ -683,7 +779,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			PrepareRenameParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
 		ProjectScope scope = compilationService.ensureCompiledForContext(uri, scopeManager, backgroundCompiler);
-		ASTNodeVisitor visitor = scope != null ? scope.astVisitor : null;
+		ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
 		if (visitor == null) {
 			return CompletableFuture.completedFuture(null);
 		}
@@ -696,7 +792,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	public CompletableFuture<WorkspaceEdit> rename(RenameParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
 		ProjectScope scope = compilationService.ensureCompiledForContext(uri, scopeManager, backgroundCompiler);
-		ASTNodeVisitor visitor = scope != null ? scope.astVisitor : null;
+		ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
 		if (visitor == null) {
 			return CompletableFuture.completedFuture(new WorkspaceEdit());
 		}
@@ -709,8 +805,8 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	public CompletableFuture<List<Either<Command, CodeAction>>> codeAction(CodeActionParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
 		ProjectScope scope = compilationService.ensureCompiledForContext(uri, scopeManager, backgroundCompiler);
-		ASTNodeVisitor visitor = scope != null ? scope.astVisitor : null;
-		ScanResult scanResult = scope != null ? scope.classGraphScanResult : null;
+		ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
+		ScanResult scanResult = scope != null ? scope.getClassGraphScanResult() : null;
 		if (visitor == null) {
 			return CompletableFuture.completedFuture(Collections.emptyList());
 		}
@@ -735,7 +831,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	public CompletableFuture<List<InlayHint>> inlayHint(InlayHintParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
 		ProjectScope scope = compilationService.ensureCompiledForContext(uri, scopeManager, backgroundCompiler);
-		ASTNodeVisitor visitor = scope != null ? scope.astVisitor : null;
+		ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
 		if (visitor == null) {
 			return CompletableFuture.completedFuture(Collections.emptyList());
 		}
@@ -751,13 +847,29 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		}
 		URI uri = URI.create(params.getTextDocument().getUri());
 		ProjectScope scope = scopeManager.findProjectScope(uri);
-		ASTNodeVisitor visitor = scope != null ? scope.astVisitor : null;
+		ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
 		if (visitor == null) {
 			return CompletableFuture.completedFuture(new SemanticTokens(Collections.emptyList()));
 		}
 
 		SemanticTokensProvider provider = new SemanticTokensProvider(visitor, fileContentsTracker);
 		return provider.provideSemanticTokensFull(params.getTextDocument());
+	}
+
+	@Override
+	public CompletableFuture<SemanticTokens> semanticTokensRange(SemanticTokensRangeParams params) {
+		if (!scopeManager.isSemanticHighlightingEnabled()) {
+			return CompletableFuture.completedFuture(new SemanticTokens(Collections.emptyList()));
+		}
+		URI uri = URI.create(params.getTextDocument().getUri());
+		ProjectScope scope = scopeManager.findProjectScope(uri);
+		ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
+		if (visitor == null) {
+			return CompletableFuture.completedFuture(new SemanticTokens(Collections.emptyList()));
+		}
+
+		SemanticTokensProvider provider = new SemanticTokensProvider(visitor, fileContentsTracker);
+		return provider.provideSemanticTokensRange(params.getTextDocument(), params.getRange());
 	}
 
 	@Override

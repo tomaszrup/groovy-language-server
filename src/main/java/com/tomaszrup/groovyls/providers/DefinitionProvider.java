@@ -35,11 +35,13 @@ import org.codehaus.groovy.ast.Variable;
 import org.eclipse.lsp4j.Location;
 import org.eclipse.lsp4j.LocationLink;
 import org.eclipse.lsp4j.Position;
+import org.eclipse.lsp4j.Range;
 import org.eclipse.lsp4j.TextDocumentIdentifier;
 import org.eclipse.lsp4j.jsonrpc.messages.Either;
 
 import com.tomaszrup.groovyls.compiler.ast.ASTNodeVisitor;
 import com.tomaszrup.groovyls.compiler.util.GroovyASTUtils;
+import com.tomaszrup.groovyls.util.ClassNodeDecompiler;
 import com.tomaszrup.groovyls.util.GroovyLanguageServerUtils;
 import com.tomaszrup.groovyls.util.JavaSourceLocator;
 
@@ -106,28 +108,35 @@ public class DefinitionProvider {
 		}
 		if (definitionNode instanceof ClassNode) {
 			ClassNode classNode = (ClassNode) definitionNode;
-			return javaSourceLocator.findLocationForClass(classNode.getName());
+			Location loc = javaSourceLocator.findLocationForClass(classNode.getName());
+			if (loc != null) return loc;
+			return decompileAndLocateClass(classNode);
 		}
 		if (definitionNode instanceof ConstructorNode) {
 			ConstructorNode ctorNode = (ConstructorNode) definitionNode;
 			ClassNode declaringClass = ctorNode.getDeclaringClass();
 			if (declaringClass != null) {
-				return javaSourceLocator.findLocationForConstructor(
+				Location loc = javaSourceLocator.findLocationForConstructor(
 						declaringClass.getName(), ctorNode.getParameters().length);
+				if (loc != null) return loc;
+				return decompileAndLocateConstructor(declaringClass, ctorNode.getParameters().length);
 			}
 		}
 		if (definitionNode instanceof MethodNode) {
 			MethodNode methodNode = (MethodNode) definitionNode;
 			ClassNode declaringClass = methodNode.getDeclaringClass();
 			if (declaringClass != null) {
-				// Check if this is a constructor call (ConstructorCallExpression
-				// resolves to a MethodNode named "<init>")
 				if ("<init>".equals(methodNode.getName())) {
-					return javaSourceLocator.findLocationForConstructor(
+					Location loc = javaSourceLocator.findLocationForConstructor(
 							declaringClass.getName(), methodNode.getParameters().length);
+					if (loc != null) return loc;
+					return decompileAndLocateConstructor(declaringClass, methodNode.getParameters().length);
 				}
-				return javaSourceLocator.findLocationForMethod(
+				Location loc = javaSourceLocator.findLocationForMethod(
 						declaringClass.getName(), methodNode.getName(),
+						methodNode.getParameters().length);
+				if (loc != null) return loc;
+				return decompileAndLocateMethod(declaringClass, methodNode.getName(),
 						methodNode.getParameters().length);
 			}
 		}
@@ -135,25 +144,75 @@ public class DefinitionProvider {
 			PropertyNode propNode = (PropertyNode) definitionNode;
 			ClassNode declaringClass = propNode.getDeclaringClass();
 			if (declaringClass != null) {
-				return javaSourceLocator.findLocationForField(
+				Location loc = javaSourceLocator.findLocationForField(
 						declaringClass.getName(), propNode.getName());
+				if (loc != null) return loc;
+				return decompileAndLocateField(declaringClass, propNode.getName());
 			}
 		}
 		if (definitionNode instanceof FieldNode) {
 			FieldNode fieldNode = (FieldNode) definitionNode;
 			ClassNode declaringClass = fieldNode.getDeclaringClass();
 			if (declaringClass != null) {
-				return javaSourceLocator.findLocationForField(
+				Location loc = javaSourceLocator.findLocationForField(
 						declaringClass.getName(), fieldNode.getName());
+				if (loc != null) return loc;
+				return decompileAndLocateField(declaringClass, fieldNode.getName());
 			}
 		}
 		if (definitionNode instanceof Variable) {
 			Variable variable = (Variable) definitionNode;
 			ClassNode originType = variable.getOriginType();
 			if (originType != null) {
-				return javaSourceLocator.findLocationForClass(originType.getName());
+				Location loc = javaSourceLocator.findLocationForClass(originType.getName());
+				if (loc != null) return loc;
+				return decompileAndLocateClass(originType);
 			}
 		}
 		return null;
+	}
+
+	// --- Decompilation fallback methods ---
+
+	private Location decompileAndLocateClass(ClassNode classNode) {
+		URI uri = ensureDecompiled(classNode);
+		if (uri == null) return null;
+		int line = ClassNodeDecompiler.getClassDeclarationLine(classNode);
+		return new Location(uri.toString(),
+				new Range(new Position(line, 0), new Position(line, 0)));
+	}
+
+	private Location decompileAndLocateMethod(ClassNode classNode, String methodName, int paramCount) {
+		URI uri = ensureDecompiled(classNode);
+		if (uri == null) return null;
+		int line = ClassNodeDecompiler.getMethodLine(classNode, methodName, paramCount);
+		return new Location(uri.toString(),
+				new Range(new Position(line, 0), new Position(line, 0)));
+	}
+
+	private Location decompileAndLocateConstructor(ClassNode classNode, int paramCount) {
+		URI uri = ensureDecompiled(classNode);
+		if (uri == null) return null;
+		int line = ClassNodeDecompiler.getMethodLine(classNode, classNode.getNameWithoutPackage(), paramCount);
+		return new Location(uri.toString(),
+				new Range(new Position(line, 0), new Position(line, 0)));
+	}
+
+	private Location decompileAndLocateField(ClassNode classNode, String fieldName) {
+		URI uri = ensureDecompiled(classNode);
+		if (uri == null) return null;
+		int line = ClassNodeDecompiler.getFieldLine(classNode, fieldName);
+		return new Location(uri.toString(),
+				new Range(new Position(line, 0), new Position(line, 0)));
+	}
+
+	private URI ensureDecompiled(ClassNode classNode) {
+		if (javaSourceLocator == null || classNode == null) return null;
+		String className = classNode.getName();
+		// If real source is now available (e.g. source JARs indexed after
+		// lazy classpath resolution), skip decompilation entirely.
+		if (javaSourceLocator.hasSource(className)) return null;
+		List<String> lines = ClassNodeDecompiler.decompile(classNode);
+		return javaSourceLocator.registerDecompiledContent(className, lines);
 	}
 }

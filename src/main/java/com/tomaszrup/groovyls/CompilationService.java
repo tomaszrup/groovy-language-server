@@ -88,15 +88,15 @@ public class CompilationService {
 	// --- AST visiting ---
 
 	public void visitAST(ProjectScope scope) {
-		ASTNodeVisitor visitor = compilationOrchestrator.visitAST(scope.compilationUnit);
+		ASTNodeVisitor visitor = compilationOrchestrator.visitAST(scope.getCompilationUnit());
 		if (visitor != null) {
-			scope.astVisitor = visitor;
+			scope.setAstVisitor(visitor);
 		}
 	}
 
 	public void visitAST(ProjectScope scope, Set<URI> uris) {
-		scope.astVisitor = compilationOrchestrator.visitAST(
-				scope.compilationUnit, scope.astVisitor, uris);
+		scope.setAstVisitor(compilationOrchestrator.visitAST(
+				scope.getCompilationUnit(), scope.getAstVisitor(), uris));
 	}
 
 	// --- Compilation unit management ---
@@ -106,19 +106,24 @@ public class CompilationService {
 	}
 
 	public boolean createOrUpdateCompilationUnit(ProjectScope scope, Set<URI> additionalInvalidations) {
-		GroovyLSCompilationUnit[] cuHolder = { scope.compilationUnit };
-		ASTNodeVisitor[] avHolder = { scope.astVisitor };
-		ScanResult[] srHolder = { scope.classGraphScanResult };
-		GroovyClassLoader[] clHolder = { scope.classLoader };
+		GroovyLSCompilationUnit[] cuHolder = { scope.getCompilationUnit() };
+		ASTNodeVisitor[] avHolder = { scope.getAstVisitor() };
+		ScanResult[] srHolder = { scope.getClassGraphScanResult() };
+		GroovyClassLoader[] clHolder = { scope.getClassLoader() };
 
 		boolean result = compilationOrchestrator.createOrUpdateCompilationUnit(
-				cuHolder, avHolder, scope.projectRoot,
-				scope.compilationUnitFactory, fileContentsTracker,
+				cuHolder, avHolder, scope.getProjectRoot(),
+				scope.getCompilationUnitFactory(), fileContentsTracker,
 				srHolder, clHolder, additionalInvalidations);
 
-		scope.compilationUnit = cuHolder[0];
-		scope.classGraphScanResult = srHolder[0];
-		scope.classLoader = clHolder[0];
+		scope.setCompilationUnit(cuHolder[0]);
+		scope.setClassGraphScanResult(srHolder[0]);
+		scope.setClassLoader(clHolder[0]);
+		// Keep the source locator in sync with the compilation classloader
+		// so that "Go to Definition" can locate .class files inside JARs.
+		if (scope.getJavaSourceLocator() != null && scope.getClassLoader() != null) {
+			scope.getJavaSourceLocator().setCompilationClassLoader(scope.getClassLoader());
+		}
 		return result;
 	}
 
@@ -126,11 +131,11 @@ public class CompilationService {
 
 	public void compile(ProjectScope scope) {
 		ErrorCollector collector = compilationOrchestrator.compile(
-				scope.compilationUnit, scope.projectRoot);
+				scope.getCompilationUnit(), scope.getProjectRoot());
 		if (collector != null) {
 			DiagnosticHandler.DiagnosticResult result = diagnosticHandler.handleErrorCollector(
-					scope.compilationUnit, collector, scope.projectRoot, scope.prevDiagnosticsByFile);
-			scope.prevDiagnosticsByFile = result.getDiagnosticsByFile();
+					scope.getCompilationUnit(), collector, scope.getProjectRoot(), scope.getPrevDiagnosticsByFile());
+			scope.setPrevDiagnosticsByFile(result.getDiagnosticsByFile());
 			LanguageClient client = languageClient;
 			if (client != null) {
 				result.getDiagnosticsToPublish().forEach(client::publishDiagnostics);
@@ -147,13 +152,13 @@ public class CompilationService {
 	 *         be compiled (e.g. classpath not yet resolved)
 	 */
 	public boolean ensureScopeCompiled(ProjectScope scope) {
-		if (scope.compiled) {
+		if (scope.isCompiled()) {
 			return false;
 		}
 		// Guard: do not compile a scope whose classpath hasn't been resolved
 		// yet — this would produce thousands of false-positive diagnostics.
-		if (!scope.classpathResolved && scope.projectRoot != null) {
-			logger.debug("Skipping compilation of {} — classpath not yet resolved", scope.projectRoot);
+		if (!scope.isClasspathResolved() && scope.getProjectRoot() != null) {
+			logger.debug("Skipping compilation of {} — classpath not yet resolved", scope.getProjectRoot());
 			return false;
 		}
 		createOrUpdateCompilationUnit(scope);
@@ -161,14 +166,14 @@ public class CompilationService {
 		compile(scope);
 		visitAST(scope);
 		// Build the full dependency graph after initial compilation
-		if (scope.astVisitor != null) {
-			scope.dependencyGraph.clear();
-			for (URI uri : scope.astVisitor.getDependenciesByURI().keySet()) {
-				Set<URI> deps = scope.astVisitor.resolveSourceDependencies(uri);
-				scope.dependencyGraph.updateDependencies(uri, deps);
+		if (scope.getAstVisitor() != null) {
+			scope.getDependencyGraph().clear();
+			for (URI uri : scope.getAstVisitor().getDependenciesByURI().keySet()) {
+				Set<URI> deps = scope.getAstVisitor().resolveSourceDependencies(uri);
+				scope.getDependencyGraph().updateDependencies(uri, deps);
 			}
 		}
-		scope.compiled = true;
+		scope.setCompiled(true);
 		return true;
 	}
 
@@ -186,28 +191,28 @@ public class CompilationService {
 			return null;
 		}
 
-		if (!scope.compiled || scope.astVisitor == null) {
-			scope.lock.writeLock().lock();
+		if (!scope.isCompiled() || scope.getAstVisitor() == null) {
+			scope.getLock().writeLock().lock();
 			try {
 				ensureScopeCompiled(scope);
-				if (scope.astVisitor == null) {
+				if (scope.getAstVisitor() == null) {
 					return scope;
 				}
-				if (fileContentsTracker.hasChangedURIsUnder(scope.projectRoot)) {
+				if (fileContentsTracker.hasChangedURIsUnder(scope.getProjectRoot())) {
 					compileAndVisitAST(scope, uri);
 				}
 			} finally {
-				scope.lock.writeLock().unlock();
+				scope.getLock().writeLock().unlock();
 			}
-		} else if (fileContentsTracker.hasChangedURIsUnder(scope.projectRoot)) {
+		} else if (fileContentsTracker.hasChangedURIsUnder(scope.getProjectRoot())) {
 			// Compile synchronously so callers always see up-to-date AST state
-			scope.lock.writeLock().lock();
+			scope.getLock().writeLock().lock();
 			try {
-				if (fileContentsTracker.hasChangedURIsUnder(scope.projectRoot)) {
+				if (fileContentsTracker.hasChangedURIsUnder(scope.getProjectRoot())) {
 					compileAndVisitAST(scope, uri);
 				}
 			} finally {
-				scope.lock.writeLock().unlock();
+				scope.getLock().writeLock().unlock();
 			}
 		}
 
@@ -215,21 +220,21 @@ public class CompilationService {
 	}
 
 	protected void recompileIfContextChanged(ProjectScope scope, URI newContext) {
-		if (scope.previousContext == null || scope.previousContext.equals(newContext)) {
+		if (scope.getPreviousContext() == null || scope.getPreviousContext().equals(newContext)) {
 			return;
 		}
-		if (fileContentsTracker.hasChangedURIsUnder(scope.projectRoot)) {
+		if (fileContentsTracker.hasChangedURIsUnder(scope.getProjectRoot())) {
 			compileAndVisitAST(scope, newContext);
 		} else {
-			scope.previousContext = newContext;
+			scope.setPreviousContext(newContext);
 		}
 	}
 
 	public void compileAndVisitAST(ProjectScope scope, URI contextURI) {
 		// Early return: if the scope is already compiled and there are no
 		// pending changes under this scope's root, skip the compile cycle.
-		if (scope.compiled && !fileContentsTracker.hasChangedURIsUnder(scope.projectRoot)) {
-			scope.previousContext = contextURI;
+		if (scope.isCompiled() && !fileContentsTracker.hasChangedURIsUnder(scope.getProjectRoot())) {
+			scope.setPreviousContext(contextURI);
 			return;
 		}
 
@@ -237,19 +242,19 @@ public class CompilationService {
 
 		// Try incremental (single-file) compilation for small change sets
 		if (changedSnapshot.size() <= INCREMENTAL_MAX_CHANGED
-				&& scope.astVisitor != null
-				&& scope.compiled
-				&& !scope.dependencyGraph.isEmpty()) {
+				&& scope.getAstVisitor() != null
+				&& scope.isCompiled()
+				&& !scope.getDependencyGraph().isEmpty()) {
 			if (tryIncrementalCompile(scope, contextURI, changedSnapshot)) {
 				clearProcessedChanges(scope, changedSnapshot);
-				scope.previousContext = contextURI;
+				scope.setPreviousContext(contextURI);
 				return;
 			}
-			logger.info("Incremental compile failed for scope {}, falling back to full", scope.projectRoot);
+			logger.info("Incremental compile failed for scope {}, falling back to full", scope.getProjectRoot());
 		}
 
 		// Full compilation path
-		Set<URI> affectedDependents = scope.dependencyGraph.getTransitiveDependents(changedSnapshot);
+		Set<URI> affectedDependents = scope.getDependencyGraph().getTransitiveDependents(changedSnapshot);
 
 		Set<URI> allAffectedURIs = new HashSet<>(changedSnapshot);
 		allAffectedURIs.add(contextURI);
@@ -266,8 +271,8 @@ public class CompilationService {
 
 		updateDependencyGraph(scope, allAffectedURIs);
 
-		scope.previousContext = contextURI;
-		scope.compiled = true;
+		scope.setPreviousContext(contextURI);
+		scope.setCompiled(true);
 	}
 
 	/**
@@ -277,7 +282,7 @@ public class CompilationService {
 		Set<URI> changedPlusContext = new HashSet<>(changedSnapshot);
 		changedPlusContext.add(contextURI);
 
-		Set<URI> forwardDeps = scope.dependencyGraph.getTransitiveDependencies(changedPlusContext, 2);
+		Set<URI> forwardDeps = scope.getDependencyGraph().getTransitiveDependencies(changedPlusContext, 2);
 
 		Set<URI> filesToCompile = new HashSet<>(changedPlusContext);
 		filesToCompile.addAll(forwardDeps);
@@ -288,34 +293,34 @@ public class CompilationService {
 			return false;
 		}
 
-		Map<String, ClassSignature> oldSignatures = captureClassSignatures(scope.astVisitor, changedPlusContext);
+		Map<String, ClassSignature> oldSignatures = captureClassSignatures(scope.getAstVisitor(), changedPlusContext);
 
-		GroovyLSCompilationUnit incrementalUnit = scope.compilationUnitFactory.createIncremental(
-				scope.projectRoot, fileContentsTracker, filesToCompile);
+		GroovyLSCompilationUnit incrementalUnit = scope.getCompilationUnitFactory().createIncremental(
+				scope.getProjectRoot(), fileContentsTracker, filesToCompile);
 		if (incrementalUnit == null) {
 			return false;
 		}
 
-		ErrorCollector collector = compilationOrchestrator.compileIncremental(incrementalUnit, scope.projectRoot);
+		ErrorCollector collector = compilationOrchestrator.compileIncremental(incrementalUnit, scope.getProjectRoot());
 
 		ASTNodeVisitor newVisitor = compilationOrchestrator.visitAST(
-				incrementalUnit, scope.astVisitor, changedPlusContext);
+				incrementalUnit, scope.getAstVisitor(), changedPlusContext);
 
 		Map<String, ClassSignature> newSignatures = captureClassSignatures(newVisitor, changedPlusContext);
 		if (!oldSignatures.equals(newSignatures)) {
 			logger.info("API change detected in incremental compile for scope {}, need full recompile",
-					scope.projectRoot);
+					scope.getProjectRoot());
 			return false;
 		}
 
-		scope.astVisitor = newVisitor;
+		scope.setAstVisitor(newVisitor);
 
 		updateDependencyGraph(scope, changedPlusContext);
 
 		if (collector != null) {
 			DiagnosticHandler.DiagnosticResult result = diagnosticHandler.handleErrorCollector(
-					incrementalUnit, collector, scope.projectRoot, scope.prevDiagnosticsByFile);
-			scope.prevDiagnosticsByFile = result.getDiagnosticsByFile();
+					incrementalUnit, collector, scope.getProjectRoot(), scope.getPrevDiagnosticsByFile());
+			scope.setPrevDiagnosticsByFile(result.getDiagnosticsByFile());
 			LanguageClient client = languageClient;
 			if (client != null) {
 				result.getDiagnosticsToPublish().forEach(client::publishDiagnostics);
@@ -323,7 +328,7 @@ public class CompilationService {
 		}
 
 		logger.debug("Incremental compilation succeeded for scope {} ({} changed, {} total in unit)",
-				scope.projectRoot, changedPlusContext.size(), filesToCompile.size());
+				scope.getProjectRoot(), changedPlusContext.size(), filesToCompile.size());
 		return true;
 	}
 
@@ -351,23 +356,23 @@ public class CompilationService {
 	// --- Dependency graph ---
 
 	public void updateDependencyGraph(ProjectScope scope, Set<URI> uris) {
-		if (scope.astVisitor == null) {
+		if (scope.getAstVisitor() == null) {
 			return;
 		}
 		for (URI uri : uris) {
-			Set<URI> deps = scope.astVisitor.resolveSourceDependencies(uri);
-			scope.dependencyGraph.updateDependencies(uri, deps);
+			Set<URI> deps = scope.getAstVisitor().resolveSourceDependencies(uri);
+			scope.getDependencyGraph().updateDependencies(uri, deps);
 		}
 	}
 
 	// --- Changed file tracking ---
 
 	public void resetChangedFilesForScope(ProjectScope scope) {
-		if (scope.projectRoot != null) {
+		if (scope.getProjectRoot() != null) {
 			Set<URI> toReset = new HashSet<>();
 			for (URI uri : fileContentsTracker.getChangedURIs()) {
 				try {
-					if (Paths.get(uri).startsWith(scope.projectRoot)) {
+					if (Paths.get(uri).startsWith(scope.getProjectRoot())) {
 						toReset.add(uri);
 					}
 				} catch (Exception e) {
@@ -383,11 +388,11 @@ public class CompilationService {
 	}
 
 	public void clearProcessedChanges(ProjectScope scope, Set<URI> snapshot) {
-		if (scope.projectRoot != null) {
+		if (scope.getProjectRoot() != null) {
 			Set<URI> toReset = new HashSet<>();
 			for (URI uri : snapshot) {
 				try {
-					if (Paths.get(uri).startsWith(scope.projectRoot)) {
+					if (Paths.get(uri).startsWith(scope.getProjectRoot())) {
 						toReset.add(uri);
 					}
 				} catch (Exception e) {
@@ -415,7 +420,7 @@ public class CompilationService {
 	 */
 	public String injectCompletionPlaceholder(ProjectScope scope, URI uri, Position position) {
 		String originalSource = compilationOrchestrator.injectCompletionPlaceholder(
-				scope.astVisitor, fileContentsTracker, uri, position);
+				scope.getAstVisitor(), fileContentsTracker, uri, position);
 		if (originalSource != null) {
 			compileAndVisitAST(scope, uri);
 		}
@@ -502,19 +507,19 @@ public class CompilationService {
 	 * <p><b>Caller must hold the scope's write lock.</b></p>
 	 */
 	public void recompileForClasspathChange(ProjectScope scope) {
-		scope.dependencyGraph.clear();
+		scope.getDependencyGraph().clear();
 		createOrUpdateCompilationUnit(scope);
 		resetChangedFilesForScope(scope);
 		compile(scope);
 		visitAST(scope);
-		if (scope.astVisitor != null) {
-			for (URI uri : scope.astVisitor.getDependenciesByURI().keySet()) {
-				Set<URI> deps = scope.astVisitor.resolveSourceDependencies(uri);
-				scope.dependencyGraph.updateDependencies(uri, deps);
+		if (scope.getAstVisitor() != null) {
+			for (URI uri : scope.getAstVisitor().getDependenciesByURI().keySet()) {
+				Set<URI> deps = scope.getAstVisitor().resolveSourceDependencies(uri);
+				scope.getDependencyGraph().updateDependencies(uri, deps);
 			}
 		}
-		scope.previousContext = null;
-		scope.compiled = true;
+		scope.setPreviousContext(null);
+		scope.setCompiled(true);
 	}
 
 	/**
@@ -522,17 +527,17 @@ public class CompilationService {
 	 * <p><b>Caller must hold the scope's write lock.</b></p>
 	 */
 	public void recompileAfterJavaChange(ProjectScope scope) {
-		scope.compilationUnitFactory.invalidateFileCache();
-		scope.compilationUnitFactory.invalidateCompilationUnit();
-		scope.dependencyGraph.clear();
+		scope.getCompilationUnitFactory().invalidateFileCache();
+		scope.getCompilationUnitFactory().invalidateCompilationUnit();
+		scope.getDependencyGraph().clear();
 		createOrUpdateCompilationUnit(scope);
 		resetChangedFilesForScope(scope);
 		compile(scope);
 		visitAST(scope);
-		if (scope.astVisitor != null) {
-			for (URI uri : scope.astVisitor.getDependenciesByURI().keySet()) {
-				Set<URI> deps = scope.astVisitor.resolveSourceDependencies(uri);
-				scope.dependencyGraph.updateDependencies(uri, deps);
+		if (scope.getAstVisitor() != null) {
+			for (URI uri : scope.getAstVisitor().getDependenciesByURI().keySet()) {
+				Set<URI> deps = scope.getAstVisitor().resolveSourceDependencies(uri);
+				scope.getDependencyGraph().updateDependencies(uri, deps);
 			}
 		}
 	}
