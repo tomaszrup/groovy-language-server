@@ -53,6 +53,15 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 	private static final String FILE_EXTENSION_GROOVY = ".groovy";
 
 	/**
+	 * Maximum number of source files to include in a full compilation unit.
+	 * When a project has more .groovy files than this, only open files and
+	 * files in the same packages as open files are compiled, plus files up
+	 * to this limit. This bounds peak AST memory and prevents OOM in very
+	 * large projects.
+	 */
+	private static final int MAX_FULL_COMPILATION_FILES = 500;
+
+	/**
 	 * Directory names to exclude when walking the workspace for source files.
 	 * These are typically build output directories that may contain copies of
 	 * source files, which would cause duplicate class definition errors.
@@ -411,13 +420,70 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 	protected void addDirectoryToCompilationUnit(Path dirPath, GroovyLSCompilationUnit compilationUnit,
 			FileContentsTracker fileContentsTracker, Set<URI> changedUris) {
 		Set<Path> groovyFiles = getOrBuildFileCache(dirPath);
+
+		// Collect open file packages to prioritize related files when the
+		// project exceeds MAX_FULL_COMPILATION_FILES
+		boolean needsLimiting = groovyFiles.size() > MAX_FULL_COMPILATION_FILES;
+		Set<String> openPackageDirs = new HashSet<>();
+		if (needsLimiting) {
+			logger.warn("Project {} has {} .groovy files (limit {}). "
+					+ "Prioritizing open file packages to reduce memory usage.",
+					dirPath, groovyFiles.size(), MAX_FULL_COMPILATION_FILES);
+			fileContentsTracker.getOpenURIs().forEach(uri -> {
+				try {
+					Path openPath = Paths.get(uri);
+					if (openPath.getParent() != null) {
+						openPackageDirs.add(openPath.getParent().normalize().toString());
+					}
+				} catch (Exception ignored) {}
+			});
+		}
+
+		int addedCount = 0;
+		// First pass: add files from open-file packages (prioritized)
+		if (needsLimiting) {
+			for (Path filePath : groovyFiles) {
+				URI fileURI = filePath.toUri();
+				if (!fileContentsTracker.isOpen(fileURI)) {
+					String parentDir = filePath.getParent() != null
+							? filePath.getParent().normalize().toString() : "";
+					if (openPackageDirs.contains(parentDir)) {
+						File file = filePath.toFile();
+						if (file.isFile()) {
+							if (changedUris == null || changedUris.contains(fileURI)) {
+								compilationUnit.addSource(file);
+								addedCount++;
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Second pass: add remaining files up to the limit
 		for (Path filePath : groovyFiles) {
+			if (needsLimiting && addedCount >= MAX_FULL_COMPILATION_FILES) {
+				logger.warn("Reached file limit of {} for project {}. "
+						+ "{} files excluded from compilation.",
+						MAX_FULL_COMPILATION_FILES, dirPath,
+						groovyFiles.size() - addedCount);
+				break;
+			}
 			URI fileURI = filePath.toUri();
 			if (!fileContentsTracker.isOpen(fileURI)) {
+				// Skip files already added in the priority pass
+				if (needsLimiting && !openPackageDirs.isEmpty()) {
+					String parentDir = filePath.getParent() != null
+							? filePath.getParent().normalize().toString() : "";
+					if (openPackageDirs.contains(parentDir)) {
+						continue; // already added in first pass
+					}
+				}
 				File file = filePath.toFile();
 				if (file.isFile()) {
 					if (changedUris == null || changedUris.contains(fileURI)) {
 						compilationUnit.addSource(file);
+						addedCount++;
 					}
 				}
 			}

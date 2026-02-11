@@ -536,6 +536,12 @@ public class ProjectScopeManager {
 	/**
 	 * Periodic sweep that evicts heavy state from inactive scopes and
 	 * cleans up expired entries from the closed-file cache.
+	 *
+	 * <p>In addition to TTL-based eviction, this sweep also performs
+	 * <b>memory-pressure eviction</b>: when heap usage exceeds 75% of max
+	 * heap, the least-recently-accessed compiled scope (without open files)
+	 * is evicted immediately regardless of TTL.  This acts as a safety
+	 * valve to prevent OOM in large multi-project workspaces.</p>
 	 */
 	private void performEvictionSweep() {
 		// Sweep expired closed-file cache entries
@@ -551,6 +557,22 @@ public class ProjectScopeManager {
 		long now = System.currentTimeMillis();
 		Set<URI> openURIs = fileContentsTracker.getOpenURIs();
 
+		// --- Memory-pressure eviction ---
+		// When heap usage exceeds 75%, aggressively evict the least-recently
+		// accessed compiled scope to reclaim memory before OOM.
+		Runtime rt = Runtime.getRuntime();
+		long usedBytes = rt.totalMemory() - rt.freeMemory();
+		long maxBytes = rt.maxMemory();
+		double heapUsageRatio = (double) usedBytes / maxBytes;
+		if (heapUsageRatio > 0.75) {
+			logger.warn("High memory pressure: heap at {}/{} MB ({} %). "
+					+ "Attempting emergency scope eviction.",
+					usedBytes / (1024 * 1024), maxBytes / (1024 * 1024),
+					(int) (heapUsageRatio * 100));
+			evictLeastRecentScope(openURIs, now);
+		}
+
+		// --- Standard TTL-based eviction ---
 		for (ProjectScope scope : projectScopes) {
 			if (scope.isEvicted() || !scope.isCompiled()) {
 				continue;
@@ -580,6 +602,45 @@ public class ProjectScopeManager {
 			} finally {
 				scope.getLock().writeLock().unlock();
 			}
+		}
+	}
+
+	/**
+	 * Evicts the least-recently-accessed compiled scope that has no open
+	 * files.  Used as an emergency memory-pressure relief.
+	 */
+	private void evictLeastRecentScope(Set<URI> openURIs, long now) {
+		ProjectScope lruScope = null;
+		long oldestAccess = Long.MAX_VALUE;
+
+		for (ProjectScope scope : projectScopes) {
+			if (scope.isEvicted() || !scope.isCompiled()) {
+				continue;
+			}
+			if (hasOpenFilesInScope(scope, openURIs)) {
+				continue;
+			}
+			if (scope.getLastAccessedAt() < oldestAccess) {
+				oldestAccess = scope.getLastAccessedAt();
+				lruScope = scope;
+			}
+		}
+
+		if (lruScope != null) {
+			lruScope.getLock().writeLock().lock();
+			try {
+				if (!lruScope.isEvicted() && lruScope.isCompiled()
+						&& !hasOpenFilesInScope(lruScope, openURIs)) {
+					long idleMs = now - lruScope.getLastAccessedAt();
+					logger.info("Memory-pressure eviction: scope {} (idle for {}s)",
+							lruScope.getProjectRoot(), idleMs / 1000);
+					lruScope.evictHeavyState();
+				}
+			} finally {
+				lruScope.getLock().writeLock().unlock();
+			}
+		} else {
+			logger.warn("Memory-pressure eviction: no eligible scopes to evict");
 		}
 	}
 

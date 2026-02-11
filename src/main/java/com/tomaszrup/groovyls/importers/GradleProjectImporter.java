@@ -149,7 +149,10 @@ public class GradleProjectImporter implements ProjectImporter {
         GradleConnector connector = GradleConnector.newConnector()
                 .forProjectDirectory(gradleRoot.toFile());
         try (ProjectConnection connection = connector.connect()) {
-            Map<String, List<String>> classpathsByProjectDir = resolveAllClasspathsViaInitScript(connection);
+            // Use the filtered init script that only resolves the requested
+            // project, avoiding the cost of resolving all ~N sibling projects.
+            Map<String, List<String>> classpathsByProjectDir =
+                    resolveSingleProjectClasspathViaInitScript(connection, projectRoot);
 
             List<String> cp = new ArrayList<>();
             String normSub = normalise(projectRoot);
@@ -158,7 +161,17 @@ public class GradleProjectImporter implements ProjectImporter {
             if (resolved != null) {
                 cp.addAll(resolved);
             } else {
-                logger.warn("No classpath resolved for project {} (normalised: {})", projectRoot, normSub);
+                // Fallback: try the unfiltered variant in case the filter
+                // didn't match (e.g. projectDir mismatch on Windows)
+                logger.warn("Filtered init script returned no classpath for {} — "
+                        + "falling back to allprojects resolution", projectRoot);
+                classpathsByProjectDir = resolveAllClasspathsViaInitScript(connection);
+                resolved = classpathsByProjectDir.get(normSub);
+                if (resolved != null) {
+                    cp.addAll(resolved);
+                } else {
+                    logger.warn("No classpath resolved for project {} (normalised: {})", projectRoot, normSub);
+                }
             }
 
             try {
@@ -431,7 +444,7 @@ public class GradleProjectImporter implements ProjectImporter {
                 "    tasks.register('_groovyLSDownloadSources') {\n" +
                 "        doLast {\n" +
                 "            def allCoords = new LinkedHashSet()\n" +
-                "            ['compileClasspath', 'runtimeClasspath', 'testCompileClasspath', 'testRuntimeClasspath'].each { configName ->\n" +
+                "            ['testCompileClasspath', 'runtimeClasspath'].each { configName ->\n" +
                 "                def config = configurations.findByName(configName)\n" +
                 "                if (config != null && config.canBeResolved) {\n" +
                 "                    try {\n" +
@@ -500,7 +513,7 @@ public class GradleProjectImporter implements ProjectImporter {
                 "allprojects {\n" +
                 "    tasks.register('_groovyLSResolveClasspath') {\n" +
                 "        doLast {\n" +
-                "            ['compileClasspath', 'runtimeClasspath', 'testCompileClasspath', 'testRuntimeClasspath'].each { configName ->\n" +
+                "            ['testCompileClasspath', 'runtimeClasspath'].each { configName ->\n" +
                 "                def config = configurations.findByName(configName)\n" +
                 "                if (config != null && config.canBeResolved) {\n" +
                 "                    try {\n" +
@@ -566,6 +579,106 @@ public class GradleProjectImporter implements ProjectImporter {
             }
         }
         // Convert sets to lists for the public API
+        Map<String, List<String>> classpathsByProject = new LinkedHashMap<>();
+        for (Map.Entry<String, Set<String>> entry : dedupByProject.entrySet()) {
+            classpathsByProject.put(entry.getKey(), new ArrayList<>(entry.getValue()));
+        }
+        return classpathsByProject;
+    }
+
+    /**
+     * Resolve classpath for a <b>single</b> subproject using a filtered init
+     * script that only processes the target project directory. This avoids the
+     * cost of Gradle configuring and resolving all ~N sibling subprojects when
+     * only one is needed (lazy on-demand resolution).
+     *
+     * <p>The init script uses {@code allprojects} but wraps the resolution
+     * logic in a {@code projectDir} check, so Gradle still configures all
+     * projects (required by the Tooling API) but only resolves dependency
+     * configurations for the matching project.</p>
+     *
+     * @param connection  an open Tooling API connection to the Gradle root
+     * @param targetProject the specific subproject to resolve
+     * @return map with a single entry for the target project
+     */
+    private Map<String, List<String>> resolveSingleProjectClasspathViaInitScript(
+            ProjectConnection connection, Path targetProject) {
+        Map<String, Set<String>> dedupByProject = new LinkedHashMap<>();
+        Path initScript = null;
+        try {
+            initScript = Files.createTempFile("groovyls-single-init", ".gradle");
+            // Escape backslashes for the Groovy string in the init script
+            String targetDir = targetProject.toAbsolutePath().normalize().toString()
+                    .replace("\\", "\\\\");
+            String initScriptContent =
+                "allprojects {\n" +
+                "    tasks.register('_groovyLSResolveSingleClasspath') {\n" +
+                "        doLast {\n" +
+                "            def targetDir = '" + targetDir + "'\n" +
+                "            def normalizedProjectDir = project.projectDir.absolutePath.replace('\\\\', '/')\n" +
+                "            def normalizedTargetDir = targetDir.replace('\\\\', '/')\n" +
+                "            if (normalizedProjectDir.equalsIgnoreCase(normalizedTargetDir)) {\n" +
+                "                ['testCompileClasspath', 'runtimeClasspath'].each { configName ->\n" +
+                "                    def config = configurations.findByName(configName)\n" +
+                "                    if (config != null && config.canBeResolved) {\n" +
+                "                        try {\n" +
+                "                            config.files.each { f ->\n" +
+                "                                println \"GROOVYLS_CP:${project.projectDir.absolutePath}:${f.absolutePath}\"\n" +
+                "                            }\n" +
+                "                        } catch (Exception e) {\n" +
+                "                            // skip unresolvable configurations\n" +
+                "                        }\n" +
+                "                    }\n" +
+                "                }\n" +
+                "            }\n" +
+                "        }\n" +
+                "    }\n" +
+                "}\n";
+            Files.write(initScript, initScriptContent.getBytes("UTF-8"));
+
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            connection.newBuild()
+                    .forTasks("_groovyLSResolveSingleClasspath")
+                    .withArguments("--init-script", initScript.toString())
+                    .setStandardOutput(baos)
+                    .setStandardError(newLogOutputStream())
+                    .run();
+
+            String output = baos.toString("UTF-8");
+            for (String line : output.split("\\r?\\n")) {
+                line = line.trim();
+                if (line.startsWith("GROOVYLS_CP:")) {
+                    String rest = line.substring("GROOVYLS_CP:".length());
+                    int separatorIdx = findProjectDirSeparator(rest);
+                    if (separatorIdx < 0) {
+                        continue;
+                    }
+                    String projectDir = normalise(rest.substring(0, separatorIdx));
+                    String cpEntry = rest.substring(separatorIdx + 1);
+                    if (new File(cpEntry).exists()) {
+                        try {
+                            cpEntry = new File(cpEntry).getCanonicalPath();
+                        } catch (IOException ignored) {
+                        }
+                        dedupByProject
+                                .computeIfAbsent(projectDir, k -> new LinkedHashSet<>())
+                                .add(cpEntry);
+                    }
+                }
+            }
+
+            logger.info("Single-project init script resolved classpath for {} project(s)",
+                    dedupByProject.size());
+        } catch (Exception e) {
+            logger.warn("Could not resolve single-project classpath via init script: {}", e.getMessage());
+        } finally {
+            if (initScript != null) {
+                try {
+                    Files.deleteIfExists(initScript);
+                } catch (IOException ignored) {
+                }
+            }
+        }
         Map<String, List<String>> classpathsByProject = new LinkedHashMap<>();
         for (Map.Entry<String, Set<String>> entry : dedupByProject.entrySet()) {
             classpathsByProject.put(entry.getKey(), new ArrayList<>(entry.getValue()));

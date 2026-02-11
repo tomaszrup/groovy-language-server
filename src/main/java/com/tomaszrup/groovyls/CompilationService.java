@@ -36,6 +36,8 @@ import org.codehaus.groovy.control.CompilerConfiguration;
 import org.codehaus.groovy.control.ErrorCollector;
 import org.codehaus.groovy.control.Phases;
 import org.eclipse.lsp4j.Diagnostic;
+import org.eclipse.lsp4j.MessageParams;
+import org.eclipse.lsp4j.MessageType;
 import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.PublishDiagnosticsParams;
 import org.eclipse.lsp4j.services.LanguageClient;
@@ -292,6 +294,15 @@ public class CompilationService {
 			backgroundCompiler.submit(() -> {
 				scope.getLock().writeLock().lock();
 				try {
+					// Guard: another Phase B (or standard compilation) may
+					// have completed while this task was queued.  This
+					// prevents N open tabs from causing N full compilations
+					// of the same project during startup.
+					if (scope.isCompiled()) {
+						logger.debug("Phase B skipped for {} — already compiled",
+								scope.getProjectRoot());
+						return;
+					}
 					doFullCompilation(scope);
 				} finally {
 					scope.getLock().writeLock().unlock();
@@ -747,6 +758,7 @@ public class CompilationService {
 	 *   <li>Attempts {@code System.gc()} to reclaim soft references</li>
 	 *   <li>Marks the scope as failed so future compilations are skipped</li>
 	 *   <li>Publishes a synthetic diagnostic so the user gets feedback</li>
+	 *   <li>Shows a user-visible notification with actionable fix guidance</li>
 	 * </ol>
 	 */
 	private void handleCompilationOOM(ProjectScope scope, VirtualMachineError e, String context) {
@@ -766,6 +778,9 @@ public class CompilationService {
 
 		// Publish a synthetic diagnostic so the user sees feedback
 		publishOOMDiagnostic(scope, e);
+
+		// Show a prominent notification with actionable fix guidance
+		showOOMNotification(scope, e);
 
 		logMemoryStats();
 	}
@@ -813,5 +828,33 @@ public class CompilationService {
 		long totalMB = rt.totalMemory() / (1024 * 1024);
 		long maxMB = rt.maxMemory() / (1024 * 1024);
 		logger.warn("JVM memory: used={}MB, total={}MB, max={}MB", usedMB, totalMB, maxMB);
+	}
+
+	/**
+	 * Shows a user-visible notification (window/showMessage) with specific
+	 * guidance on how to fix OOM errors. This is more prominent than the
+	 * synthetic diagnostic and provides an actionable fix.
+	 */
+	private void showOOMNotification(ProjectScope scope, VirtualMachineError e) {
+		LanguageClient client = languageClient;
+		if (client == null) {
+			return;
+		}
+		try {
+			Runtime rt = Runtime.getRuntime();
+			long usedMB = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024);
+			long maxMB = rt.maxMemory() / (1024 * 1024);
+			String projectName = scope.getProjectRoot() != null
+					? scope.getProjectRoot().getFileName().toString() : "unknown";
+			long suggestedMB = Math.min(maxMB * 2, 4096);
+			String message = String.format(
+					"Groovy Language Server: OutOfMemoryError while compiling '%s' "
+					+ "(heap: %dMB/%dMB). To fix, add to VS Code settings: "
+					+ "\"groovy.java.vmargs\": \"-Xmx%dm\"",
+					projectName, usedMB, maxMB, suggestedMB);
+			client.showMessage(new MessageParams(MessageType.Error, message));
+		} catch (Throwable t) {
+			logger.debug("Failed to show OOM notification: {}", t.getMessage());
+		}
 	}
 }

@@ -2,7 +2,7 @@
   "name": "groovy-spock-support",
   "displayName": "Groovy & Spock Language Support",
   "description": "Language support for Groovy and Spock",
-  "version": "0.1.8",
+  "version": "0.1.11",
   "publisher": "TomaszRup",
   "homepage": "https://github.com/tomaszrup/groovy-language-server",
   "repository": {
@@ -124,7 +124,7 @@
             "null"
           ],
           "default": null,
-          "description": "Extra JVM arguments for the Groovy language server (e.g. \"-Xmx768m -XX:+UseG1GC\"). When unset, defaults to \"-Xmx512m\"."
+          "description": "Extra JVM arguments for the Groovy language server (e.g. \"-Xmx2g\"). When unset, heap is auto-sized (512 MB–4 GB) based on workspace size, G1GC is enabled, and HeapDumpOnOutOfMemoryError is set."
         },
         "groovy.classpath": {
           "type": "array",

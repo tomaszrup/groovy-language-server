@@ -66,9 +66,11 @@ async function estimateHeapSize(): Promise<number> {
   const evictionTTL = config.get<number>("memory.scopeEvictionTTL") ?? 300;
   const evictionEnabled = evictionTTL > 0;
 
-  // When eviction is enabled, assume at most ~5 scopes are active at once
-  const MAX_ACTIVE_SCOPES = 5;
-  const PER_PROJECT_MB = evictionEnabled ? 16 : 32;
+  // Each active scope with AST + classloader + ClassGraph scan realistically
+  // needs ~40-80 MB. With eviction, only a handful of scopes are loaded at
+  // once; without eviction, every discovered project is potentially active.
+  const MAX_ACTIVE_SCOPES = 8;
+  const PER_PROJECT_MB = evictionEnabled ? 48 : 64;
 
   try {
     const buildFiles = await vscode.workspace.findFiles(
@@ -361,9 +363,13 @@ function startLanguageServer() {
             args.unshift(...vmTokens);
           } else {
             const heapMb = await estimateHeapSize();
-            args.unshift(`-Xmx${heapMb}m`);
+            args.unshift(
+              `-Xmx${heapMb}m`,
+              "-XX:+UseG1GC",
+              "-XX:+HeapDumpOnOutOfMemoryError",
+            );
             outputChannel?.appendLine(
-              `Auto-detected heap size: -Xmx${heapMb}m`
+              `Auto-detected heap size: -Xmx${heapMb}m (G1GC, HeapDumpOnOOM)`
             );
           }
 

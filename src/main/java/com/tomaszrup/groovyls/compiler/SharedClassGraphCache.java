@@ -72,6 +72,46 @@ public class SharedClassGraphCache {
 
 	private static final Logger logger = LoggerFactory.getLogger(SharedClassGraphCache.class);
 
+	/**
+	 * Maximum number of ClassGraph scan results to keep in memory at once.
+	 * Each scan result consumes 50–200 MB of heap. When this limit is
+	 * reached, zero-refcount entries are evicted before acquiring a new
+	 * one.  This caps total ClassGraph memory at roughly
+	 * {@code MAX_HELD_SCANS × 200 MB}.
+	 */
+	private static final int MAX_HELD_SCANS = 3;
+
+	/**
+	 * Version prefix for the disk cache key. Bump this whenever the ClassGraph
+	 * scan configuration changes (e.g. adding/removing rejectPackages filters)
+	 * so that stale cached results are naturally orphaned.
+	 */
+	private static final String CACHE_KEY_VERSION = "v2";
+
+	/**
+	 * Internal JDK packages rejected from ClassGraph scans to reduce memory.
+	 * Public {@code com.sun.*} APIs (httpserver, management, jdi, etc.) are
+	 * intentionally kept.
+	 */
+	private static final String[] REJECTED_PACKAGES = {
+		"sun.",
+		"jdk.",
+		"com.sun.proxy",
+		"com.sun.crypto",
+		"com.sun.org.apache",
+		"com.sun.xml.internal",
+		"com.sun.java.swing",
+		"com.sun.imageio",
+		"com.sun.media",
+		"com.sun.naming",
+		"com.sun.rowset",
+		"com.sun.beans",
+		"com.sun.corba",
+		"com.sun.jmx",
+		"com.sun.awt",
+		"com.sun.swing"
+	};
+
 	/** Singleton instance. */
 	private static final SharedClassGraphCache INSTANCE = new SharedClassGraphCache();
 
@@ -143,12 +183,18 @@ public class SharedClassGraphCache {
 		// Cache miss — perform scan
 		logger.debug("SharedClassGraphCache MISS for key {}… — scanning classpath ({} URLs)",
 				key.substring(0, Math.min(12, key.length())), classLoader.getURLs().length);
+
+		// Before scanning, enforce the held-entries limit by evicting
+		// zero-refcount entries.  This caps total ClassGraph memory.
+		evictUnusedEntries();
+
 		try {
 			long scanStart = System.currentTimeMillis();
 			scanResult = new ClassGraph()
 					.overrideClassLoaders(classLoader)
 					.enableClassInfo()
 					.enableSystemJarsAndModules()
+					.rejectPackages(REJECTED_PACKAGES)
 					.scan();
 			long scanElapsed = System.currentTimeMillis() - scanStart;
 			logger.info("ClassGraph scan completed in {}ms ({} URLs)",
@@ -214,6 +260,35 @@ public class SharedClassGraphCache {
 	}
 
 	/**
+	 * Evict zero-refcount entries when the cache exceeds {@link #MAX_HELD_SCANS}.
+	 * Called before acquiring a new scan to cap total ClassGraph memory.
+	 * <p><b>Must be called while holding the synchronized lock.</b></p>
+	 */
+	private void evictUnusedEntries() {
+		if (cache.size() < MAX_HELD_SCANS) {
+			return;
+		}
+		var iterator = cache.entrySet().iterator();
+		while (iterator.hasNext() && cache.size() >= MAX_HELD_SCANS) {
+			var entry = iterator.next();
+			CacheEntry ce = entry.getValue();
+			if (ce.refCount <= 0) {
+				logger.info("ClassGraph cache limit reached ({}/{}). "
+						+ "Evicting unused entry for key {}…",
+						cache.size(), MAX_HELD_SCANS,
+						ce.classpathKey.substring(0, Math.min(12, ce.classpathKey.length())));
+				reverseIndex.remove(ce.scanResult);
+				ce.scanResult.close();
+				iterator.remove();
+			}
+		}
+		if (cache.size() >= MAX_HELD_SCANS) {
+			logger.warn("ClassGraph cache has {} active entries (all in use, limit {}). "
+					+ "Memory pressure may increase.", cache.size(), MAX_HELD_SCANS);
+		}
+	}
+
+	/**
 	 * Compute a content-based cache key from the classloader's classpath.
 	 * The URLs are sorted lexicographically and then SHA-256 hashed so that
 	 * two classloaders with the same JARs (in any order) produce the same key.
@@ -226,6 +301,7 @@ public class SharedClassGraphCache {
 		}
 		Arrays.sort(urlStrings);
 		StringBuilder sb = new StringBuilder();
+		sb.append(CACHE_KEY_VERSION).append('\n');
 		for (String url : urlStrings) {
 			sb.append(url).append('\n');
 		}

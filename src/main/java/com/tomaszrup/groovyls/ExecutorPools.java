@@ -122,10 +122,14 @@ public class ExecutorPools {
         });
         this.backgroundCompilationPool = new MdcExecutorService(rawBgPool);
 
-        // Allow at most 2 concurrent compilations regardless of which pool
-        // they originate from.  This bounds peak memory consumption for
-        // large workspaces with many subprojects.
-        this.compilationPermits = new Semaphore(Math.min(2, Runtime.getRuntime().availableProcessors()));
+        // Allow at most N concurrent compilations regardless of which pool
+        // they originate from.  When heap is small (< 1 GB), restrict to 1
+        // concurrent compilation to prevent overlapping peak AST memory from
+        // causing OOM.  Otherwise allow up to 2 concurrent compilations.
+        long maxHeapMB = Runtime.getRuntime().maxMemory() / (1024 * 1024);
+        int permits = maxHeapMB < 1024 ? 1 : Math.min(2, Runtime.getRuntime().availableProcessors());
+        this.compilationPermits = new Semaphore(permits);
+        logger.info("Compilation permits: {} (maxHeap={}MB)", permits, maxHeapMB);
     }
 
     /** Scheduled executor for debounce timers and delayed task scheduling. */
