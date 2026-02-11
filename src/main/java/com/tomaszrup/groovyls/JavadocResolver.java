@@ -522,4 +522,36 @@ public class JavadocResolver {
 	public static void clearCache() {
 		cache.clear();
 	}
+
+	/**
+	 * Estimates the total heap memory consumed by the static Javadoc cache.
+	 * Each JavadocEntry holds 4 String fields; we estimate ~400 bytes per
+	 * entry (including map overhead and String char arrays).
+	 *
+	 * @return estimated bytes consumed by the Javadoc cache
+	 */
+	public static long estimateCacheMemoryBytes() {
+		long total = 0;
+		synchronized (cache) {
+			for (Map<String, List<JavadocEntry>> classMap : cache.values()) {
+				if (classMap != null) {
+					for (List<JavadocEntry> entries : classMap.values()) {
+						if (entries != null) {
+							total += (long) entries.size() * 400;
+						}
+					}
+				}
+			}
+		}
+		return total;
+	}
+
+	/**
+	 * Returns the number of source JARs currently cached.
+	 */
+	public static int getCacheSize() {
+		synchronized (cache) {
+			return cache.size();
+		}
+	}
 }

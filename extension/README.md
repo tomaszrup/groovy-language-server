@@ -1,6 +1,9 @@
-![code status: vibed](https://img.shields.io/badge/code_status-Vibed-green)
-
 # Groovy Language Server
+
+[![CI](https://github.com/tomaszrup/groovy-language-server/actions/workflows/ci.yml/badge.svg)](https://github.com/tomaszrup/groovy-language-server/actions/workflows/ci.yml)
+![GLS Coverage](https://raw.githubusercontent.com/tomaszrup/groovy-language-server/badges/.badges/gls-coverage.svg)
+![GLS Branches](https://raw.githubusercontent.com/tomaszrup/groovy-language-server/badges/.badges/gls-branches.svg)
+![Extension Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/tomaszrup/groovy-language-server/badges/.badges/extension-coverage.json)
 
 A [Language Server Protocol](https://microsoft.github.io/language-server-protocol/) implementation for [Groovy](http://groovy-lang.org/), with first-class support for Gradle and Maven projects.
 
@@ -67,6 +70,27 @@ Built-in support for the [Spock](https://spockframework.org/) testing framework:
 
 Spock support activates automatically when a class extends `spock.lang.Specification` (resolved via the superclass chain or unresolved name).
 
+### Incremental & Staged Compilation
+
+The server uses several strategies to minimise compilation latency:
+
+- **Incremental compilation** — when ≤ 3 files change at once, only the changed files and their transitive dependencies (capped at depth 2, max 50 files) are recompiled. Class signatures are compared before and after: if the public API hasn't changed, dependent files are not recompiled; otherwise the server falls back to a full compile.
+- **Staged (two-phase) compilation** — when a file is opened in a not-yet-compiled project:
+  - **Phase A** compiles only the trigger file, publishing diagnostics immediately for fast feedback.
+  - **Phase B** schedules a full project compilation in the background and replaces the partial AST when done.
+- **Last-known-good AST preservation** — if a file has syntax errors and its new AST is significantly degraded (less than half the nodes of the previous AST), the previous AST data is preserved so semantic tokens and navigation continue working.
+
+### Memory Management
+
+The server includes automatic memory management designed for large multi-project workspaces:
+
+- **Automatic heap sizing** — when `groovy.java.vmargs` is unset, the extension estimates an appropriate JVM heap (512 MB – 4 GB) based on the number of discovered projects. G1GC and `HeapDumpOnOutOfMemoryError` are enabled by default.
+- **Scope eviction** — inactive project scopes have their heavy state (AST, classloader, compilation unit) evicted after a configurable TTL (default 300 s). Evicted scopes are transparently reactivated on next access. Scopes with open files are never evicted.
+- **Memory-pressure eviction** — when heap usage exceeds the configurable pressure threshold (default 75 %), the least-recently-used inactive scope is evicted immediately, and reference indexes are shed to free memory.
+- **OOM handling** — if a `VirtualMachineError` occurs during compilation, the scope is marked as failed (preventing retry loops), a synthetic diagnostic is published on the build file, and a user-visible notification suggests increasing `-Xmx` via the `groovy.java.vmargs` setting.
+- **Memory profiler** — opt-in via `-Dgroovyls.debug.memoryProfile=true` in `groovy.java.vmargs`. Logs per-project RAM estimates and a JVM heap breakdown.
+- **Status bar indicator** — enable `groovy.showMemoryUsage` to display live JVM heap usage next to "Groovy" in the VS Code status bar.
+
 ### Build Tool Integration
 
 Automatic classpath resolution for both **Gradle** and **Maven** projects:
@@ -82,6 +106,9 @@ Gradle projects are imported via the [Gradle Tooling API](https://docs.gradle.or
 - Caches resolved classpaths and validates them against build-file timestamps to avoid redundant resolution
 - Recompiles Java/Gradle sources on change so the Groovy compilation unit picks up updates
 - Per-project scoping — each Gradle subproject gets its own classpath and compilation context
+- **Lazy on-demand resolution** — classpaths are resolved when you first open a file in a project, not at startup. Optionally, sibling subprojects can be backfilled in the background (`groovy.memory.backfillSiblingProjects`)
+- **Persistent classpath cache** — resolved classpaths are cached on disk (`~/.groovyls/cache/`). On restart, if build files haven't changed (validated via SHA-256 hashes), the expensive Gradle Tooling API call is skipped entirely
+- **Shared ClassGraph scanning** — projects with identical classpaths share a single ClassGraph `ScanResult` in memory, reducing duplication. Rarely-used JDK packages (Swing, AWT, RMI) are excluded from scanning by default to save ~15–20 MB per scope (configurable via `groovy.memory.rejectedPackages`)
 
 #### Maven
 
@@ -93,6 +120,7 @@ Maven projects are imported by invoking `mvn` to resolve dependencies:
 - Compiles Java sources via `mvn compile test-compile` on import and when `.java` or `pom.xml` files change
 - Discovers `target/classes` and `target/test-classes` output directories
 - Per-project scoping — each Maven module gets its own classpath and compilation context
+- **Lazy on-demand resolution** and **persistent classpath cache** work identically to Gradle (see above)
 
 #### Priority
 
@@ -108,6 +136,8 @@ A bundled VS Code extension provides a seamless editor experience:
 - **Status bar indicator** — shows server state (starting, importing, ready, error) with live progress during project import
 - **Restart command** — `Groovy: Restart Groovy language server` command to restart the server without reloading the window
 - **Show Output Channel** — `Groovy: Show Output Channel` command to view the language server log
+- **Memory usage in status bar** — optionally displays live JVM heap usage next to the server status (enable via `groovy.showMemoryUsage`)
+- **JVM argument security** — dangerous JVM flags (`-javaagent:`, `-agentpath:`, `-Xbootclasspath`, etc.) are blocked in `groovy.java.vmargs` to prevent arbitrary code execution via workspace-level settings
 
 ### Language Configuration
 
@@ -125,12 +155,20 @@ The extension ships a `language-configuration.json` that enables rich editing su
 | Option | Type | Description |
 |---|---|---|
 | `groovy.java.home` | `string` | Path to a custom JDK installation |
+| `groovy.java.vmargs` | `string` | Extra JVM arguments for the language server (e.g. `"-Xmx2g"`). When unset, heap is auto-sized (512 MB – 4 GB) based on workspace size, G1GC is enabled, and `HeapDumpOnOutOfMemoryError` is set |
 | `groovy.classpath` | `string[]` | Additional `.jar` files to include on the classpath |
 | `groovy.debug.serverPort` | `number` | Connect to an existing Groovy LSP server on this TCP port instead of starting one automatically |
+| `groovy.logLevel` | `string` | Log level: `ERROR`, `WARN`, `INFO` (default), `DEBUG`, `TRACE`. Changing this restarts the server |
+| `groovy.showMemoryUsage` | `boolean` | Show JVM memory usage in the status bar (default: `false`) |
 | `groovy.semanticHighlighting.enabled` | `boolean` | Enable or disable semantic syntax highlighting (default: `true`) |
 | `groovy.formatting.enabled` | `boolean` | Enable or disable document formatting (default: `true`) |
 | `groovy.maven.home` | `string` | Path to a Maven installation (used when `mvn` is not on `PATH` and no Maven Wrapper is present) |
-| `groovy.project.importers` | `string[]` | Limit which build-tool importers are active during project discovery. Valid values: `"Gradle"`, `"Maven"`. An empty array (default) enables all importers. |
+| `groovy.project.importers` | `string[]` | Limit which build-tool importers are active during project discovery. Valid values: `"Gradle"`, `"Maven"`. An empty array (default) enables all importers |
+| `groovy.memory.scopeEvictionTTL` | `number` | Seconds before an inactive project scope is evicted from memory. Set to `0` to disable (default: `300`) |
+| `groovy.memory.backfillSiblingProjects` | `boolean` | Auto-resolve classpaths for sibling Gradle subprojects in the background (default: `false`) |
+| `groovy.memory.perProjectMB` | `number` | Memory (MB) allocated per project for heap auto-sizing (default: `128`, range: 32 – 512) |
+| `groovy.memory.pressureThreshold` | `number` | Heap usage percentage that triggers emergency scope eviction (default: `75`, range: 30 – 95) |
+| `groovy.memory.rejectedPackages` | `string[]` | JDK package prefixes excluded from ClassGraph scanning to save memory. Defaults exclude Swing, AWT, RMI, etc. Set to `[]` to include all JDK packages |
 
 
 ## Build

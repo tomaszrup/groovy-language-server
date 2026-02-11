@@ -223,6 +223,36 @@ public class JavaSourceLocator {
     }
 
     /**
+     * Estimates the heap memory consumed by this locator's per-scope caches
+     * (decompiled content, class-file URI cache, reverse URI lookup).
+     * Does NOT count the shared source-JAR index (tracked globally).
+     *
+     * @return estimated bytes consumed
+     */
+    public long estimateMemoryBytes() {
+        long bytes = 0;
+        // classNameToSource: FQCN string -> Path (~200 bytes per entry)
+        Map<String, Path> snapshot = classNameToSource;
+        if (snapshot != null) {
+            bytes += (long) snapshot.size() * 200;
+        }
+        // decompiledContentCache: up to DECOMPILED_CACHE_MAX_ENTRIES.
+        // Each entry is SoftReference<List<String>> — only count if not GC'd.
+        // Average decompiled class ~5 KB of source lines.
+        int liveEntries = 0;
+        for (SoftReference<List<String>> ref : decompiledContentCache.values()) {
+            if (ref != null && ref.get() != null) {
+                liveEntries++;
+            }
+        }
+        bytes += (long) liveEntries * 5120;
+        // classFileURICache + uriToClassName: ~200 bytes per entry each
+        bytes += (long) classFileURICache.size() * 200;
+        bytes += (long) uriToClassName.size() * 200;
+        return bytes;
+    }
+
+    /**
      * Set the classloader used by the Groovy compiler. This is used to
      * locate {@code .class} files on the classpath so that "Go to Definition"
      * can return a {@code jar:} or {@code jrt:} URI pointing to the actual

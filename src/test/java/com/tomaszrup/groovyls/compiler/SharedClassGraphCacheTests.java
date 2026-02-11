@@ -124,8 +124,8 @@ class SharedClassGraphCacheTests {
 	@Test
 	void testComputeClasspathKeyDeterministic() {
 		GroovyClassLoader cl = createClassLoader();
-		String key1 = SharedClassGraphCache.computeClasspathKey(cl);
-		String key2 = SharedClassGraphCache.computeClasspathKey(cl);
+		String key1 = cache.computeClasspathKey(cl);
+		String key2 = cache.computeClasspathKey(cl);
 		Assertions.assertEquals(key1, key2, "Same classloader → same key");
 	}
 
@@ -135,8 +135,8 @@ class SharedClassGraphCacheTests {
 		GroovyClassLoader cl1 = new GroovyClassLoader(ClassLoader.getSystemClassLoader().getParent(), config, true);
 		GroovyClassLoader cl2 = new GroovyClassLoader(ClassLoader.getSystemClassLoader().getParent(), config, true);
 
-		String key1 = SharedClassGraphCache.computeClasspathKey(cl1);
-		String key2 = SharedClassGraphCache.computeClasspathKey(cl2);
+		String key1 = cache.computeClasspathKey(cl1);
+		String key2 = cache.computeClasspathKey(cl2);
 		Assertions.assertEquals(key1, key2, "Identical classpaths → same key");
 	}
 

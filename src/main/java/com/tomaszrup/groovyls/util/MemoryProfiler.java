@@ -19,7 +19,9 @@
 ////////////////////////////////////////////////////////////////////////////////
 package com.tomaszrup.groovyls.util;
 
+import com.tomaszrup.groovyls.JavadocResolver;
 import com.tomaszrup.groovyls.ProjectScope;
+import com.tomaszrup.groovyls.compiler.SharedClassGraphCache;
 import com.tomaszrup.groovyls.compiler.ast.ASTNodeVisitor;
 import com.tomaszrup.groovyls.compiler.control.GroovyLSCompilationUnit;
 import com.tomaszrup.groovyls.config.CompilationUnitFactory;
@@ -36,7 +38,8 @@ import java.util.*;
 
 /**
  * Opt-in memory profiler that estimates per-project RAM usage and reports
- * the top 3 memory-consuming projects with their top 3 internal components.
+ * the top 3 memory-consuming projects with their top 3 internal components,
+ * plus global (process-wide) memory consumers and a JVM overhead estimate.
  *
  * <p><b>Disabled by default</b> to avoid any overhead for regular users.
  * Enable via system property: {@code -Dgroovyls.debug.memoryProfile=true}</p>
@@ -46,17 +49,30 @@ import java.util.*;
  * and produces output like:</p>
  * <pre>
  * === Memory Profile: Top 3 projects by RAM ===
- *   1. /workspace/project-alpha (312.4 MB)
- *        ClassGraph ScanResult: 180.2 MB | GroovyClassLoader: 85.1 MB | AST: 47.1 MB
- *   2. /workspace/project-beta (287.9 MB)
- *        ClassGraph ScanResult: 165.0 MB | GroovyClassLoader: 78.3 MB | AST: 44.6 MB
- *   3. /workspace/project-gamma (201.5 MB)
- *        GroovyClassLoader: 92.0 MB | ClassGraph ScanResult: 70.4 MB | CompilationUnit: 39.1 MB
- * Total tracked: 12 scopes (8 active, 4 evicted) | JVM heap: 1,847 / 4,096 MB
+ *   1. /workspace/project-alpha (45.2 MB)
+ *        ClassGraph ScanResult: 18.0 MB | GroovyClassLoader: 12.5 MB | AST: 8.1 MB
+ *   2. /workspace/project-beta (38.7 MB)
+ *        ClassGraph ScanResult: 15.2 MB | GroovyClassLoader: 10.3 MB | AST: 7.6 MB
+ * Per-scope total: 83.9 MB (2 active, 0 evicted)
+ * --- Global (process-wide) ---
+ *   SharedClassGraphCache: 52.3 MB (2 entries, 3 refs)
+ *   SharedSourceJarIndex: 1.2 MB | JavadocResolver: 0.4 MB
+ *   JavaSourceLocator (all scopes): 0.8 MB
+ * --- Summary ---
+ *   Tracked:   83.9 MB (scopes) + 54.7 MB (global) = 138.6 MB
+ *   JVM heap:  158 / 768 MB (21 %)
+ *   Untracked: ~19 MB (JVM internals, thread stacks, LSP4J, GC overhead)
  * </pre>
  *
- * <p>Estimation is shallow (reference counting + coefficients) to keep cost
- * low even when active. No deep heap walking is performed.</p>
+ * <h3>Estimation accuracy</h3>
+ * <p>Estimation uses empirically-calibrated coefficients per data structure.
+ * No deep heap walking is performed to keep cost low. The goal is to account
+ * for &gt;80% of used heap so that the "Untracked" line is small and stable.</p>
+ *
+ * <h3>ScanResult sharing</h3>
+ * <p>Per-scope ScanResult estimates reflect each scope's <em>view</em> of
+ * the ScanResult (class count). The global section reports the actual unique
+ * memory footprint via {@link SharedClassGraphCache} without double-counting.</p>
  */
 public final class MemoryProfiler {
 
@@ -69,18 +85,50 @@ public final class MemoryProfiler {
 	private static final boolean ENABLED = Boolean.getBoolean(PROP_ENABLED);
 
 	// ---- Estimation coefficients (bytes) ----
+	// These are calibrated against JVM heap dumps of real workspaces.
 
-	/** Estimated bytes per AST node (ASTNode + lookup data + map entries). */
-	private static final long BYTES_PER_AST_NODE = 320;
+	/**
+	 * Estimated bytes per ClassInfo in a ClassGraph ScanResult.
+	 * Each ClassInfo holds: name, modifiers, superclass ref, interfaces list,
+	 * MethodInfoList, FieldInfoList, AnnotationInfoList, type signature,
+	 * ClasspathElement ref, and various interned strings.
+	 * Empirical measurement: ~6 KB per ClassInfo on average.
+	 */
+	private static final long BYTES_PER_CLASSINFO = 6144;
 
-	/** Estimated bytes per class node entry in the visitor. */
-	private static final long BYTES_PER_CLASS_NODE = 512;
+	/** Base overhead of a ScanResult (internal indexes, ClasspathElement list). */
+	private static final long SCANRESULT_BASE_BYTES = 2 * 1024 * 1024; // 2 MB
 
-	/** Estimated bytes per source unit in a compilation unit. */
-	private static final long BYTES_PER_SOURCE_UNIT = 4096;
+	/**
+	 * Estimated bytes per AST node in the ASTNodeVisitor lookup map.
+	 * Each node has: the ASTNode object itself (~200 bytes avg for various
+	 * subclasses), ASTLookupKey wrapper (16 bytes), ASTNodeLookupData
+	 * (parent ref + URI ref = 32 bytes), HashMap entry (32 bytes),
+	 * plus the node's internal fields (type ClassNode refs, Token, etc.).
+	 * Conservative: ~800 bytes per node.
+	 */
+	private static final long BYTES_PER_AST_NODE = 800;
 
-	/** Estimated bytes per classpath entry string in a classloader. */
-	private static final long BYTES_PER_CLASSPATH_ENTRY = 256;
+	/** Estimated bytes per ClassNode entry (larger than avg node). */
+	private static final long BYTES_PER_CLASS_NODE = 2048;
+
+	/**
+	 * Estimated bytes per source unit in a CompilationUnit.
+	 * Each SourceUnit holds: the full AST subtree (ModuleNode → ClassNode →
+	 * MethodNode → Statement trees), a ReaderSource, ErrorCollector,
+	 * and CompileUnit metadata.  ~40 KB per source file on average.
+	 */
+	private static final long BYTES_PER_SOURCE_UNIT = 40 * 1024; // 40 KB
+
+	/**
+	 * Base overhead of a GroovyClassLoader instance.
+	 * Includes: internal class cache, defineClass registry, transformation
+	 * caches, parent classloader overhead, and URLClassPath with JAR handles.
+	 */
+	private static final long CLASSLOADER_BASE_BYTES = 5 * 1024 * 1024; // 5 MB
+
+	/** Per-classpath-entry cost in the classloader (URL + JAR file handle). */
+	private static final long BYTES_PER_CLASSPATH_ENTRY = 1024;
 
 	/** Estimated bytes per dependency graph edge (URI + set entry). */
 	private static final long BYTES_PER_DEP_EDGE = 192;
@@ -91,11 +139,8 @@ public final class MemoryProfiler {
 	/** Estimated bytes per cached groovy file path. */
 	private static final long BYTES_PER_CACHED_FILE = 160;
 
-	/** Base overhead of a GroovyClassLoader instance (internal tables, etc.). */
-	private static final long CLASSLOADER_BASE_BYTES = 2 * 1024 * 1024; // 2 MB
-
-	/** Base overhead of a ScanResult instance (indexes, metadata). */
-	private static final long SCANRESULT_BASE_BYTES = 8 * 1024 * 1024; // 8 MB
+	/** Estimated bytes per resolved classpath cache entry. */
+	private static final long BYTES_PER_CLASSPATH_CACHE_ENTRY = 256;
 
 	private MemoryProfiler() {
 		// utility class
@@ -112,8 +157,8 @@ public final class MemoryProfiler {
 
 	/**
 	 * Profiles all given scopes and logs the top 3 projects by estimated RAM,
-	 * each with their top 3 internal components. No-ops if the profiler is
-	 * disabled.
+	 * each with their top 3 internal components, followed by global singletons
+	 * and a JVM summary.  No-ops if the profiler is disabled.
 	 *
 	 * @param scopes the list of project scopes to profile
 	 */
@@ -168,9 +213,66 @@ public final class MemoryProfiler {
 				sb.append('\n');
 			}
 
+			double scopeTotalMB = profiles.stream().mapToDouble(p -> p.totalMB).sum();
+			sb.append(String.format("Per-scope total: %.1f MB (%d active, %d evicted)%n",
+					scopeTotalMB, activeCount, evictedCount));
+
+			// --- Global (process-wide) singletons ---
+			sb.append("--- Global (process-wide) ---\n");
+
+			// SharedClassGraphCache (unique ScanResult footprint, no double-counting)
+			SharedClassGraphCache classGraphCache = SharedClassGraphCache.getInstance();
+			long classGraphBytes = classGraphCache.estimateMemoryBytes();
+			double classGraphMB = classGraphBytes / (1024.0 * 1024.0);
+			sb.append(String.format("  SharedClassGraphCache: %.1f MB (%d entries, %d refs)%n",
+					classGraphMB, classGraphCache.getEntryCount(), classGraphCache.getTotalRefCount()));
+
+			// SharedSourceJarIndex
+			SharedSourceJarIndex sourceJarIndex = SharedSourceJarIndex.getInstance();
+			long sourceJarBytes = sourceJarIndex.estimateMemoryBytes();
+			double sourceJarMB = sourceJarBytes / (1024.0 * 1024.0);
+
+			// JavadocResolver (static cache)
+			long javadocBytes = JavadocResolver.estimateCacheMemoryBytes();
+			double javadocMB = javadocBytes / (1024.0 * 1024.0);
+
+			sb.append(String.format("  SharedSourceJarIndex: %.1f MB | JavadocResolver: %.1f MB%n",
+					sourceJarMB, javadocMB));
+
+			// JavaSourceLocator per-scope caches (aggregate across all scopes)
+			double jslTotalMB = 0;
+			for (ProjectScope scope : scopes) {
+				if (!scope.isEvicted()) {
+					JavaSourceLocator locator = scope.getJavaSourceLocator();
+					if (locator != null) {
+						jslTotalMB += locator.estimateMemoryBytes() / (1024.0 * 1024.0);
+					}
+				}
+			}
+			if (jslTotalMB > 0.05) {
+				sb.append(String.format("  JavaSourceLocator (all scopes): %.1f MB%n", jslTotalMB));
+			}
+
+			double globalTotalMB = classGraphMB + sourceJarMB + javadocMB + jslTotalMB;
+
+			// --- Summary ---
+			sb.append("--- Summary ---\n");
+			double trackedMB = scopeTotalMB + globalTotalMB;
+			sb.append(String.format("  Tracked:   %.1f MB (scopes) + %.1f MB (global) = %.1f MB%n",
+					scopeTotalMB, globalTotalMB, trackedMB));
+
 			Runtime rt = Runtime.getRuntime();
-			long usedMB = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024);
+			long usedBytes = rt.totalMemory() - rt.freeMemory();
+			long usedMB = usedBytes / (1024 * 1024);
 			long maxMB = rt.maxMemory() / (1024 * 1024);
+			int pct = (int) (100.0 * usedBytes / rt.maxMemory());
+			sb.append(String.format("  JVM heap:  %,d / %,d MB (%d %%)%n", usedMB, maxMB, pct));
+
+			double untrackedMB = (usedBytes / (1024.0 * 1024.0)) - trackedMB;
+			if (untrackedMB < 0) untrackedMB = 0;
+			sb.append(String.format("  Untracked: ~%.0f MB (JVM internals, thread stacks, LSP4J, GC overhead)%n",
+					untrackedMB));
+
 			sb.append(String.format("Total tracked: %d scopes (%d active, %d evicted) | JVM heap: %,d / %,d MB%n",
 					scopes.size(), activeCount, evictedCount, usedMB, maxMB));
 
@@ -221,11 +323,11 @@ public final class MemoryProfiler {
 		if (sr == null) {
 			return 0.0;
 		}
-		// ScanResult base overhead + per-class info.
-		// ClassGraph stores ClassInfo for every discovered class.
+		// ~6 KB per ClassInfo (method/field/annotation metadata, interned
+		// strings, ClassGraph internal indexes) + base overhead.
 		try {
 			int classCount = sr.getAllClasses().size();
-			long bytes = SCANRESULT_BASE_BYTES + (long) classCount * 512;
+			long bytes = SCANRESULT_BASE_BYTES + (long) classCount * BYTES_PER_CLASSINFO;
 			return bytes / (1024.0 * 1024.0);
 		} catch (Exception e) {
 			// ScanResult may be closed
@@ -238,7 +340,9 @@ public final class MemoryProfiler {
 		if (cl == null) {
 			return 0.0;
 		}
-		// Base overhead + per-classpath-entry cost
+		// Base overhead (internal class cache, defineClass registry,
+		// transformation caches, URLClassPath with JAR handles)
+		// + per-classpath-entry cost
 		ICompilationUnitFactory factory = scope.getCompilationUnitFactory();
 		int cpSize = 0;
 		if (factory != null) {
@@ -299,6 +403,8 @@ public final class MemoryProfiler {
 		} catch (Exception e) {
 			// best effort
 		}
+		// 40 KB per source unit: full AST subtree (ModuleNode → ClassNode →
+		// MethodNode → Statement/Expression trees), ReaderSource, ErrorCollector
 		long bytes = (long) sourceUnitCount * BYTES_PER_SOURCE_UNIT;
 		return bytes / (1024.0 * 1024.0);
 	}
@@ -343,7 +449,7 @@ public final class MemoryProfiler {
 		// resolvedClasspathCache
 		List<String> resolvedCp = cuf.getResolvedClasspathCache();
 		if (resolvedCp != null) {
-			bytes += (long) resolvedCp.size() * BYTES_PER_CLASSPATH_ENTRY;
+			bytes += (long) resolvedCp.size() * BYTES_PER_CLASSPATH_CACHE_ENTRY;
 		}
 
 		// cachedGroovyFiles

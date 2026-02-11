@@ -302,6 +302,42 @@ public class FileContentsTracker {
 	}
 
 	/**
+	 * Estimates the total heap memory consumed by open file buffers and
+	 * the closed-file cache.  Each open file stores its full text content
+	 * as a String (2 bytes per char + ~40 bytes object overhead).
+	 *
+	 * @return estimated bytes consumed
+	 */
+	public long estimateMemoryBytes() {
+		long total = 0;
+		for (String content : openFiles.values()) {
+			if (content != null) {
+				total += 40 + (long) content.length() * 2;
+			}
+		}
+		for (CachedContent cached : closedFileCache.values()) {
+			if (cached != null && cached.content != null) {
+				total += 40 + (long) cached.content.length() * 2;
+			}
+		}
+		return total;
+	}
+
+	/**
+	 * Returns the number of open files currently tracked.
+	 */
+	public int getOpenFileCount() {
+		return openFiles.size();
+	}
+
+	/**
+	 * Returns the number of entries in the closed-file cache.
+	 */
+	public int getClosedFileCacheSize() {
+		return closedFileCache.size();
+	}
+
+	/**
 	 * Remove expired entries from the closed-file cache. This actively
 	 * cleans up entries that have outlived their TTL, rather than waiting
 	 * for the next {@link #getContents(URI)} call to lazily evict them.

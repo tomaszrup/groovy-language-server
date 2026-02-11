@@ -188,6 +188,24 @@ public class SharedSourceJarIndex {
         return cache.size();
     }
 
+    /**
+     * Estimates the total heap memory consumed by all cached source-JAR
+     * index entries. Each entry in the FQCN→SourceJarEntry map costs roughly
+     * ~300 bytes (String key ~120 bytes avg + SourceJarEntry with Path + String ~180 bytes).
+     *
+     * @return estimated bytes consumed by all cached indexes
+     */
+    public synchronized long estimateMemoryBytes() {
+        long total = 0;
+        for (IndexEntry entry : cache.values()) {
+            Map<String, ?> map = entry.getClassNameToSourceJar();
+            if (map != null) {
+                total += (long) map.size() * 300;
+            }
+        }
+        return total;
+    }
+
     private static String computeKey(List<String> classpathEntries) {
         String[] sorted = classpathEntries.toArray(new String[0]);
         Arrays.sort(sorted);

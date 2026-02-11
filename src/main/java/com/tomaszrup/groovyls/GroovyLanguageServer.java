@@ -269,6 +269,20 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                 double threshold = opts.get("memoryPressureThreshold").getAsDouble();
                 groovyServices.getScopeManager().setMemoryPressureThreshold(threshold);
             }
+            // Configurable ClassGraph rejected packages
+            if (opts.has("rejectedPackages") && opts.get("rejectedPackages").isJsonArray()) {
+                JsonArray arr = opts.getAsJsonArray("rejectedPackages");
+                java.util.List<String> packages = new java.util.ArrayList<>();
+                for (JsonElement el : arr) {
+                    if (el.isJsonPrimitive()) {
+                        String pkg = el.getAsString().trim();
+                        if (!pkg.isEmpty()) {
+                            packages.add(pkg);
+                        }
+                    }
+                }
+                SharedClassGraphCache.getInstance().setAdditionalRejectedPackages(packages);
+            }
         }
 
         // Apply memory settings to scope manager

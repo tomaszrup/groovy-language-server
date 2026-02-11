@@ -245,7 +245,8 @@ function onDidChangeConfiguration(event: vscode.ConfigurationChangeEvent) {
     event.affectsConfiguration("groovy.formatting.enabled") ||
     event.affectsConfiguration("groovy.memory.scopeEvictionTTL") ||
     event.affectsConfiguration("groovy.memory.backfillSiblingProjects") ||
-    event.affectsConfiguration("groovy.memory.pressureThreshold")
+    event.affectsConfiguration("groovy.memory.pressureThreshold") ||
+    event.affectsConfiguration("groovy.memory.rejectedPackages")
   ) {
     javaPath = findJava();
     //we're going to try to kill the language server and then restart
@@ -322,6 +323,12 @@ export function buildInitializationOptions(): Record<string, unknown> {
   if (pressureThreshold !== undefined) {
     // Convert from percentage (30-95) to ratio (0.30-0.95) for the server
     options.memoryPressureThreshold = pressureThreshold / 100;
+  }
+
+  // Rejected packages for ClassGraph scanning
+  const rejectedPackages = config.get<string[]>("memory.rejectedPackages");
+  if (rejectedPackages !== undefined) {
+    options.rejectedPackages = rejectedPackages;
   }
 
   return options;

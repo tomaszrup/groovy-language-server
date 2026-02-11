@@ -1,0 +1,153 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  gls:
+    name: Groovy Language Server
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@v4
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build & Test with Coverage
+        run: ./gradlew jacocoTestReport shadowJarSmokeTest
+
+      - name: Generate GLS Coverage Badge
+        id: jacoco
+        uses: cicirello/jacoco-badge-generator@v2
+        with:
+          jacoco-csv-file: build/reports/jacoco/test/jacocoTestReport.csv
+          badges-directory: .badges
+          coverage-badge-filename: gls-coverage.svg
+          branches-badge-filename: gls-branches.svg
+          generate-branches-badge: true
+          coverage-label: GLS Coverage
+          branches-label: GLS Branches
+
+      - name: Upload GLS badges
+        uses: actions/upload-artifact@v4
+        with:
+          name: badges-gls
+          path: .badges/
+
+      - name: Upload GLS test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gls-test-results
+          path: |
+            build/reports/tests/test/
+            build/reports/jacoco/test/html/
+
+  extension:
+    name: VS Code Extension
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: extension
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: extension/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests with coverage
+        run: npx vitest run --coverage
+
+      - name: Generate Extension Coverage Badge
+        run: |
+          COVERAGE=$(node -e "
+            const summary = require('./coverage/coverage-summary.json');
+            const pct = summary.total.lines.pct;
+            console.log(pct);
+          ")
+          COLOR="red"
+          if (( $(echo "$COVERAGE >= 90" | bc -l) )); then COLOR="brightgreen"
+          elif (( $(echo "$COVERAGE >= 80" | bc -l) )); then COLOR="green"
+          elif (( $(echo "$COVERAGE >= 70" | bc -l) )); then COLOR="yellowgreen"
+          elif (( $(echo "$COVERAGE >= 60" | bc -l) )); then COLOR="yellow"
+          elif (( $(echo "$COVERAGE >= 50" | bc -l) )); then COLOR="orange"
+          fi
+          mkdir -p .badges
+          cat > .badges/extension-coverage.json << EOF
+          {
+            "schemaVersion": 1,
+            "label": "Extension Coverage",
+            "message": "${COVERAGE}%",
+            "color": "${COLOR}"
+          }
+          EOF
+
+      - name: Upload Extension badges
+        uses: actions/upload-artifact@v4
+        with:
+          name: badges-extension
+          path: extension/.badges/
+
+      - name: Upload Extension coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: extension-coverage-report
+          path: extension/coverage/
+
+  update-badges:
+    name: Update Coverage Badges
+    needs: [gls, extension]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Switch to badges branch
+        run: |
+          git checkout badges 2>/dev/null || git checkout --orphan badges
+          git rm -rf . 2>/dev/null || true
+          mkdir -p .badges
+
+      - name: Download GLS badges
+        uses: actions/download-artifact@v4
+        with:
+          name: badges-gls
+          path: .badges/
+
+      - name: Download Extension badges
+        uses: actions/download-artifact@v4
+        with:
+          name: badges-extension
+          path: .badges/
+
+      - name: Push badges
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .badges/
+          git diff --cached --quiet && echo "No badge changes" || {
+            git commit -m "Update coverage badges [skip ci]"
+            git push origin badges
+          }

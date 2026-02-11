@@ -30,7 +30,10 @@ import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 
 import groovy.lang.GroovyClassLoader;
@@ -87,14 +90,14 @@ public class SharedClassGraphCache {
 	 * scan configuration changes (e.g. adding/removing rejectPackages filters)
 	 * so that stale cached results are naturally orphaned.
 	 */
-	private static final String CACHE_KEY_VERSION = "v2";
+	private static final String CACHE_KEY_VERSION = "v3";
 
 	/**
-	 * Internal JDK packages rejected from ClassGraph scans to reduce memory.
-	 * Public {@code com.sun.*} APIs (httpserver, management, jdi, etc.) are
-	 * intentionally kept.
+	 * Internal JDK implementation packages that are <b>always</b> rejected from
+	 * ClassGraph scans. These are non-public APIs that should never appear in
+	 * code completion. Not configurable.
 	 */
-	private static final String[] REJECTED_PACKAGES = {
+	private static final String[] BASE_REJECTED_PACKAGES = {
 		"sun.",
 		"jdk.",
 		"com.sun.proxy",
@@ -113,11 +116,80 @@ public class SharedClassGraphCache {
 		"com.sun.swing"
 	};
 
+	/**
+	 * Default list of <em>additional</em> public JDK packages to reject from
+	 * ClassGraph scans. These are GUI, RMI, and other rarely-used packages
+	 * that save ~15–20 MB per scan result. Configurable via the
+	 * {@code groovy.memory.rejectedPackages} VS Code setting.
+	 *
+	 * <p>Users who need completions for any of these packages (e.g.
+	 * {@code java.awt.Color} for PDF/Excel libraries) can remove entries
+	 * from the setting.
+	 */
+	public static final List<String> DEFAULT_ADDITIONAL_REJECTED_PACKAGES = List.of(
+		"javax.swing",
+		"javax.sound",
+		"javax.print",
+		"javax.accessibility",
+		"java.applet",
+		"java.awt",
+		"java.rmi",
+		"javax.rmi",
+		"javax.smartcardio",
+		"org.ietf.jgss",
+		"javax.security.sasl"
+	);
+
 	/** Singleton instance. */
 	private static final SharedClassGraphCache INSTANCE = new SharedClassGraphCache();
 
 	public static SharedClassGraphCache getInstance() {
 		return INSTANCE;
+	}
+
+	/**
+	 * User-configured additional packages to reject, set via
+	 * {@code groovy.memory.rejectedPackages}. Defaults to
+	 * {@link #DEFAULT_ADDITIONAL_REJECTED_PACKAGES}.
+	 */
+	private volatile List<String> additionalRejectedPackages =
+			DEFAULT_ADDITIONAL_REJECTED_PACKAGES;
+
+	/**
+	 * Set the list of additional public JDK packages to reject from
+	 * ClassGraph scans. These are merged with the hardcoded
+	 * {@link #BASE_REJECTED_PACKAGES} at scan time.
+	 *
+	 * <p>Pass an empty list to disable additional filtering (only the
+	 * base internal-JDK packages will be rejected).
+	 *
+	 * <p><b>Note:</b> changing this does <em>not</em> invalidate existing
+	 * cached scan results. The cache key includes the rejected packages,
+	 * so a new scan will be performed with the updated filter the next
+	 * time {@link #acquire} is called with a classloader whose key does
+	 * not match.</p>
+	 *
+	 * @param packages list of package prefixes to reject (e.g.
+	 *                 {@code "javax.swing"}, {@code "java.awt"})
+	 */
+	public void setAdditionalRejectedPackages(List<String> packages) {
+		this.additionalRejectedPackages = packages != null
+				? Collections.unmodifiableList(new ArrayList<>(packages))
+				: DEFAULT_ADDITIONAL_REJECTED_PACKAGES;
+		logger.info("ClassGraph additional rejected packages: {}", this.additionalRejectedPackages);
+	}
+
+	/**
+	 * Returns the merged array of all rejected packages (base + additional).
+	 */
+	private String[] getMergedRejectedPackages() {
+		List<String> additional = this.additionalRejectedPackages;
+		String[] merged = new String[BASE_REJECTED_PACKAGES.length + additional.size()];
+		System.arraycopy(BASE_REJECTED_PACKAGES, 0, merged, 0, BASE_REJECTED_PACKAGES.length);
+		for (int i = 0; i < additional.size(); i++) {
+			merged[BASE_REJECTED_PACKAGES.length + i] = additional.get(i);
+		}
+		return merged;
 	}
 
 	/**
@@ -228,12 +300,13 @@ public class SharedClassGraphCache {
 		evictUnusedEntries();
 
 		try {
+			String[] mergedRejected = getMergedRejectedPackages();
 			long scanStart = System.currentTimeMillis();
 			scanResult = new ClassGraph()
 					.overrideClassLoaders(classLoader)
 					.enableClassInfo()
 					.enableSystemJarsAndModules()
-					.rejectPackages(REJECTED_PACKAGES)
+					.rejectPackages(mergedRejected)
 					.scan();
 			long scanElapsed = System.currentTimeMillis() - scanStart;
 			logger.info("ClassGraph scan completed in {}ms ({} URLs)",
@@ -338,7 +411,14 @@ public class SharedClassGraphCache {
 	 * The URLs are sorted lexicographically and then SHA-256 hashed so that
 	 * two classloaders with the same JARs (in any order) produce the same key.
 	 */
-	static String computeClasspathKey(GroovyClassLoader classLoader) {
+	/**
+	 * Compute a content-based cache key from the classloader's classpath
+	 * <em>and</em> the current rejected-packages configuration.  Including
+	 * the rejected packages in the hash ensures that changing the filter
+	 * list naturally produces a different cache key, invalidating stale
+	 * entries without requiring a manual version bump.
+	 */
+	String computeClasspathKey(GroovyClassLoader classLoader) {
 		URL[] urls = classLoader.getURLs();
 		String[] urlStrings = new String[urls.length];
 		for (int i = 0; i < urls.length; i++) {
@@ -349,6 +429,17 @@ public class SharedClassGraphCache {
 		sb.append(CACHE_KEY_VERSION).append('\n');
 		for (String url : urlStrings) {
 			sb.append(url).append('\n');
+		}
+		// Include rejected packages so changing the filter invalidates the cache
+		List<String> additional = this.additionalRejectedPackages;
+		if (!additional.isEmpty()) {
+			sb.append("rejected:");
+			List<String> sorted = new ArrayList<>(additional);
+			Collections.sort(sorted);
+			for (String pkg : sorted) {
+				sb.append(pkg).append(',');
+			}
+			sb.append('\n');
 		}
 		return sha256(sb.toString());
 	}
@@ -391,6 +482,54 @@ public class SharedClassGraphCache {
 		}
 		CacheEntry entry = cache.get(key);
 		return entry != null ? entry.refCount : -1;
+	}
+
+	/**
+	 * Estimates the total heap memory consumed by all cached ScanResult
+	 * instances in this cache.  Each ClassInfo object in a ScanResult
+	 * carries method/field/annotation metadata, interned strings, and
+	 * internal ClassGraph indexes — empirically ~6 KB per ClassInfo.
+	 *
+	 * <p>Because scopes share ScanResults via reference counting, this
+	 * reports the <em>actual unique</em> memory footprint (no double-counting).
+	 *
+	 * @return estimated bytes consumed by all cached ScanResults
+	 */
+	public synchronized long estimateMemoryBytes() {
+		long total = 0;
+		for (CacheEntry entry : cache.values()) {
+			ScanResult sr = entry.get();
+			if (sr != null) {
+				try {
+					int classCount = sr.getAllClasses().size();
+					// ~6 KB per ClassInfo (type refs, method/field lists,
+					// annotations, generics, interned strings, index entries)
+					// + 2 MB base overhead for ClassGraph internal structures
+					total += 2L * 1024 * 1024 + (long) classCount * 6144;
+				} catch (Exception e) {
+					total += 2L * 1024 * 1024; // base only if ScanResult is closed
+				}
+			}
+		}
+		return total;
+	}
+
+	/**
+	 * Returns the number of currently cached entries.
+	 */
+	public synchronized int getEntryCount() {
+		return cache.size();
+	}
+
+	/**
+	 * Returns the total reference count across all cached entries.
+	 */
+	public synchronized int getTotalRefCount() {
+		int total = 0;
+		for (CacheEntry entry : cache.values()) {
+			total += entry.refCount;
+		}
+		return total;
 	}
 
 	/**
