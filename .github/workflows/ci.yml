@@ -62,11 +62,21 @@ jobs:
           }
           EOF
 
+      - name: Verify GLS badges exist
+        run: |
+          echo "Checking badge files..."
+          ls -la .badges/
+          test -f .badges/gls-coverage.svg
+          test -f .badges/gls-branches.svg
+          test -f .badges/gls-coverage.json
+          echo "All badge files present"
+
       - name: Upload GLS badges
         uses: actions/upload-artifact@v4
         with:
           name: badges-gls
           path: .badges/
+          if-no-files-found: error
 
       - name: Upload GLS test results
         if: always()
@@ -123,11 +133,19 @@ jobs:
           }
           EOF
 
+      - name: Verify Extension badges exist
+        run: |
+          echo "Checking badge files..."
+          ls -la .badges/
+          test -f .badges/extension-coverage.json
+          echo "All badge files present"
+
       - name: Upload Extension badges
         uses: actions/upload-artifact@v4
         with:
           name: badges-extension
           path: extension/.badges/
+          if-no-files-found: error
 
       - name: Upload Extension coverage report
         if: always()
@@ -157,12 +175,20 @@ jobs:
         with:
           name: badges-gls
           path: .badges/
+        continue-on-error: false
 
       - name: Download Extension badges
         uses: actions/download-artifact@v4
         with:
           name: badges-extension
           path: .badges/
+        continue-on-error: false
+
+      - name: Verify downloaded badges
+        run: |
+          echo "Listing downloaded badges..."
+          ls -la .badges/
+          echo "Badge files downloaded successfully"
 
       - name: Push badges
         run: |
