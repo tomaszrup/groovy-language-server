@@ -28,6 +28,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.tomaszrup.groovyls.util.MdcProjectContext;
+import com.tomaszrup.groovyls.util.MemoryProfiler;
 
 import java.net.URI;
 import java.nio.file.Path;
@@ -336,6 +337,7 @@ public class ClasspathResolutionCoordinator {
 
     /**
      * Log JVM memory statistics and warn if usage exceeds 80% of max heap.
+     * When the memory profiler is enabled, also logs a per-project breakdown.
      */
     private void logMemoryStats() {
         Runtime rt = Runtime.getRuntime();
@@ -356,6 +358,7 @@ public class ClasspathResolutionCoordinator {
                 languageClient.logMessage(new MessageParams(MessageType.Warning, warning));
             }
         }
+        MemoryProfiler.logProfile(scopeManager.getProjectScopes());
     }
 
     public void shutdown() {

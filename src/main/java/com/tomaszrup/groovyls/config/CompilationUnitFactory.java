@@ -211,6 +211,23 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 		cachedGroovyFiles = null;
 	}
 
+	/**
+	 * Returns the resolved classpath cache, or {@code null} if not yet
+	 * computed. Used by the memory profiler for size estimation.
+	 */
+	public List<String> getResolvedClasspathCache() {
+		return resolvedClasspathCache;
+	}
+
+	/**
+	 * Returns the number of cached .groovy file paths, or 0 if the cache
+	 * has not been populated yet. Used by the memory profiler.
+	 */
+	public int getCachedGroovyFileCount() {
+		Set<Path> cached = cachedGroovyFiles;
+		return cached != null ? cached.size() : 0;
+	}
+
 	public GroovyLSCompilationUnit create(Path workspaceRoot, FileContentsTracker fileContentsTracker) {
 		return create(workspaceRoot, fileContentsTracker, Collections.emptySet());
 	}

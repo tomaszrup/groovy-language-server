@@ -407,6 +407,18 @@ function startLanguageServer() {
               );
               return;
             }
+            // If the user set vmargs but didn't include -Xmx, auto-size
+            // the heap so the JVM doesn't default to 1/4 of physical RAM.
+            const hasXmx = vmTokens.some((t) =>
+              t.toLowerCase().startsWith("-xmx")
+            );
+            if (!hasXmx) {
+              const heapMb = await estimateHeapSize();
+              args.unshift(`-Xmx${heapMb}m`, "-XX:+UseG1GC", "-XX:+HeapDumpOnOutOfMemoryError");
+              outputChannel?.appendLine(
+                `Auto-detected heap size: -Xmx${heapMb}m (user vmargs don't include -Xmx)`
+              );
+            }
             args.unshift(...vmTokens);
           } else {
             const heapMb = await estimateHeapSize();

@@ -56,6 +56,7 @@ import com.tomaszrup.groovyls.compiler.ast.ASTNodeVisitor;
 import com.tomaszrup.groovyls.compiler.control.GroovyLSCompilationUnit;
 import com.tomaszrup.groovyls.util.FileContentsTracker;
 import com.tomaszrup.groovyls.util.MdcProjectContext;
+import com.tomaszrup.groovyls.util.MemoryProfiler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -932,6 +933,15 @@ public class CompilationService {
 		long totalMB = rt.totalMemory() / (1024 * 1024);
 		long maxMB = rt.maxMemory() / (1024 * 1024);
 		logger.warn("JVM memory: used={}MB, total={}MB, max={}MB", usedMB, totalMB, maxMB);
+	}
+
+	/**
+	 * Logs current JVM memory statistics plus a detailed per-project memory
+	 * profile (when enabled via {@code -Dgroovyls.debug.memoryProfile=true}).
+	 */
+	private void logMemoryStats(List<ProjectScope> scopes) {
+		logMemoryStats();
+		MemoryProfiler.logProfile(scopes);
 	}
 
 	/**

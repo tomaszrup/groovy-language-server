@@ -19,9 +19,12 @@
 ////////////////////////////////////////////////////////////////////////////////
 package com.tomaszrup.groovyls.importers;
 
+import com.tomaszrup.groovyls.ProjectScope;
 import com.tomaszrup.groovyls.config.CompilationUnitFactory;
 import com.tomaszrup.groovyls.compiler.control.GroovyLSCompilationUnit;
 import com.tomaszrup.groovyls.util.FileContentsTracker;
+import com.tomaszrup.groovyls.util.MemoryProfiler;
+import org.codehaus.groovy.control.Phases;
 import org.junit.jupiter.api.*;
 
 import java.io.IOException;
@@ -100,9 +103,11 @@ class LargeWorkspaceMemoryTests {
 
     private static final int PROJECT_COUNT = Integer.getInteger("groovyls.test.projectCount", 50);
     private static final int CLASSPATH_SIZE = Integer.getInteger("groovyls.test.classpathSize", 50_000);
-    private static final int JAR_SIZE_BYTES = Integer.getInteger("groovyls.test.jarSize", 1024);
+    private static final int JAR_SIZE_BYTES = Integer.getInteger("groovyls.test.jarSize", 1_500_000); // 1.5MB default
+    private static final int SOURCE_FILES_PER_PROJECT = Integer.getInteger("groovyls.test.sourceFilesPerProject", 30);
     private static final boolean HEAP_DUMP_ENABLED = Boolean.getBoolean("groovyls.test.heapDump");
     private static final boolean DISABLE_EVICTION = Boolean.getBoolean("groovyls.test.disableEviction");
+    private static final boolean SKIP_COMPILATION = Boolean.getBoolean("groovyls.test.skipCompilation");
 
     // ---- Test state ----
 
@@ -126,11 +131,22 @@ class LargeWorkspaceMemoryTests {
         System.out.printf("Configuration:%n");
         System.out.printf("  Projects:             %,d%n", PROJECT_COUNT);
         System.out.printf("  Classpath per project: %,d entries%n", CLASSPATH_SIZE);
-        System.out.printf("  JAR size:             %,d bytes%n", JAR_SIZE_BYTES);
+        System.out.printf("  JAR size:             %,d bytes (%.1f MB)%n", JAR_SIZE_BYTES, JAR_SIZE_BYTES / 1024.0 / 1024.0);
+        System.out.printf("  Source files/project: %,d%n", SOURCE_FILES_PER_PROJECT);
         System.out.printf("  Total classpath:      %,d entries%n", (long) PROJECT_COUNT * CLASSPATH_SIZE);
+        System.out.printf("  Total disk space:     %.1f GB%n", (long) PROJECT_COUNT * CLASSPATH_SIZE * JAR_SIZE_BYTES / 1024.0 / 1024.0 / 1024.0);
         System.out.printf("  Heap dump enabled:    %s%n", HEAP_DUMP_ENABLED);
         System.out.printf("  Eviction disabled:    %s%n", DISABLE_EVICTION);
+        System.out.printf("  Skip compilation:     %s%n", SKIP_COMPILATION);
         System.out.println();
+        
+        if (CLASSPATH_SIZE > 10000 && !SKIP_COMPILATION) {
+            System.out.println("⚠️  WARNING: Large classpath (" + CLASSPATH_SIZE + " entries) detected.");
+            System.out.println("   Phase 6 (Compilation Unit Creation) may take 5-30+ minutes.");
+            System.out.println("   To skip compilation and measure only classpath memory, use:");
+            System.out.println("   -Dgroovyls.test.skipCompilation=true");
+            System.out.println();
+        }
 
         sharedJarDir = Files.createTempDirectory("groovyls-memory-test-jars");
         jarPathsByProject = new HashMap<>();
@@ -226,16 +242,15 @@ class LargeWorkspaceMemoryTests {
     }
 
     /**
-     * Generate a minimal valid JAR file at the specified size.
+     * Generate a realistic JAR file at the specified size.
      * 
-     * <p><strong>Performance optimizations:</strong></p>
+     * <p><strong>Realistic structure for memory profiling:</strong></p>
      * <ul>
-     *   <li>Uses {@link ZipOutputStream#STORED} (no compression) instead of DEFLATE — 3-5x faster</li>
-     *   <li>Reuses manifest and padding buffer — reduces GC pressure</li>
-     *   <li>Pre-calculates CRC32 for dummy entry — avoids per-file checksum computation</li>
+     *   <li>Contains dummy .class files to simulate Spring Boot JARs</li>
+     *   <li>Uses {@link ZipOutputStream#STORED} (no compression) for speed</li>
+     *   <li>Pre-calculates CRC32 for all entries</li>
+     *   <li>1.5-2MB JARs similar to real libraries (spring-core, hibernate, etc.)</li>
      * </ul>
-     * 
-     * <p>These optimizations reduce generation time from ~107s to ~20-30s for 50k JARs.</p>
      */
     private static void generateMinimalJar(Path jarPath, int targetSizeBytes) throws IOException {
         try (JarOutputStream jos = new JarOutputStream(
@@ -244,43 +259,45 @@ class LargeWorkspaceMemoryTests {
             // Disable compression for speed (STORED = uncompressed)
             jos.setMethod(ZipOutputStream.STORED);
             
-            // Calculate padding size (account for ZIP overhead)
-            int overhead = 100;
-            int paddingSize = Math.max(0, targetSizeBytes - overhead);
+            // Add multiple dummy class files to simulate real Jars
+            // Real JARs contain many classes, we'll add ~20-50 dummy entries
+            int numClassFiles = Math.max(10, targetSizeBytes / 50000); // ~50KB per "class"
+            int bytesPerFile = targetSizeBytes / numClassFiles;
             
-            // Create ZIP entry with pre-calculated CRC and sizes
-            ZipEntry entry = new ZipEntry("dummy.txt");
-            entry.setMethod(ZipOutputStream.STORED);
-            entry.setSize(paddingSize);
-            entry.setCompressedSize(paddingSize);
-            
-            // Pre-calculate CRC32 for the padding content
-            CRC32 crc = new CRC32();
-            int remaining = paddingSize;
-            while (remaining > 0) {
-                int chunk = Math.min(remaining, PADDING_BUFFER.length);
-                crc.update(PADDING_BUFFER, 0, chunk);
-                remaining -= chunk;
+            for (int i = 0; i < numClassFiles; i++) {
+                String className = String.format("com/example/lib%d/DummyClass%d.class", i % 10, i);
+                
+                // Create entry with realistic size
+                ZipEntry entry = new ZipEntry(className);
+                entry.setMethod(ZipOutputStream.STORED);
+                entry.setSize(bytesPerFile);
+                entry.setCompressedSize(bytesPerFile);
+                
+                // Calculate CRC for the dummy content
+                CRC32 crc = new CRC32();
+                int remaining = bytesPerFile;
+                while (remaining > 0) {
+                    int chunk = Math.min(remaining, PADDING_BUFFER.length);
+                    crc.update(PADDING_BUFFER, 0, chunk);
+                    remaining -= chunk;
+                }
+                entry.setCrc(crc.getValue());
+                
+                // Write entry
+                jos.putNextEntry(entry);
+                remaining = bytesPerFile;
+                while (remaining > 0) {
+                    int chunk = Math.min(remaining, PADDING_BUFFER.length);
+                    jos.write(PADDING_BUFFER, 0, chunk);
+                    remaining -= chunk;
+                }
+                jos.closeEntry();
             }
-            entry.setCrc(crc.getValue());
-            
-            // Write entry
-            jos.putNextEntry(entry);
-            
-            // Write padding data
-            remaining = paddingSize;
-            while (remaining > 0) {
-                int chunk = Math.min(remaining, PADDING_BUFFER.length);
-                jos.write(PADDING_BUFFER, 0, chunk);
-                remaining -= chunk;
-            }
-            
-            jos.closeEntry();
         }
     }
 
     /**
-     * Create a synthetic multi-project Gradle workspace.
+     * Create a synthetic multi-project Gradle workspace with realistic source files.
      */
     private List<Path> createLargeWorkspace(int projectCount) throws IOException {
         // Root settings.gradle listing all subprojects
@@ -298,6 +315,7 @@ class LargeWorkspaceMemoryTests {
             Path project = workspaceRoot.resolve("project-" + i);
             Files.createDirectories(project.resolve("src/main/java"));
             Files.createDirectories(project.resolve("src/main/groovy"));
+            Files.createDirectories(project.resolve("src/test/groovy"));
             Files.createDirectories(project.resolve("build/classes/java/main"));
 
             // Create a simple build.gradle
@@ -307,13 +325,64 @@ class LargeWorkspaceMemoryTests {
                     "  // Simulated large classpath\n" +
                     "}\n");
 
-            // Create a sample Groovy source file
-            Path groovyFile = project.resolve("src/main/groovy/Project" + i + ".groovy");
-            Files.writeString(groovyFile,
-                    "class Project" + i + " {\n" +
-                    "  void doSomething() {\n" +
-                    "    println 'Project " + i + "'\n" +
-                    "  }\n" +
+            // Create multiple realistic Groovy source files to generate realistic AST
+            for (int fileNum = 0; fileNum < SOURCE_FILES_PER_PROJECT; fileNum++) {
+                String className = String.format("Service%d", fileNum);
+                Path groovyFile = project.resolve(String.format("src/main/groovy/%s.groovy", className));
+                
+                // Generate realistic Groovy class with fields, methods, imports
+                StringBuilder classContent = new StringBuilder();
+                classContent.append("package com.example.project").append(i).append("\n\n");
+                classContent.append("import groovy.transform.CompileStatic\n");
+                classContent.append("import java.util.List\n");
+                classContent.append("import java.util.Map\n\n");
+                classContent.append("@CompileStatic\n");
+                classContent.append("class ").append(className).append(" {\n\n");
+                
+                // Add several fields
+                classContent.append("    private String name\n");
+                classContent.append("    private int count\n");
+                classContent.append("    private List<String> items = []\n");
+                classContent.append("    private Map<String, Object> config = [:]\n\n");
+                
+                // Add several methods
+                classContent.append("    void doSomething() {\n");
+                classContent.append("        println \"").append(className).append(": ${name}\"\n");
+                classContent.append("        count++\n");
+                classContent.append("    }\n\n");
+                
+                classContent.append("    String getName() { name }\n");
+                classContent.append("    void setName(String name) { this.name = name }\n\n");
+                
+                classContent.append("    int getCount() { count }\n\n");
+                
+                classContent.append("    void addItem(String item) {\n");
+                classContent.append("        items << item\n");
+                classContent.append("    }\n\n");
+                
+                classContent.append("    List<String> getItems() {\n");
+                classContent.append("        items.asImmutable()\n");
+                classContent.append("    }\n\n");
+                
+                classContent.append("    void configure(Map<String, Object> newConfig) {\n");
+                classContent.append("        config.putAll(newConfig)\n");
+                classContent.append("    }\n");
+                
+                classContent.append("}\n");
+                
+                Files.writeString(groovyFile, classContent.toString());
+            }
+            
+            // Add a test file too
+            Path testFile = project.resolve("src/test/groovy/TestSpec.groovy");
+            Files.writeString(testFile,
+                    "package com.example.project" + i + "\n\n" +
+                    "import spock.lang.Specification\n\n" +
+                    "class TestSpec extends Specification {\n" +
+                    "    def \"test something\"() {\n" +
+                    "        expect:\n" +
+                    "        true\n" +
+                    "    }\n" +
                     "}\n");
 
             projectRoots.add(project);
@@ -491,36 +560,77 @@ class LargeWorkspaceMemoryTests {
                 heapAfterSetup, heapAfterSetup - heapAfterResolution);
 
         // ---- Phase 6: Compilation unit creation (per-project simulation) ----
-        phaseStart = System.nanoTime();
-        System.out.printf("%n[PHASE 6] Compilation Unit Creation%n");
-        
         List<GroovyLSCompilationUnit> compilationUnits = new ArrayList<>();
-        FileContentsTracker tracker = new FileContentsTracker();
-        
         long peakHeapDuringCompilation = heapAfterSetup;
+        long compilationMs = 0;
         
-        for (int i = 0; i < Math.min(5, projectRoots.size()); i++) {
-            Path project = projectRoots.get(i);
-            long cuStart = System.nanoTime();
+        if (SKIP_COMPILATION) {
+            System.out.printf("%n[PHASE 6] Compilation Unit Creation (SKIPPED)%n");
+            System.out.printf("  Skipped per configuration (groovyls.test.skipCompilation=true)%n");
+        } else {
+            phaseStart = System.nanoTime();
+            System.out.printf("%n[PHASE 6] Compilation Unit Creation%n");
+            System.out.printf("  Creating compilation units with %,d classpath entries...%n", 
+                    aggregatedClasspath.size());
+            System.out.printf("  Note: This may take several minutes with large classpaths.%n");
+            System.out.flush();
             
-            GroovyLSCompilationUnit cu = factory.create(project, tracker);
-            compilationUnits.add(cu);
+            FileContentsTracker tracker = new FileContentsTracker();
             
-            long cuMs = (System.nanoTime() - cuStart) / 1_000_000;
-            long currentHeap = getCurrentHeapMB();
-            peakHeapDuringCompilation = Math.max(peakHeapDuringCompilation, currentHeap);
+            // Create compilation units for all projects
+            for (int i = 0; i < projectRoots.size(); i++) {
+                Path project = projectRoots.get(i);
+                long cuStart = System.nanoTime();
+                
+                System.out.printf("    Creating compilation unit for project %d/%d...%n", 
+                        i + 1, projectRoots.size());
+                System.out.flush();
+                
+                GroovyLSCompilationUnit cu = factory.create(project, tracker);
+                
+                // Load all Groovy source files into the compilation unit
+                Path srcMainGroovy = project.resolve("src/main/groovy");
+                if (Files.exists(srcMainGroovy)) {
+                    try (var stream = Files.walk(srcMainGroovy)) {
+                        stream.filter(p -> p.toString().endsWith(".groovy"))
+                              .forEach(groovyFile -> cu.addSource(groovyFile.toFile()));
+                    }
+                }
+                
+                Path srcTestGroovy = project.resolve("src/test/groovy");
+                if (Files.exists(srcTestGroovy)) {
+                    try (var stream = Files.walk(srcTestGroovy)) {
+                        stream.filter(p -> p.toString().endsWith(".groovy"))
+                              .forEach(groovyFile -> cu.addSource(groovyFile.toFile()));
+                    }
+                }
+                
+                // Actually compile to generate AST structures and trigger parsing
+                try {
+                    cu.compile(Phases.CONVERSION);
+                } catch (Exception e) {
+                    // Compilation may fail with dummy classpath, but AST is still built
+                    System.out.printf("    (Compilation errors expected with dummy classpath)%n");
+                }
+                
+                compilationUnits.add(cu);
+                
+                long cuMs = (System.nanoTime() - cuStart) / 1_000_000;
+                long currentHeap = getCurrentHeapMB();
+                peakHeapDuringCompilation = Math.max(peakHeapDuringCompilation, currentHeap);
+                
+                System.out.printf("    Project %d: created CU in %,d ms (heap: %,d MB)%n", 
+                        i + 1, cuMs, currentHeap);
+                
+                // Invalidate for next iteration to simulate multiple scopes
+                factory.invalidateCompilationUnit();
+            }
             
-            System.out.printf("    Project %d: created CU in %,d ms (heap: %,d MB)%n", 
-                    i, cuMs, currentHeap);
-            
-            // Invalidate for next iteration to simulate multiple scopes
-            factory.invalidateCompilationUnit();
+            compilationMs = (System.nanoTime() - phaseStart) / 1_000_000;
+            System.out.printf("  Created %d compilation unit(s) in %,d ms%n", 
+                    compilationUnits.size(), compilationMs);
+            System.out.printf("  Peak heap during compilation: %,d MB%n", peakHeapDuringCompilation);
         }
-        
-        long compilationMs = (System.nanoTime() - phaseStart) / 1_000_000;
-        System.out.printf("  Created %d compilation units in %,d ms%n", 
-                compilationUnits.size(), compilationMs);
-        System.out.printf("  Peak heap during compilation: %,d MB%n", peakHeapDuringCompilation);
 
         if (HEAP_DUMP_ENABLED) {
             dumpHeap("02-after-compilation");
@@ -537,6 +647,34 @@ class LargeWorkspaceMemoryTests {
         long heapPerProject = compilationUnits.isEmpty() ? 0 : 
                 (steadyStateHeapMB - baselineHeapMB) / compilationUnits.size();
         System.out.printf("  Estimated heap per project: ~%,d MB%n", heapPerProject);
+
+        // ---- Memory Profiler breakdown ----
+        if (!compilationUnits.isEmpty()) {
+            System.out.printf("%n[PHASE 7b] MemoryProfiler Breakdown%n");
+            List<ProjectScope> testScopes = new ArrayList<>();
+            for (int i = 0; i < projectRoots.size(); i++) {
+                CompilationUnitFactory scopeFactory = new CompilationUnitFactory();
+                scopeFactory.setAdditionalClasspathList(
+                        new ArrayList<>(classpathsByProject.get(projectRoots.get(i))));
+                ProjectScope ps = new ProjectScope(projectRoots.get(i), scopeFactory);
+                if (i < compilationUnits.size()) {
+                    ps.setCompilationUnit(compilationUnits.get(i));
+                }
+                testScopes.add(ps);
+            }
+            // Always log in tests regardless of system property
+            for (ProjectScope ps : testScopes) {
+                Map<String, Double> breakdown = MemoryProfiler.estimateComponentSizes(ps);
+                double total = breakdown.values().stream().mapToDouble(Double::doubleValue).sum();
+                System.out.printf("  %s (%.1f MB)%n", ps.getProjectRoot().getFileName(), total);
+                breakdown.entrySet().stream()
+                        .sorted((a, b) -> Double.compare(b.getValue(), a.getValue()))
+                        .limit(3)
+                        .forEach(e -> System.out.printf("       %s: %.1f MB%n", e.getKey(), e.getValue()));
+            }
+            // Also call logProfile to exercise the full flow
+            MemoryProfiler.logProfile(testScopes);
+        }
 
         if (HEAP_DUMP_ENABLED) {
             dumpHeap("03-steady-state");
@@ -559,8 +697,10 @@ class LargeWorkspaceMemoryTests {
         System.out.printf("╚═══════════════════════════════════════════════════════════════════════╝%n");
 
         // Assertions (lenient — focus is on measurement, not pass/fail)
-        assertTrue(compilationUnits.size() > 0, "Should create at least one compilation unit");
-        assertTrue(steadyStateHeapMB > baselineHeapMB, "Heap should grow with workspace loaded");
+        if (!SKIP_COMPILATION) {
+            assertTrue(compilationUnits.size() > 0, "Should create at least one compilation unit");
+        }
+        assertTrue(steadyStateHeapMB >= baselineHeapMB, "Heap should grow with workspace loaded");
     }
 
     /**

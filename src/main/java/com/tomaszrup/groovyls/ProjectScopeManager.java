@@ -43,6 +43,7 @@ import org.eclipse.lsp4j.services.LanguageClient;
 import com.tomaszrup.groovyls.config.CompilationUnitFactory;
 import com.tomaszrup.groovyls.config.ICompilationUnitFactory;
 import com.tomaszrup.groovyls.util.FileContentsTracker;
+import com.tomaszrup.groovyls.util.MemoryProfiler;
 import com.tomaszrup.groovyls.JavadocResolver;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -591,6 +592,9 @@ public class ProjectScopeManager {
 	 * memory fills up, before reaching the emergency eviction trigger.</p>
 	 */
 	private void performEvictionSweep() {
+		// --- Periodic memory profiling (opt-in) ---
+		MemoryProfiler.logProfile(projectScopes);
+
 		// Sweep expired closed-file cache entries
 		int expired = fileContentsTracker.sweepExpiredClosedFileCache();
 		if (expired > 0) {

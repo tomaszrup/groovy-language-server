@@ -281,6 +281,18 @@ public class DependencyGraph {
 	}
 
 	/**
+	 * Returns the total number of individual dependency edges (sum of all
+	 * forward edge set sizes). Used by the memory profiler for estimation.
+	 */
+	public int getEdgeCount() {
+		int count = 0;
+		for (Set<URI> deps : dependsOn.values()) {
+			count += deps.size();
+		}
+		return count;
+	}
+
+	/**
 	 * Returns {@code true} if the graph contains no dependency information.
 	 */
 	public boolean isEmpty() {

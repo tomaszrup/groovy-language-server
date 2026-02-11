@@ -14,65 +14,8 @@ test {
   exclude '**/LargeWorkspaceMemoryTests.class'
 }
 
-// Task for running extreme-scale memory profiling tests
 task memoryTest(type: Test) {
-  description = 'Run large workspace memory profiling tests with heap dumps and profiler support'
-  group = 'verification'
-  
-  useJUnitPlatform()
-  include '**/LargeWorkspaceMemoryTests.class'
-  
-  // Large heap for 50 projects × 50k classpath entries
-  maxHeapSize = '8g'
-  
-  jvmArgs = [
-    // Use G1GC for better large heap performance
-    '-XX:+UseG1GC',
-    '-XX:MaxGCPauseMillis=200',
-    '-XX:InitiatingHeapOccupancyPercent=45',
-    
-    // Enable diagnostic features
-    '-XX:+UnlockDiagnosticVMOptions',
-    
-    // JDK Flight Recorder support (Java 11+)
-    '-XX:StartFlightRecording=filename=build/jfr/memory-test.jfr,dumponexit=true,settings=profile',
-    
-    // Enable heap dumps on OOM
-    '-XX:+HeapDumpOnOutOfMemoryError',
-    '-XX:HeapDumpPath=build/heap-dumps/oom.hprof',
-    
-    // Enable detailed GC logging
-    '-Xlog:gc*:file=build/logs/gc-memory-test.log:time,uptime,level,tags',
-    
-    // Enable heap dump capture via system property
-    '-Dgroovyls.test.heapDump=true',
-    
-    // Test configuration (override via -D flags on command line)
-    '-Dgroovyls.test.projectCount=50',
-    '-Dgroovyls.test.classpathSize=50000',
-    '-Dgroovyls.test.jarSize=1024'
-  ]
-  
-  // Create output directories
-  doFirst {
-    file("$buildDir/heap-dumps").mkdirs()
-    file("$buildDir/jfr").mkdirs()
-    file("$buildDir/logs").mkdirs()
-  }
-  
-  // Show standard output in console
-  testLogging {
-    showStandardStreams = true
-    events "passed", "skipped", "failed"
-  }
-  
-  // Increase test timeout for long-running tests
-  timeout = Duration.ofMinutes(30)
-}
-
-// Quick memory test with reduced scale for CI/local development
-task quickMemoryTest(type: Test) {
-  description = 'Run memory tests with reduced scale (10 projects × 5k classpath)'
+  description = 'Run memory tests with small scale'
   group = 'verification'
   
   useJUnitPlatform()
@@ -82,15 +25,19 @@ task quickMemoryTest(type: Test) {
   
   jvmArgs = [
     '-XX:+UseG1GC',
-    '-Dgroovyls.test.projectCount=10',
-    '-Dgroovyls.test.classpathSize=5000',
-    '-Dgroovyls.test.jarSize=512',
-    '-Dgroovyls.test.heapDump=false'
+    '-Dgroovyls.test.projectCount=5',
+    '-Dgroovyls.test.classpathSize=1000',  
+    '-Dgroovyls.test.jarSize=1500000',  
+    '-Dgroovyls.test.sourceFilesPerProject=150',  
+    '-Dgroovyls.test.heapDump=false',
+    '-Dgroovyls.test.skipCompilation=false'  
   ]
   
   testLogging {
     showStandardStreams = true
   }
+
+  timeout = Duration.ofMinutes(5)
 }
 
 ext.mainClass = "com.tomaszrup.groovyls.GroovyLanguageServer"
