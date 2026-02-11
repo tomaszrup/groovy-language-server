@@ -223,14 +223,22 @@ describe("estimateHeapSize", () => {
 
     // With eviction
     vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
-      get: vi.fn().mockReturnValue(300),
+      get: vi.fn((key: string) => {
+        if (key === "memory.scopeEvictionTTL") return 300;
+        if (key === "memory.perProjectMB") return 128;
+        return undefined;
+      }),
     } as any);
     vi.mocked(vscode.workspace.findFiles).mockResolvedValue(mockFiles as any);
     const heapWithEviction = await estimateHeapSize();
 
     // Without eviction
     vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
-      get: vi.fn().mockReturnValue(0),
+      get: vi.fn((key: string) => {
+        if (key === "memory.scopeEvictionTTL") return 0;
+        if (key === "memory.perProjectMB") return 128;
+        return undefined;
+      }),
     } as any);
     vi.mocked(vscode.workspace.findFiles).mockResolvedValue(mockFiles as any);
     const heapWithoutEviction = await estimateHeapSize();
