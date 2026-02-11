@@ -75,7 +75,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: badges-gls
-          path: .badges/
+          path: .badges
           if-no-files-found: error
 
       - name: Upload GLS test results
@@ -90,9 +90,6 @@ jobs:
   extension:
     name: VS Code Extension
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: extension
     steps:
       - uses: actions/checkout@v4
 
@@ -104,12 +101,15 @@ jobs:
           cache-dependency-path: extension/package-lock.json
 
       - name: Install dependencies
+        working-directory: extension
         run: npm ci
 
       - name: Run tests with coverage
+        working-directory: extension
         run: npx vitest run --coverage
 
       - name: Generate Extension Coverage Badge
+        working-directory: extension
         run: |
           if [ ! -f coverage/coverage-summary.json ]; then
             echo "Error: coverage/coverage-summary.json not found"
@@ -140,6 +140,7 @@ jobs:
           EOF
 
       - name: Verify Extension badges exist
+        working-directory: extension
         run: |
           echo "Checking badge files..."
           ls -la .badges/
@@ -150,9 +151,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: badges-extension
-          path: extension/.badges/
+          path: extension/.badges
           if-no-files-found: error
-          
+
       - name: Upload Extension coverage report
         if: always()
         uses: actions/upload-artifact@v4
