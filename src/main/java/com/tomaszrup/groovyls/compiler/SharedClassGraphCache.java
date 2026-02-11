@@ -19,6 +19,7 @@
 ////////////////////////////////////////////////////////////////////////////////
 package com.tomaszrup.groovyls.compiler;
 
+import java.io.File;
 import java.io.IOException;
 import java.lang.ref.SoftReference;
 import java.net.URL;
@@ -33,9 +34,11 @@ import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 import groovy.lang.GroovyClassLoader;
@@ -87,14 +90,14 @@ public class SharedClassGraphCache {
 	 * one.  This caps total ClassGraph memory at roughly
 	 * {@code MAX_HELD_SCANS × 200 MB}.
 	 */
-	private static final int MAX_HELD_SCANS = 3;
+	private static final int MAX_HELD_SCANS = 6;
 
 	/**
 	 * Version prefix for the disk cache key. Bump this whenever the ClassGraph
 	 * scan configuration changes (e.g. adding/removing rejectPackages filters)
 	 * so that stale cached results are naturally orphaned.
 	 */
-	private static final String CACHE_KEY_VERSION = "v3";
+	private static final String CACHE_KEY_VERSION = "v4";
 
 	/**
 	 * Internal JDK implementation packages that are <b>always</b> rejected from
@@ -102,6 +105,7 @@ public class SharedClassGraphCache {
 	 * code completion. Not configurable.
 	 */
 	private static final String[] BASE_REJECTED_PACKAGES = {
+		// --- JDK internal implementation packages (never useful) ---
 		"sun.",
 		"jdk.",
 		"com.sun.proxy",
@@ -117,7 +121,19 @@ public class SharedClassGraphCache {
 		"com.sun.corba",
 		"com.sun.jmx",
 		"com.sun.awt",
-		"com.sun.swing"
+		"com.sun.swing",
+		// Additional com.sun.* internal packages (not useful in Spring Boot / Java projects)
+		"com.sun.jndi",      // JNDI SPI internals
+		"com.sun.security",   // security SPI internals
+		"com.sun.nio",        // NIO SPI internals
+		"com.sun.net",        // internal net (httpserver is in com.sun.net.httpserver — rare)
+		"com.sun.tools",      // JDK tools
+		// --- Groovy's shaded internal dependencies (never useful in user code) ---
+		"groovyjarjarantlr4",
+		"groovyjarjarantlr",
+		"groovyjarjarasm",
+		"groovyjarjarpicocli",
+		"groovyjarjarcommonscli"
 	};
 
 	/**
@@ -202,14 +218,53 @@ public class SharedClassGraphCache {
 	 * count.  When the soft reference is cleared, the entry is transparently
 	 * reloaded from the on-disk cache or re-scanned.
 	 */
+	/**
+	 * Result of {@link #acquire}: the shared scan result plus the set of
+	 * classpath files that belong to the acquiring scope.  When the scan
+	 * result is a superset (shared across scopes with overlapping
+	 * classpaths), consumers can use {@link #ownClasspathFiles} to filter
+	 * {@code ScanResult.getAllClasses()} down to only the classes that
+	 * are actually on the scope's classpath.
+	 */
+	public static final class AcquireResult {
+		private final ScanResult scanResult;
+		private final Set<File> ownClasspathFiles;
+		private final boolean shared;
+
+		AcquireResult(ScanResult scanResult, Set<File> ownClasspathFiles, boolean shared) {
+			this.scanResult = scanResult;
+			this.ownClasspathFiles = ownClasspathFiles;
+			this.shared = shared;
+		}
+
+		/** The ClassGraph scan result (may be a superset of this scope's classpath). */
+		public ScanResult getScanResult() { return scanResult; }
+
+		/**
+		 * The set of classpath files (JARs / directories) that belong to the
+		 * acquiring scope.  {@code null} when the scan result is an exact match
+		 * (no filtering needed).
+		 */
+		public Set<File> getOwnClasspathFiles() { return ownClasspathFiles; }
+
+		/**
+		 * Whether this scan result is shared as a superset across multiple
+		 * scopes with overlapping (but not identical) classpaths.
+		 */
+		public boolean isShared() { return shared; }
+	}
+
 	static final class CacheEntry {
 		volatile SoftReference<ScanResult> scanResultRef;
 		final String classpathKey;
+		/** The sorted set of classpath URL strings for this entry. */
+		final Set<String> classpathUrls;
 		int refCount;
 
-		CacheEntry(ScanResult scanResult, String classpathKey) {
+		CacheEntry(ScanResult scanResult, String classpathKey, Set<String> classpathUrls) {
 			this.scanResultRef = new SoftReference<>(scanResult);
 			this.classpathKey = classpathKey;
+			this.classpathUrls = classpathUrls;
 			this.refCount = 1;
 		}
 
@@ -244,16 +299,57 @@ public class SharedClassGraphCache {
 	}
 
 	/**
-	 * Acquire a {@link ScanResult} for the given classloader. If a cached
-	 * result already exists for the same classpath, the ref count is
-	 * incremented and the existing result is returned. Otherwise, checks
-	 * the on-disk cache and falls back to a new ClassGraph scan.
+	 * Minimum overlap ratio between the requested classpath URLs and a cached
+	 * entry's URLs for the cached entry to be reused.  A value of 0.75 means
+	 * at least 75% of the requested URLs must appear in the cached entry.
+	 *
+	 * <p>In typical multi-module builds, parent and sub-module classpaths
+	 * overlap by ~80–85% (differing only in the module's own output directory
+	 * and 1–2 unique dependencies).  The per-scope filter ensures only classes
+	 * from the scope's actual classpath appear in completions.</p>
+	 */
+	private static final double SUPERSET_OVERLAP_THRESHOLD = 0.75;
+
+	/**
+	 * Acquire a {@link ScanResult} for the given classloader.  Delegates to
+	 * {@link #acquireWithResult(GroovyClassLoader)} and returns just the
+	 * {@code ScanResult} for backward compatibility.
 	 *
 	 * @param classLoader the classloader whose classpath should be scanned
 	 * @return the scan result, or {@code null} if scanning failed
 	 */
 	public synchronized ScanResult acquire(GroovyClassLoader classLoader) {
+		AcquireResult ar = acquireWithResult(classLoader);
+		return ar != null ? ar.getScanResult() : null;
+	}
+
+	/**
+	 * Acquire a {@link ScanResult} for the given classloader, returning an
+	 * {@link AcquireResult} that also carries the scope's own classpath
+	 * files — needed for per-scope filtering when the scan result is a
+	 * shared superset.
+	 *
+	 * <p><b>Similarity-based sharing:</b> if no exact cache hit is found,
+	 * this method checks whether any existing cached entry's classpath is
+	 * a <em>superset</em> of (or overlaps by &ge;{@value #SUPERSET_OVERLAP_THRESHOLD})
+	 * the requested classpath.  If so, the existing entry is reused and
+	 * marked as shared.  Consumers should then filter
+	 * {@code ScanResult.getAllClasses()} using
+	 * {@link AcquireResult#getOwnClasspathFiles}.</p>
+	 *
+	 * @param classLoader the classloader whose classpath should be scanned
+	 * @return the acquire result, or {@code null} if scanning failed
+	 */
+	public synchronized AcquireResult acquireWithResult(GroovyClassLoader classLoader) {
 		String key = computeClasspathKey(classLoader);
+		Set<String> requestedUrls = extractUrlSet(classLoader);
+
+		logger.info("SharedClassGraphCache acquireWithResult: {} URLs from classloader, "
+				+ "cache has {} entries, key={}…",
+				requestedUrls.size(), cache.size(),
+				key.substring(0, Math.min(12, key.length())));
+
+		// --- Exact cache hit ---
 		CacheEntry entry = cache.get(key);
 		if (entry != null) {
 			ScanResult existing = entry.get();
@@ -261,7 +357,7 @@ public class SharedClassGraphCache {
 				entry.refCount++;
 				logger.debug("SharedClassGraphCache HIT for key {}… (refCount={}), cache size={}",
 						key.substring(0, Math.min(12, key.length())), entry.refCount, cache.size());
-				return existing;
+				return new AcquireResult(existing, null, false);
 			}
 			// SoftReference was cleared by GC — reload from disk or rescan
 			logger.info("SharedClassGraphCache: SoftReference cleared for key {}… — reloading",
@@ -274,7 +370,7 @@ public class SharedClassGraphCache {
 				reverseIndex.put(reloaded, key);
 				logger.info("SharedClassGraphCache: reloaded from disk for key {}…",
 						key.substring(0, Math.min(12, key.length())));
-				return reloaded;
+				return new AcquireResult(reloaded, null, false);
 			}
 			// Disk cache also missing — need full rescan
 			cache.remove(key);
@@ -282,20 +378,26 @@ public class SharedClassGraphCache {
 					key.substring(0, Math.min(12, key.length())));
 		}
 
-		// Try loading from disk cache
+		// --- Similarity-based sharing: check existing entries ---
+		AcquireResult supersetHit = findSupersetEntry(requestedUrls, classLoader);
+		if (supersetHit != null) {
+			return supersetHit;
+		}
+
+		// --- Try loading from disk cache ---
 		long loadStart = System.currentTimeMillis();
 		ScanResult scanResult = loadFromDisk(key);
 		if (scanResult != null) {
 			long loadElapsed = System.currentTimeMillis() - loadStart;
 			logger.info("SharedClassGraphCache DISK HIT for key {}… ({}ms)",
 					key.substring(0, Math.min(12, key.length())), loadElapsed);
-			entry = new CacheEntry(scanResult, key);
+			entry = new CacheEntry(scanResult, key, requestedUrls);
 			cache.put(key, entry);
 			reverseIndex.put(scanResult, key);
-			return scanResult;
+			return new AcquireResult(scanResult, null, false);
 		}
 
-		// Cache miss — perform scan
+		// --- Cache miss — perform full scan ---
 		logger.debug("SharedClassGraphCache MISS for key {}… — scanning classpath ({} URLs)",
 				key.substring(0, Math.min(12, key.length())), classLoader.getURLs().length);
 
@@ -315,7 +417,7 @@ public class SharedClassGraphCache {
 			long scanElapsed = System.currentTimeMillis() - scanStart;
 			logger.info("ClassGraph scan completed in {}ms ({} URLs)",
 					scanElapsed, classLoader.getURLs().length);
-			entry = new CacheEntry(scanResult, key);
+			entry = new CacheEntry(scanResult, key, requestedUrls);
 			cache.put(key, entry);
 			reverseIndex.put(scanResult, key);
 			logger.debug("SharedClassGraphCache stored new entry, cache size={}", cache.size());
@@ -323,7 +425,7 @@ public class SharedClassGraphCache {
 			// Persist to disk for future server starts
 			saveToDisk(key, scanResult);
 
-			return scanResult;
+			return new AcquireResult(scanResult, null, false);
 		} catch (ClassGraphException e) {
 			logger.warn("ClassGraph scan failed: {}", e.getMessage());
 			return null;
@@ -334,6 +436,112 @@ public class SharedClassGraphCache {
 			try { System.gc(); } catch (Throwable ignored) { }
 			return null;
 		}
+	}
+
+	/**
+	 * Check cached entries for one whose classpath sufficiently overlaps with
+	 * the requested URLs.  Returns an {@link AcquireResult} with the shared
+	 * entry if found, or {@code null}.
+	 *
+	 * <p>When the best overlap is at or above the threshold, the cached entry
+	 * is reused directly — even if it is not a strict superset.  Classes from
+	 * the requesting scope's unique JARs that are <em>not</em> in the cached
+	 * scan will simply be absent from completions; in practice these are
+	 * almost always the module's own compiled output (already available
+	 * through the AST) or minor test-only dependencies.</p>
+	 *
+	 * <p><b>Must be called while holding the synchronized lock.</b></p>
+	 */
+	private AcquireResult findSupersetEntry(Set<String> requestedUrls, GroovyClassLoader classLoader) {
+		if (requestedUrls.isEmpty()) {
+			return null;
+		}
+
+		CacheEntry bestCandidate = null;
+		double bestOverlap = 0;
+		int bestMatchCount = 0;
+
+		for (CacheEntry candidate : cache.values()) {
+			ScanResult sr = candidate.get();
+			if (sr == null) continue;
+			Set<String> cachedUrls = candidate.classpathUrls;
+			if (cachedUrls == null || cachedUrls.isEmpty()) continue;
+
+			int matchCount = 0;
+			for (String url : requestedUrls) {
+				if (cachedUrls.contains(url)) matchCount++;
+			}
+			double overlap = (double) matchCount / requestedUrls.size();
+
+			logger.info("SharedClassGraphCache overlap check: {}/{} = {}% "
+					+ "(cached={} URLs [key={}…], requested={} URLs)",
+					matchCount, requestedUrls.size(), (int) (overlap * 100),
+					cachedUrls.size(),
+					candidate.classpathKey.substring(0, Math.min(8, candidate.classpathKey.length())),
+					requestedUrls.size());
+
+			if (overlap >= SUPERSET_OVERLAP_THRESHOLD && overlap > bestOverlap) {
+				bestCandidate = candidate;
+				bestOverlap = overlap;
+				bestMatchCount = matchCount;
+			}
+		}
+
+		if (bestCandidate == null) {
+			if (!cache.isEmpty()) {
+				logger.info("SharedClassGraphCache: no overlap candidate above {}% threshold",
+						(int) (SUPERSET_OVERLAP_THRESHOLD * 100));
+			}
+			return null;
+		}
+
+		// Reuse the best candidate directly (strict superset or high overlap)
+		bestCandidate.refCount++;
+		Set<File> ownFiles = urlStringsToFiles(requestedUrls);
+		int missingUrls = requestedUrls.size() - bestMatchCount;
+		logger.info("SharedClassGraphCache OVERLAP HIT: reusing cached entry "
+				+ "(overlap={}/{} = {}%, cached={} URLs, requested={} URLs, "
+				+ "missing={} URLs, refCount={})",
+				bestMatchCount, requestedUrls.size(), (int) (bestOverlap * 100),
+				bestCandidate.classpathUrls.size(), requestedUrls.size(),
+				missingUrls, bestCandidate.refCount);
+		return new AcquireResult(bestCandidate.get(), ownFiles, true);
+	}
+
+	/**
+	 * Extract a sorted set of URL external-form strings from classloader.
+	 */
+	static Set<String> extractUrlSet(GroovyClassLoader classLoader) {
+		URL[] urls = classLoader.getURLs();
+		Set<String> urlSet = new HashSet<>(urls.length * 2);
+		for (URL url : urls) {
+			urlSet.add(url.toExternalForm());
+		}
+		return Collections.unmodifiableSet(urlSet);
+	}
+
+	/**
+	 * Convert URL strings to canonical {@link File} objects for comparison
+	 * with {@link ClassInfo#getClasspathElementFile()}.
+	 */
+	private static Set<File> urlStringsToFiles(Set<String> urlStrings) {
+		Set<File> files = new HashSet<>(urlStrings.size() * 2);
+		for (String url : urlStrings) {
+			try {
+				java.net.URI uri = new java.net.URI(url);
+				File f = new File(uri);
+				files.add(f.getCanonicalFile());
+			} catch (Exception e) {
+				// Skip URLs that can't be converted to files (e.g. jrt:/)
+				try {
+					// Try as a plain path
+					files.add(new File(url).getCanonicalFile());
+				} catch (Exception ignored) {
+					// Skip entirely
+				}
+			}
+		}
+		return Collections.unmodifiableSet(files);
 	}
 
 	/**

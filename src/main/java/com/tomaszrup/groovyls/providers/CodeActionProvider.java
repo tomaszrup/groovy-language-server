@@ -37,13 +37,57 @@ public class CodeActionProvider {
 
 	private ASTNodeVisitor ast;
 	private ScanResult classGraphScanResult;
+	/**
+	 * When non-null, the scan result is a shared superset and should be
+	 * filtered to only include classes from these classpath files.
+	 */
+	private java.util.Set<java.io.File> classGraphClasspathFiles;
 	private FileContentsTracker fileContentsTracker;
 
 	public CodeActionProvider(ASTNodeVisitor ast, ScanResult classGraphScanResult,
 			FileContentsTracker fileContentsTracker) {
+		this(ast, classGraphScanResult, null, fileContentsTracker);
+	}
+
+	public CodeActionProvider(ASTNodeVisitor ast, ScanResult classGraphScanResult,
+			java.util.Set<java.io.File> classGraphClasspathFiles,
+			FileContentsTracker fileContentsTracker) {
 		this.ast = ast;
 		this.classGraphScanResult = classGraphScanResult;
+		this.classGraphClasspathFiles = classGraphClasspathFiles;
 		this.fileContentsTracker = fileContentsTracker;
+	}
+
+	/**
+	 * Returns classes from the scan result, filtered by the scope's
+	 * classpath files if this is a shared superset scan.
+	 */
+	private List<ClassInfo> getFilteredClasses() {
+		if (classGraphScanResult == null) {
+			return Collections.emptyList();
+		}
+		List<ClassInfo> all = classGraphScanResult.getAllClasses();
+		if (classGraphClasspathFiles == null) {
+			return all;
+		}
+		List<ClassInfo> filtered = new ArrayList<>(all.size());
+		for (ClassInfo ci : all) {
+			java.io.File cpElem = ci.getClasspathElementFile();
+			if (cpElem == null) {
+				filtered.add(ci); // JDK module class
+			} else {
+				try {
+					if (classGraphClasspathFiles.contains(cpElem.getCanonicalFile())) {
+						filtered.add(ci);
+					}
+				} catch (java.io.IOException e) {
+					if (classGraphClasspathFiles.contains(cpElem)) {
+						filtered.add(ci);
+					}
+				}
+			}
+		}
+		return filtered;
 	}
 
 	public CompletableFuture<List<Either<Command, CodeAction>>> provideCodeActions(CodeActionParams params) {
@@ -133,7 +177,7 @@ public class CodeActionProvider {
 
 		// Search in classpath via ClassGraph
 		if (classGraphScanResult != null) {
-			List<ClassInfo> allClasses = classGraphScanResult.getAllClasses();
+			List<ClassInfo> allClasses = getFilteredClasses();
 			for (ClassInfo classInfo : allClasses) {
 				if (classInfo.getSimpleName().equals(unresolvedClassName)) {
 					String fullyQualifiedName = classInfo.getName();

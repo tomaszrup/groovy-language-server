@@ -75,12 +75,52 @@ import com.tomaszrup.groovyls.util.GroovyNodeToStringUtils;
 public class CompletionProvider {
 	private ASTNodeVisitor ast;
 	private ScanResult classGraphScanResult;
+	/**
+	 * When non-null, the scan result is a shared superset and should be
+	 * filtered to only include classes from these classpath files (JARs/dirs).
+	 * JDK module classes ({@code getClasspathElementFile() == null}) are
+	 * always included.
+	 */
+	private java.util.Set<java.io.File> classGraphClasspathFiles;
 	private int maxItemCount = 1000;
 	private boolean isIncomplete = false;
 
 	public CompletionProvider(ASTNodeVisitor ast, ScanResult classGraphScanResult) {
+		this(ast, classGraphScanResult, null);
+	}
+
+	public CompletionProvider(ASTNodeVisitor ast, ScanResult classGraphScanResult,
+			java.util.Set<java.io.File> classGraphClasspathFiles) {
 		this.ast = ast;
 		this.classGraphScanResult = classGraphScanResult;
+		this.classGraphClasspathFiles = classGraphClasspathFiles;
+	}
+
+	/**
+	 * Returns the list of all classes from the scan result, filtered by
+	 * the scope's classpath files if this is a shared superset scan.
+	 */
+	private List<ClassInfo> getFilteredClasses() {
+		if (classGraphScanResult == null) {
+			return Collections.emptyList();
+		}
+		List<ClassInfo> all = classGraphScanResult.getAllClasses();
+		if (classGraphClasspathFiles == null) {
+			return all; // exact match, no filtering needed
+		}
+		// Shared superset: filter to only classes from this scope's JARs
+		return all.stream()
+				.filter(ci -> {
+					java.io.File cpElem = ci.getClasspathElementFile();
+					// null = JDK module class (always include)
+					if (cpElem == null) return true;
+					try {
+						return classGraphClasspathFiles.contains(cpElem.getCanonicalFile());
+					} catch (java.io.IOException e) {
+						return classGraphClasspathFiles.contains(cpElem);
+					}
+				})
+				.collect(Collectors.toList());
 	}
 
 	public CompletableFuture<Either<List<CompletionItem>, CompletionList>> provideCompletion(
@@ -196,7 +236,7 @@ public class CompletionProvider {
 		if (classGraphScanResult == null) {
 			return;
 		}
-		List<ClassInfo> classes = classGraphScanResult.getAllClasses();
+		List<ClassInfo> classes = getFilteredClasses();
 		List<PackageInfo> packages = classGraphScanResult.getPackageInfo();
 
 		List<CompletionItem> packageItems = packages.stream().filter(packageInfo -> {
@@ -471,7 +511,7 @@ public class CompletionProvider {
 		if (classGraphScanResult == null) {
 			return;
 		}
-		List<ClassInfo> classes = classGraphScanResult.getAllClasses();
+		List<ClassInfo> classes = getFilteredClasses();
 
 		List<CompletionItem> classItems = classes.stream().filter(classInfo -> {
 			if (isIncomplete) {

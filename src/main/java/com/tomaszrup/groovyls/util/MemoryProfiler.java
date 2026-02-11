@@ -197,7 +197,9 @@ public final class MemoryProfiler {
 				ScopeProfile p = profiles.get(i);
 				String projectName = p.scope.getProjectRoot() != null
 						? p.scope.getProjectRoot().toString() : "<default>";
-				sb.append(String.format("  %d. %s (%.1f MB)%n", i + 1, projectName, p.totalMB));
+				boolean isSharedScan = p.scope.getClassGraphClasspathFiles() != null;
+				String sharedSuffix = isSharedScan ? " [shared scan]" : "";
+				sb.append(String.format("  %d. %s (%.1f MB)%s%n", i + 1, projectName, p.totalMB, sharedSuffix));
 
 				// Top 3 components for this project
 				List<Map.Entry<String, Double>> sorted = new ArrayList<>(p.breakdown.entrySet());

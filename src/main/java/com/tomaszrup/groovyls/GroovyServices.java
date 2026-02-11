@@ -659,6 +659,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		// Capture AST snapshot under write-lock, then run providers lock-free.
 		ASTNodeVisitor visitor;
 		ScanResult scanResult;
+		java.util.Set<java.io.File> classGraphClasspathFiles;
 		scope.getLock().writeLock().lock();
 		try {
 			compilationService.ensureScopeCompiled(scope);
@@ -682,6 +683,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			visitor = scope.getAstVisitor();
 			// Lazily trigger ClassGraph scan on first completion request
 			scanResult = scope.ensureClassGraphScannedUnsafe();
+			classGraphClasspathFiles = scope.getClassGraphClasspathFiles();
 
 			if (originalSource != null) {
 				compilationService.restoreDocumentSource(scope, uri, originalSource);
@@ -691,7 +693,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		}
 
 		// Provider logic runs lock-free on the captured AST snapshot
-		CompletionProvider provider = new CompletionProvider(visitor, scanResult);
+		CompletionProvider provider = new CompletionProvider(visitor, scanResult, classGraphClasspathFiles);
 		CompletableFuture<Either<List<CompletionItem>, CompletionList>> result =
 				provider.provideCompletion(params.getTextDocument(), params.getPosition(),
 						params.getContext());
@@ -926,11 +928,12 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
 		// Lazily trigger ClassGraph scan on first code action request
 		ScanResult scanResult = scope != null ? scope.ensureClassGraphScanned() : null;
+		java.util.Set<java.io.File> classGraphClasspathFiles = scope != null ? scope.getClassGraphClasspathFiles() : null;
 		if (visitor == null) {
 			return CompletableFuture.completedFuture(Collections.emptyList());
 		}
 
-		CodeActionProvider provider = new CodeActionProvider(visitor, scanResult, fileContentsTracker);
+		CodeActionProvider provider = new CodeActionProvider(visitor, scanResult, classGraphClasspathFiles, fileContentsTracker);
 		CompletableFuture<List<Either<Command, CodeAction>>> result = provider.provideCodeActions(params);
 
 		SpockCodeActionProvider spockProvider = new SpockCodeActionProvider(visitor);

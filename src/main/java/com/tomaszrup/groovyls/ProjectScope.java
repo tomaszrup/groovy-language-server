@@ -20,10 +20,12 @@
 ////////////////////////////////////////////////////////////////////////////////
 package com.tomaszrup.groovyls;
 
+import java.io.File;
 import java.net.URI;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -67,6 +69,19 @@ public class ProjectScope {
 
 	/** Published via volatile write when the classloader changes. */
 	private volatile ScanResult classGraphScanResult;
+
+	/**
+	 * When the {@link #classGraphScanResult} is a shared superset (obtained
+	 * via similarity-based sharing), this holds the set of classpath files
+	 * (JARs/directories) that actually belong to this scope. Consumers
+	 * should filter {@code getAllClasses()} to only include classes whose
+	 * {@code ClassInfo.getClasspathElementFile()} is in this set (or is
+	 * {@code null}, meaning a JDK module class).
+	 *
+	 * <p>{@code null} when the scan result is an exact match for this
+	 * scope's classpath (no filtering needed).</p>
+	 */
+	private volatile Set<File> classGraphClasspathFiles;
 
 	private GroovyClassLoader classLoader;
 	private volatile URI previousContext;
@@ -182,6 +197,15 @@ public class ProjectScope {
 
 	public void setClassGraphScanResult(ScanResult classGraphScanResult) {
 		this.classGraphScanResult = classGraphScanResult;
+		this.classGraphClasspathFiles = null; // clear filter when result changes externally
+	}
+
+	/**
+	 * Returns the set of classpath files for per-scope filtering, or
+	 * {@code null} if the scan result is an exact match (no filtering needed).
+	 */
+	public Set<File> getClassGraphClasspathFiles() {
+		return classGraphClasspathFiles;
 	}
 
 	public GroovyClassLoader getClassLoader() {
@@ -297,7 +321,15 @@ public class ProjectScope {
 		try {
 			com.tomaszrup.groovyls.compiler.SharedClassGraphCache sharedCache =
 					com.tomaszrup.groovyls.compiler.SharedClassGraphCache.getInstance();
-			classGraphScanResult = sharedCache.acquire(cl);
+			com.tomaszrup.groovyls.compiler.SharedClassGraphCache.AcquireResult ar =
+					sharedCache.acquireWithResult(cl);
+			if (ar != null) {
+				classGraphScanResult = ar.getScanResult();
+				classGraphClasspathFiles = ar.getOwnClasspathFiles(); // null when exact match
+			} else {
+				classGraphScanResult = null;
+				classGraphClasspathFiles = null;
+			}
 		} catch (VirtualMachineError e) {
 			// ClassGraph scan OOM — log and return null. Completion/code
 			// actions will degrade (no classpath type suggestions) but
@@ -307,6 +339,7 @@ public class ProjectScope {
 							+ "will be unavailable for {}", e.getClass().getSimpleName(),
 							e.getMessage(), projectRoot);
 			classGraphScanResult = null;
+			classGraphClasspathFiles = null;
 		}
 		return classGraphScanResult;
 	}
@@ -353,6 +386,7 @@ public class ProjectScope {
 		if (sr != null) {
 			com.tomaszrup.groovyls.compiler.SharedClassGraphCache.getInstance().release(sr);
 			classGraphScanResult = null;
+			classGraphClasspathFiles = null;
 		}
 
 		// Close classloader
@@ -409,6 +443,7 @@ public class ProjectScope {
 		if (sr != null) {
 			com.tomaszrup.groovyls.compiler.SharedClassGraphCache.getInstance().release(sr);
 			classGraphScanResult = null;
+			classGraphClasspathFiles = null;
 		}
 
 		// Dispose source locator (releases shared source-JAR index)
