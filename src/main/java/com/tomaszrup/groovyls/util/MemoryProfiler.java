@@ -26,6 +26,7 @@ import com.tomaszrup.groovyls.compiler.ast.ASTNodeVisitor;
 import com.tomaszrup.groovyls.compiler.control.GroovyLSCompilationUnit;
 import com.tomaszrup.groovyls.config.CompilationUnitFactory;
 import com.tomaszrup.groovyls.config.ICompilationUnitFactory;
+import io.github.classgraph.ClassInfo;
 import io.github.classgraph.ScanResult;
 import org.codehaus.groovy.control.SourceUnit;
 import org.slf4j.Logger;
@@ -35,6 +36,7 @@ import groovy.lang.GroovyClassLoader;
 
 import java.net.URI;
 import java.util.*;
+import java.util.stream.Collectors;
 
 /**
  * Opt-in memory profiler that estimates per-project RAM usage and reports
@@ -211,6 +213,25 @@ public final class MemoryProfiler {
 					sb.append(String.format("%s: %.1f MB", entry.getKey(), entry.getValue()));
 				}
 				sb.append('\n');
+
+				// Per-package breakdown of ScanResult memory
+				Double srSize = p.breakdown.get("ClassGraph ScanResult");
+				if (srSize != null && srSize > 0.0) {
+					List<PackageMemoryEntry> pkgEntries = estimateScanResultByPackage(p.scope);
+					if (!pkgEntries.isEmpty()) {
+						int pkgLimit = Math.min(5, pkgEntries.size());
+						sb.append("       Top packages: ");
+						for (int j = 0; j < pkgLimit; j++) {
+							if (j > 0) {
+								sb.append(" | ");
+							}
+							PackageMemoryEntry pe = pkgEntries.get(j);
+							sb.append(String.format("%s %.1f MB (%d classes)",
+									pe.packagePrefix, pe.estimatedMB, pe.classCount));
+						}
+						sb.append('\n');
+					}
+				}
 			}
 
 			double scopeTotalMB = profiles.stream().mapToDouble(p -> p.totalMB).sum();
@@ -226,6 +247,21 @@ public final class MemoryProfiler {
 			double classGraphMB = classGraphBytes / (1024.0 * 1024.0);
 			sb.append(String.format("  SharedClassGraphCache: %.1f MB (%d entries, %d refs)%n",
 					classGraphMB, classGraphCache.getEntryCount(), classGraphCache.getTotalRefCount()));
+
+			// Per-package breakdown across all cached ScanResults
+			List<PackageMemoryEntry> globalPkgs = classGraphCache.getTopPackagesByMemory(5);
+			if (!globalPkgs.isEmpty()) {
+				sb.append("    Top packages: ");
+				for (int i = 0; i < globalPkgs.size(); i++) {
+					if (i > 0) {
+						sb.append(" | ");
+					}
+					PackageMemoryEntry pe = globalPkgs.get(i);
+					sb.append(String.format("%s %.1f MB (%d classes)",
+							pe.packagePrefix, pe.estimatedMB, pe.classCount));
+				}
+				sb.append('\n');
+			}
 
 			// SharedSourceJarIndex
 			SharedSourceJarIndex sourceJarIndex = SharedSourceJarIndex.getInstance();
@@ -459,7 +495,107 @@ public final class MemoryProfiler {
 		return bytes / (1024.0 * 1024.0);
 	}
 
-	// ---- Internal data holder ----
+	// ---- Per-package memory estimation ----
+
+	/**
+	 * Truncates a fully-qualified package name to the first {@code depth}
+	 * segments and appends ".*".
+	 * <p>Examples (depth=2):</p>
+	 * <ul>
+	 *   <li>{@code java.util.concurrent.locks} → {@code java.util.*}</li>
+	 *   <li>{@code com.google} → {@code com.google.*}</li>
+	 *   <li>{@code java} → {@code java.*}</li>
+	 *   <li>{@code ""} (default package) → {@code (default)}</li>
+	 * </ul>
+	 */
+	public static String truncatePackage(String packageName, int depth) {
+		if (packageName == null || packageName.isEmpty()) {
+			return "(default)";
+		}
+		int segmentsFound = 0;
+		int endIdx = -1;
+		for (int i = 0; i < packageName.length(); i++) {
+			if (packageName.charAt(i) == '.') {
+				segmentsFound++;
+				if (segmentsFound == depth) {
+					endIdx = i;
+					break;
+				}
+			}
+		}
+		if (endIdx > 0) {
+			return packageName.substring(0, endIdx) + ".*";
+		}
+		// Fewer segments than depth — return as-is with wildcard
+		return packageName + ".*";
+	}
+
+	/**
+	 * Estimates ScanResult memory broken down by top-level package prefix
+	 * (2-segment depth, e.g. {@code java.util.*}, {@code org.apache.*}).
+	 * Returns entries sorted descending by estimated MB.
+	 *
+	 * @param scope the project scope to analyze
+	 * @return sorted list of per-package memory entries, or empty if unavailable
+	 */
+	public static List<PackageMemoryEntry> estimateScanResultByPackage(ProjectScope scope) {
+		ScanResult sr = scope.getClassGraphScanResult();
+		if (sr == null) {
+			return Collections.emptyList();
+		}
+		try {
+			return groupClassesByPackage(sr, 2);
+		} catch (Exception e) {
+			// ScanResult may be closed
+			return Collections.emptyList();
+		}
+	}
+
+	/**
+	 * Groups all classes in a ScanResult by truncated package prefix and
+	 * returns per-group memory estimates sorted descending.
+	 *
+	 * @param sr    the scan result to analyze
+	 * @param depth the package depth to truncate to (e.g. 2)
+	 * @return sorted list of per-package memory entries
+	 */
+	static List<PackageMemoryEntry> groupClassesByPackage(ScanResult sr, int depth) {
+		Map<String, Integer> countsMap = new LinkedHashMap<>();
+		for (ClassInfo ci : sr.getAllClasses()) {
+			String prefix = truncatePackage(ci.getPackageName(), depth);
+			countsMap.merge(prefix, 1, Integer::sum);
+		}
+
+		List<PackageMemoryEntry> entries = new ArrayList<>(countsMap.size());
+		for (Map.Entry<String, Integer> e : countsMap.entrySet()) {
+			int count = e.getValue();
+			double mb = (count * BYTES_PER_CLASSINFO) / (1024.0 * 1024.0);
+			entries.add(new PackageMemoryEntry(e.getKey(), mb, count));
+		}
+
+		entries.sort((a, b) -> Double.compare(b.estimatedMB, a.estimatedMB));
+		return entries;
+	}
+
+	// ---- Internal data holders ----
+
+	/**
+	 * Holds per-package memory estimation data.
+	 */
+	public static final class PackageMemoryEntry {
+		/** Package prefix with wildcard, e.g. {@code java.util.*}. */
+		public final String packagePrefix;
+		/** Estimated memory in MB consumed by classes in this package. */
+		public final double estimatedMB;
+		/** Number of classes in this package prefix. */
+		public final int classCount;
+
+		public PackageMemoryEntry(String packagePrefix, double estimatedMB, int classCount) {
+			this.packagePrefix = packagePrefix;
+			this.estimatedMB = estimatedMB;
+			this.classCount = classCount;
+		}
+	}
 
 	private static final class ScopeProfile {
 		final ProjectScope scope;

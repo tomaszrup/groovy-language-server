@@ -69,27 +69,6 @@ Built-in support for the [Spock](https://spockframework.org/) testing framework:
 
 Spock support activates automatically when a class extends `spock.lang.Specification` (resolved via the superclass chain or unresolved name).
 
-### Incremental & Staged Compilation
-
-The server uses several strategies to minimise compilation latency:
-
-- **Incremental compilation** — when ≤ 3 files change at once, only the changed files and their transitive dependencies (capped at depth 2, max 50 files) are recompiled. Class signatures are compared before and after: if the public API hasn't changed, dependent files are not recompiled; otherwise the server falls back to a full compile.
-- **Staged (two-phase) compilation** — when a file is opened in a not-yet-compiled project:
-  - **Phase A** compiles only the trigger file, publishing diagnostics immediately for fast feedback.
-  - **Phase B** schedules a full project compilation in the background and replaces the partial AST when done.
-- **Last-known-good AST preservation** — if a file has syntax errors and its new AST is significantly degraded (less than half the nodes of the previous AST), the previous AST data is preserved so semantic tokens and navigation continue working.
-
-### Memory Management
-
-The server includes automatic memory management designed for large multi-project workspaces:
-
-- **Automatic heap sizing** — when `groovy.java.vmargs` is unset, the extension estimates an appropriate JVM heap (512 MB – 4 GB) based on the number of discovered projects. G1GC and `HeapDumpOnOutOfMemoryError` are enabled by default.
-- **Scope eviction** — inactive project scopes have their heavy state (AST, classloader, compilation unit) evicted after a configurable TTL (default 300 s). Evicted scopes are transparently reactivated on next access. Scopes with open files are never evicted.
-- **Memory-pressure eviction** — when heap usage exceeds the configurable pressure threshold (default 75 %), the least-recently-used inactive scope is evicted immediately, and reference indexes are shed to free memory.
-- **OOM handling** — if a `VirtualMachineError` occurs during compilation, the scope is marked as failed (preventing retry loops), a synthetic diagnostic is published on the build file, and a user-visible notification suggests increasing `-Xmx` via the `groovy.java.vmargs` setting.
-- **Memory profiler** — opt-in via `-Dgroovyls.debug.memoryProfile=true` in `groovy.java.vmargs`. Logs per-project RAM estimates and a JVM heap breakdown.
-- **Status bar indicator** — enable `groovy.showMemoryUsage` to display live JVM heap usage next to "Groovy" in the VS Code status bar.
-
 ### Build Tool Integration
 
 Automatic classpath resolution for both **Gradle** and **Maven** projects:

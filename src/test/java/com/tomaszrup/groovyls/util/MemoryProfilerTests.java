@@ -234,6 +234,72 @@ class MemoryProfilerTests {
 		Assertions.assertNotNull((Object) enabled);
 	}
 
+	// --- truncatePackage ---
+
+	@Test
+	void testTruncatePackageWithDepth2() {
+		Assertions.assertEquals("java.util.*",
+				MemoryProfiler.truncatePackage("java.util.concurrent.locks", 2));
+		Assertions.assertEquals("java.util.*",
+				MemoryProfiler.truncatePackage("java.util.concurrent", 2));
+		Assertions.assertEquals("java.util.*",
+				MemoryProfiler.truncatePackage("java.util", 2));
+		Assertions.assertEquals("org.apache.*",
+				MemoryProfiler.truncatePackage("org.apache.commons.lang3", 2));
+		Assertions.assertEquals("com.google.*",
+				MemoryProfiler.truncatePackage("com.google.common.collect", 2));
+	}
+
+	@Test
+	void testTruncatePackageSingleSegment() {
+		// Fewer segments than depth — returns as-is with wildcard
+		Assertions.assertEquals("java.*",
+				MemoryProfiler.truncatePackage("java", 2));
+		Assertions.assertEquals("groovy.*",
+				MemoryProfiler.truncatePackage("groovy", 2));
+	}
+
+	@Test
+	void testTruncatePackageEmptyOrNull() {
+		Assertions.assertEquals("(default)",
+				MemoryProfiler.truncatePackage("", 2));
+		Assertions.assertEquals("(default)",
+				MemoryProfiler.truncatePackage(null, 2));
+	}
+
+	@Test
+	void testTruncatePackageExactlyDepthSegments() {
+		// Exactly 2 segments — should get wildcard suffix
+		Assertions.assertEquals("com.example.*",
+				MemoryProfiler.truncatePackage("com.example", 2));
+	}
+
+	// --- PackageMemoryEntry ---
+
+	@Test
+	void testPackageMemoryEntryHoldsValues() {
+		MemoryProfiler.PackageMemoryEntry entry =
+				new MemoryProfiler.PackageMemoryEntry("java.util.*", 2.5, 420);
+		Assertions.assertEquals("java.util.*", entry.packagePrefix);
+		Assertions.assertEquals(2.5, entry.estimatedMB, 0.001);
+		Assertions.assertEquals(420, entry.classCount);
+	}
+
+	// --- estimateScanResultByPackage ---
+
+	@Test
+	void testEstimateScanResultByPackageWithNullScanResult() {
+		CompilationUnitFactory factory = new CompilationUnitFactory();
+		ProjectScope scope = new ProjectScope(PROJECT_A, factory);
+
+		List<MemoryProfiler.PackageMemoryEntry> result =
+				MemoryProfiler.estimateScanResultByPackage(scope);
+
+		Assertions.assertNotNull(result);
+		Assertions.assertTrue(result.isEmpty(),
+				"Should return empty list when ScanResult is null");
+	}
+
 	// --- Helpers ---
 
 	private List<String> createClasspath(int size) {

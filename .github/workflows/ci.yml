@@ -141,24 +141,48 @@ jobs:
 
       - name: Verify Extension badges exist
         run: |
-          echo "Checking badge files in working directory..."
+          echo "=== Current directory: $(pwd) ==="
+          echo "Checking badge files..."
           ls -la .badges/
-          test -f .badges/extension-coverage.json
-          echo "Badge files present in extension/.badges/"
-          
-      - name: Verify badge path from root
-        working-directory: .
+          if [ ! -f .badges/extension-coverage.json ]; then
+            echo "ERROR: Badge not found in current directory"
+            exit 1
+          fi
+          echo "=== Badge verified in current directory ==="
+          echo "Checking from workspace root..."
+          cd "$GITHUB_WORKSPACE"
+          echo "=== Workspace root: $(pwd) ==="
+          ls -la extension/.badges/ || {
+            echo "ERROR: extension/.badges/ directory not found from root"
+            exit 1
+          }
+          if [ ! -f extension/.badges/extension-coverage.json ]; then
+            echo "ERROR: Badge file not accessible from workspace root"
+            exit 1
+          fi
+          echo "SUCCESS: Badge accessible from root at extension/.badges/extension-coverage.json"
+
+      - name: Copy badges to root for upload
         run: |
-          echo "Verifying path from repository root..."
-          ls -la extension/.badges/
-          test -f extension/.badges/extension-coverage.json
-          echo "Badges accessible from root at extension/.badges/"
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p .badges-extension
+          cp -v extension/.badges/* .badges-extension/
+          ls -la .badges-extension/
+
+      - name: Final check before upload
+        shell: bash
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          echo "=== Final verification from workspace root ==="
+          echo "Current directory: $(pwd)"
+          find .badges-extension -type f 2>/dev/null || echo "No files found in .badges-extension"
+          echo "=== Ready for upload ==="
 
       - name: Upload Extension badges
         uses: actions/upload-artifact@v4
         with:
           name: badges-extension
-          path: extension/.badges/
+          path: .badges-extension/
           if-no-files-found: error
 
       - name: Upload Extension coverage report

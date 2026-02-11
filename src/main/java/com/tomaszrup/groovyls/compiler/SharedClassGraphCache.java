@@ -33,13 +33,17 @@ import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 import groovy.lang.GroovyClassLoader;
 import io.github.classgraph.ClassGraph;
 import io.github.classgraph.ClassGraphException;
+import io.github.classgraph.ClassInfo;
 import io.github.classgraph.ScanResult;
+import com.tomaszrup.groovyls.util.MemoryProfiler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -519,6 +523,46 @@ public class SharedClassGraphCache {
 	 */
 	public synchronized int getEntryCount() {
 		return cache.size();
+	}
+
+	/**
+	 * Returns the top N package prefixes (2-segment depth) by estimated memory
+	 * across all cached ScanResult instances. Aggregates classes from all
+	 * cache entries (unique ScanResults), groups by truncated package, and
+	 * sorts descending by estimated MB.
+	 *
+	 * @param limit maximum number of package entries to return
+	 * @return sorted list of per-package memory entries
+	 */
+	public synchronized List<MemoryProfiler.PackageMemoryEntry> getTopPackagesByMemory(int limit) {
+		Map<String, Integer> countsMap = new LinkedHashMap<>();
+		for (CacheEntry entry : cache.values()) {
+			ScanResult sr = entry.get();
+			if (sr != null) {
+				try {
+					for (ClassInfo ci : sr.getAllClasses()) {
+						String prefix = MemoryProfiler.truncatePackage(ci.getPackageName(), 2);
+						countsMap.merge(prefix, 1, Integer::sum);
+					}
+				} catch (Exception e) {
+					// ScanResult may have been closed
+				}
+			}
+		}
+
+		if (countsMap.isEmpty()) {
+			return Collections.emptyList();
+		}
+
+		List<MemoryProfiler.PackageMemoryEntry> entries = new ArrayList<>(countsMap.size());
+		for (Map.Entry<String, Integer> e : countsMap.entrySet()) {
+			int count = e.getValue();
+			double mb = (count * 6144L) / (1024.0 * 1024.0);
+			entries.add(new MemoryProfiler.PackageMemoryEntry(e.getKey(), mb, count));
+		}
+
+		entries.sort((a, b) -> Double.compare(b.estimatedMB, a.estimatedMB));
+		return entries.subList(0, Math.min(limit, entries.size()));
 	}
 
 	/**
