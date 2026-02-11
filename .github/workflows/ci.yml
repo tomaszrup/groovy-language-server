@@ -77,6 +77,7 @@ jobs:
           name: badges-gls
           path: .badges
           if-no-files-found: error
+          include-hidden-files: true
 
       - name: Upload GLS test results
         if: always()
@@ -164,6 +165,7 @@ jobs:
           name: badges-extension
           path: extension/.badges
           if-no-files-found: error
+          include-hidden-files: true
 
       - name: Upload Extension coverage report
         if: always()
