@@ -78,20 +78,19 @@ public class CompilationOrchestrator {
 	/**
 	 * Creates or updates the compilation unit for the given scope.
 	 *
-	 * @return {@code true} if the compilation unit is the same object as before
-	 *         (i.e. it was reused rather than recreated)
+	 * @return a {@link CompilationResult} containing the new compilation unit,
+	 *         classloader, scan result, and whether the unit was reused
 	 */
-	public boolean createOrUpdateCompilationUnit(
-			GroovyLSCompilationUnit[] compilationUnitHolder,
-			ASTNodeVisitor[] astVisitorHolder,
+	public CompilationResult createOrUpdateCompilationUnit(
+			GroovyLSCompilationUnit existingUnit,
 			Path projectRoot,
 			com.tomaszrup.groovyls.config.ICompilationUnitFactory compilationUnitFactory,
 			FileContentsTracker fileContentsTracker,
-			ScanResult[] scanResultHolder,
-			GroovyClassLoader[] classLoaderHolder) {
-		return createOrUpdateCompilationUnit(compilationUnitHolder, astVisitorHolder,
-				projectRoot, compilationUnitFactory, fileContentsTracker,
-				scanResultHolder, classLoaderHolder, Collections.emptySet());
+			ScanResult existingScanResult,
+			GroovyClassLoader existingClassLoader) {
+		return createOrUpdateCompilationUnit(existingUnit, projectRoot,
+				compilationUnitFactory, fileContentsTracker,
+				existingScanResult, existingClassLoader, Collections.emptySet());
 	}
 
 	/**
@@ -100,40 +99,36 @@ public class CompilationOrchestrator {
 	 *
 	 * @param additionalInvalidations  URIs of dependent files to force-invalidate
 	 *                                  even if their contents have not changed
-	 * @return {@code true} if the compilation unit is the same object as before
-	 *         (i.e. it was reused rather than recreated)
+	 * @return a {@link CompilationResult} containing the new compilation unit,
+	 *         classloader, scan result, and whether the unit was reused
 	 */
-	public boolean createOrUpdateCompilationUnit(
-			GroovyLSCompilationUnit[] compilationUnitHolder,
-			ASTNodeVisitor[] astVisitorHolder,
+	public CompilationResult createOrUpdateCompilationUnit(
+			GroovyLSCompilationUnit existingUnit,
 			Path projectRoot,
 			com.tomaszrup.groovyls.config.ICompilationUnitFactory compilationUnitFactory,
 			FileContentsTracker fileContentsTracker,
-			ScanResult[] scanResultHolder,
-			GroovyClassLoader[] classLoaderHolder,
+			ScanResult existingScanResult,
+			GroovyClassLoader existingClassLoader,
 			Set<URI> additionalInvalidations) {
 
-		GroovyLSCompilationUnit compilationUnit = compilationUnitHolder[0];
-		if (compilationUnit != null) {
-			File targetDirectory = compilationUnit.getConfiguration().getTargetDirectory();
+		if (existingUnit != null) {
+			File targetDirectory = existingUnit.getConfiguration().getTargetDirectory();
 			if (targetDirectory != null && targetDirectory.exists()) {
 				try {
 					Files.walk(targetDirectory.toPath()).sorted(Comparator.reverseOrder()).map(Path::toFile)
 							.forEach(File::delete);
 				} catch (IOException e) {
 					logger.error("Failed to delete target directory: {}", targetDirectory.getAbsolutePath(), e);
-					compilationUnitHolder[0] = null;
-					return false;
+					return new CompilationResult(null, existingClassLoader, existingScanResult, false);
 				}
 			}
 		}
 
-		GroovyLSCompilationUnit oldCompilationUnit = compilationUnit;
-		compilationUnit = compilationUnitFactory.create(projectRoot, fileContentsTracker, additionalInvalidations);
-		compilationUnitHolder[0] = compilationUnit;
+		GroovyLSCompilationUnit newUnit = compilationUnitFactory.create(
+				projectRoot, fileContentsTracker, additionalInvalidations);
 
-		if (compilationUnit != null) {
-			File targetDirectory = compilationUnit.getConfiguration().getTargetDirectory();
+		if (newUnit != null) {
+			File targetDirectory = newUnit.getConfiguration().getTargetDirectory();
 			if (targetDirectory != null && !targetDirectory.exists() && !targetDirectory.mkdirs()) {
 				logger.error("Failed to create target directory: {}", targetDirectory.getAbsolutePath());
 			}
@@ -141,38 +136,13 @@ public class CompilationOrchestrator {
 			// diagnostics. It will be triggered lazily via
 			// ProjectScope.ensureClassGraphScanned() when a provider
 			// (completion, code action) first needs it.
-			classLoaderHolder[0] = compilationUnit.getClassLoader();
+			return new CompilationResult(newUnit, newUnit.getClassLoader(),
+					existingScanResult, newUnit == existingUnit);
 		} else {
-			if (scanResultHolder[0] != null) {
-				sharedScanCache.release(scanResultHolder[0]);
+			if (existingScanResult != null) {
+				sharedScanCache.release(existingScanResult);
 			}
-			scanResultHolder[0] = null;
-		}
-
-		return compilationUnit != null && compilationUnit == oldCompilationUnit;
-	}
-
-	/**
-	 * Updates the ClassGraph scan result if the classloader has changed.
-	 * Delegates to the {@link SharedClassGraphCache} so that scopes with
-	 * identical classpaths share a single {@code ScanResult} instance.
-	 */
-	private void updateClassGraphScan(GroovyClassLoader newClassLoader,
-			ScanResult[] scanResultHolder, GroovyClassLoader[] classLoaderHolder) {
-		if (newClassLoader == classLoaderHolder[0]) {
-			return;
-		}
-		classLoaderHolder[0] = newClassLoader;
-
-		ScanResult oldScanResult = scanResultHolder[0];
-
-		// Acquire a (potentially shared) ScanResult from the cache
-		ScanResult newResult = sharedScanCache.acquire(newClassLoader);
-		scanResultHolder[0] = newResult;
-
-		// Release the previous result (decrements ref count; closes if zero)
-		if (oldScanResult != null && oldScanResult != newResult) {
-			sharedScanCache.release(oldScanResult);
+			return new CompilationResult(null, existingClassLoader, null, false);
 		}
 	}
 

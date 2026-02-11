@@ -25,12 +25,15 @@ import org.gradle.tooling.ProjectConnection;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.tomaszrup.groovyls.util.TempFileUtils;
+
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.stream.Stream;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Discovers and imports Gradle-based JVM projects. Uses the Gradle Tooling API
@@ -58,11 +61,30 @@ public class GradleProjectImporter implements ProjectImporter {
     private volatile Path workspaceBound;
 
     /**
+     * Tracks Gradle roots that have already been validated for wrapper
+     * integrity, to avoid re-reading properties on every connector call.
+     */
+    private final Set<Path> validatedRoots = ConcurrentHashMap.newKeySet();
+
+    /**
      * Sets an upper bound for the Gradle-root search.  When set,
      * {@link #findGradleRoot(Path)} will not walk above this directory.
      */
+    @Override
     public void setWorkspaceBound(Path bound) {
         this.workspaceBound = bound;
+    }
+
+    @Override
+    public boolean claimsProject(Path projectRoot) {
+        return projectRoot != null
+                && (projectRoot.resolve("build.gradle").toFile().exists()
+                    || projectRoot.resolve("build.gradle.kts").toFile().exists());
+    }
+
+    @Override
+    public boolean supportsSiblingBatching() {
+        return true;
     }
 
     @Override
@@ -81,6 +103,7 @@ public class GradleProjectImporter implements ProjectImporter {
     @Override
     public List<String> importProject(Path projectRoot) {
         List<String> classpathList = new ArrayList<>();
+        validateGradleWrapper(projectRoot);
         GradleConnector connector = GradleConnector.newConnector()
                 .forProjectDirectory(projectRoot.toFile());
 
@@ -146,6 +169,7 @@ public class GradleProjectImporter implements ProjectImporter {
         Path gradleRoot = findGradleRoot(projectRoot);
         logger.info("Lazy-resolving classpath for single project {} via Gradle root {}", projectRoot, gradleRoot);
 
+        validateGradleWrapper(gradleRoot);
         GradleConnector connector = GradleConnector.newConnector()
                 .forProjectDirectory(gradleRoot.toFile());
         try (ProjectConnection connection = connector.connect()) {
@@ -199,6 +223,7 @@ public class GradleProjectImporter implements ProjectImporter {
      * @param subprojects  the subprojects to resolve
      * @return map from subproject root to its classpath entries
      */
+    @Override
     public Map<Path, List<String>> resolveClasspathsForRoot(Path gradleRoot, List<Path> subprojects) {
         logger.info("Backfill: resolving classpaths for {} subproject(s) under Gradle root {}",
                 subprojects.size(), gradleRoot);
@@ -214,6 +239,11 @@ public class GradleProjectImporter implements ProjectImporter {
      * Expose Gradle root lookup for use by the resolution coordinator.
      */
     public Path getGradleRoot(Path projectRoot) {
+        return findGradleRoot(projectRoot);
+    }
+
+    @Override
+    public Path getBuildToolRoot(Path projectRoot) {
         return findGradleRoot(projectRoot);
     }
 
@@ -259,6 +289,7 @@ public class GradleProjectImporter implements ProjectImporter {
     private Map<Path, List<String>> importBatch(Path gradleRoot, List<Path> subprojects, boolean compile) {
         Map<Path, List<String>> result = new LinkedHashMap<>();
 
+        validateGradleWrapper(gradleRoot);
         GradleConnector connector = GradleConnector.newConnector()
                 .forProjectDirectory(gradleRoot.toFile());
 
@@ -318,6 +349,7 @@ public class GradleProjectImporter implements ProjectImporter {
     @Override
     public void recompile(Path projectRoot) {
         logger.info("Recompiling Gradle project: {}", projectRoot);
+        validateGradleWrapper(projectRoot);
         GradleConnector connector = GradleConnector.newConnector()
                 .forProjectDirectory(projectRoot.toFile());
 
@@ -430,15 +462,17 @@ public class GradleProjectImporter implements ProjectImporter {
      * @param projectRoot the project root (its Gradle root will be resolved
      *                    automatically)
      */
+    @Override
     public void downloadSourceJarsAsync(Path projectRoot) {
         Path gradleRoot = findGradleRoot(projectRoot);
         logger.info("Background source JAR download for Gradle root {}", gradleRoot);
 
+        validateGradleWrapper(gradleRoot);
         GradleConnector connector = GradleConnector.newConnector()
                 .forProjectDirectory(gradleRoot.toFile());
         Path initScript = null;
         try (ProjectConnection connection = connector.connect()) {
-            initScript = Files.createTempFile("groovyls-sources-init", ".gradle");
+            initScript = TempFileUtils.createSecureTempFile("groovyls-sources-init", ".gradle");
             String initScriptContent =
                 "allprojects {\n" +
                 "    tasks.register('_groovyLSDownloadSources') {\n" +
@@ -508,7 +542,7 @@ public class GradleProjectImporter implements ProjectImporter {
         Map<String, Set<String>> dedupByProject = new LinkedHashMap<>();
         Path initScript = null;
         try {
-            initScript = Files.createTempFile("groovyls-init", ".gradle");
+            initScript = TempFileUtils.createSecureTempFile("groovyls-init", ".gradle");
             String initScriptContent =
                 "allprojects {\n" +
                 "    tasks.register('_groovyLSResolveClasspath') {\n" +
@@ -606,10 +640,14 @@ public class GradleProjectImporter implements ProjectImporter {
         Map<String, Set<String>> dedupByProject = new LinkedHashMap<>();
         Path initScript = null;
         try {
-            initScript = Files.createTempFile("groovyls-single-init", ".gradle");
-            // Escape backslashes for the Groovy string in the init script
+            initScript = TempFileUtils.createSecureTempFile("groovyls-single-init", ".gradle");
+            // Escape backslashes, single quotes, and strip newlines for the
+            // Groovy single-quoted string in the init script to prevent injection.
             String targetDir = targetProject.toAbsolutePath().normalize().toString()
-                    .replace("\\", "\\\\");
+                    .replace("\\", "\\\\")
+                    .replace("'", "\\'")
+                    .replace("\n", "")
+                    .replace("\r", "");
             String initScriptContent =
                 "allprojects {\n" +
                 "    tasks.register('_groovyLSResolveSingleClasspath') {\n" +
@@ -805,5 +843,58 @@ public class GradleProjectImporter implements ProjectImporter {
                 flush();
             }
         };
+    }
+
+    // ----------------------------------------------------------------
+    // Gradle wrapper integrity validation
+    // ----------------------------------------------------------------
+
+    /**
+     * Validate the target project's Gradle wrapper configuration before
+     * connecting via the Tooling API.
+     *
+     * <p>Checks that {@code distributionSha256Sum} is present in the wrapper
+     * properties so that the downloaded distribution can be verified. If the
+     * checksum is missing, a warning is logged but execution continues —
+     * many legitimate projects omit it.</p>
+     *
+     * <p>Results are cached per {@code gradleRoot} so the check runs at most
+     * once per directory.</p>
+     *
+     * @param gradleRoot the Gradle root directory (containing
+     *                    {@code gradle/wrapper/gradle-wrapper.properties})
+     */
+    private void validateGradleWrapper(Path gradleRoot) {
+        if (!validatedRoots.add(gradleRoot)) {
+            return; // already validated
+        }
+
+        Path propsFile = gradleRoot.resolve("gradle")
+                .resolve("wrapper")
+                .resolve("gradle-wrapper.properties");
+
+        if (!Files.isRegularFile(propsFile)) {
+            // No wrapper properties — the Tooling API will use its own default
+            // distribution, which is safe.
+            logger.debug("No gradle-wrapper.properties found in {} — using Tooling API default", gradleRoot);
+            return;
+        }
+
+        Properties props = new Properties();
+        try (InputStream in = Files.newInputStream(propsFile)) {
+            props.load(in);
+        } catch (IOException e) {
+            logger.warn("Could not read {}: {}", propsFile, e.getMessage());
+            return;
+        }
+
+        String sha256 = props.getProperty("distributionSha256Sum");
+        boolean hasSha = sha256 != null && !sha256.isBlank();
+
+        if (!hasSha) {
+            logger.warn("Gradle wrapper in {} does not specify distributionSha256Sum — " +
+                    "distribution integrity cannot be verified. Consider adding a " +
+                    "SHA-256 checksum to gradle-wrapper.properties.", gradleRoot);
+        }
     }
 }

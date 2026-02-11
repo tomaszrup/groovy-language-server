@@ -129,6 +129,7 @@ class ClasspathResolutionCoordinatorTests {
 			}
 			@Override public void recompile(Path root) {}
 			@Override public boolean isProjectFile(String path) { return false; }
+			@Override public boolean claimsProject(Path root) { return true; }
 		};
 		importerMap.put(PROJECT_A, stubImporter);
 

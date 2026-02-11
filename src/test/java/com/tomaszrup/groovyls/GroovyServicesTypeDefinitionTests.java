@@ -24,19 +24,13 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
 
 import org.eclipse.lsp4j.DidOpenTextDocumentParams;
 import org.eclipse.lsp4j.Location;
-import org.eclipse.lsp4j.MessageActionItem;
-import org.eclipse.lsp4j.MessageParams;
 import org.eclipse.lsp4j.Position;
-import org.eclipse.lsp4j.PublishDiagnosticsParams;
-import org.eclipse.lsp4j.ShowMessageRequestParams;
 import org.eclipse.lsp4j.TextDocumentIdentifier;
 import org.eclipse.lsp4j.TextDocumentItem;
 import org.eclipse.lsp4j.TypeDefinitionParams;
-import org.eclipse.lsp4j.services.LanguageClient;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
@@ -63,33 +57,7 @@ class GroovyServicesTypeDefinitionTests {
 
 		services = new GroovyServices(new CompilationUnitFactory());
 		services.setWorkspaceRoot(workspaceRoot);
-		services.connect(new LanguageClient() {
-
-			@Override
-			public void telemetryEvent(Object object) {
-
-			}
-
-			@Override
-			public CompletableFuture<MessageActionItem> showMessageRequest(ShowMessageRequestParams requestParams) {
-				return null;
-			}
-
-			@Override
-			public void showMessage(MessageParams messageParams) {
-
-			}
-
-			@Override
-			public void publishDiagnostics(PublishDiagnosticsParams diagnostics) {
-
-			}
-
-			@Override
-			public void logMessage(MessageParams message) {
-
-			}
-		});
+		services.connect(new TestLanguageClient());
 	}
 
 	@AfterEach

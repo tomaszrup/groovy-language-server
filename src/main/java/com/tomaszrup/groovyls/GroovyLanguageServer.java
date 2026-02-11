@@ -38,6 +38,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.*;
+import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URI;
@@ -81,8 +82,8 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                 }
             }
 
-            try (ServerSocket serverSocket = new ServerSocket(port)) {
-                logger.info("Groovy Language Server listening on port {}", port);
+            try (ServerSocket serverSocket = new ServerSocket(port, 50, InetAddress.getLoopbackAddress())) {
+                logger.info("Groovy Language Server listening on port {} (localhost only)", port);
                 try (Socket socket = serverSocket.accept()) {
                     logger.info("Client connected.");
 
@@ -179,23 +180,16 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
 
     /**
      * Push relevant VS Code settings to importers that can use them.
-     * Currently handles {@code groovy.maven.home}.
+     * Each importer extracts its own relevant keys via
+     * {@link ProjectImporter#applySettings(JsonObject)}.
      */
     private void applyImporterSettings(JsonObject settings) {
         if (!settings.has("groovy") || !settings.get("groovy").isJsonObject()) {
             return;
         }
         JsonObject groovy = settings.get("groovy").getAsJsonObject();
-        if (groovy.has("maven") && groovy.get("maven").isJsonObject()) {
-            JsonObject maven = groovy.get("maven").getAsJsonObject();
-            JsonElement homeElem = maven.get("home");
-            String mavenHome = (homeElem != null && !homeElem.isJsonNull()) ? homeElem.getAsString() : null;
-
-            for (ProjectImporter importer : importers) {
-                if (importer instanceof MavenProjectImporter) {
-                    ((MavenProjectImporter) importer).setMavenHome(mavenHome);
-                }
-            }
+        for (ProjectImporter importer : importers) {
+            importer.applySettings(groovy);
         }
     }
 
@@ -276,14 +270,12 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         // Apply memory settings to scope manager
         groovyServices.getScopeManager().setScopeEvictionTTLSeconds(scopeEvictionTTLSeconds);
 
-        // Set workspace bound on the Gradle importer so findGradleRoot()
-        // stops at the workspace root instead of walking to the filesystem root.
+        // Set workspace bound on importers so build-tool root searches
+        // stop at the workspace root instead of walking to the filesystem root.
         if (rootUriString != null) {
             Path wsRoot = Paths.get(URI.create(rootUriString));
             for (ProjectImporter importer : importers) {
-                if (importer instanceof GradleProjectImporter) {
-                    ((GradleProjectImporter) importer).setWorkspaceBound(wsRoot);
-                }
+                importer.setWorkspaceBound(wsRoot);
             }
         }
 
@@ -426,22 +418,10 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
 
                 // We still need to populate importerMapLocal so that
                 // recompileProject() can look up the right importer.
-                // Assign all cached roots to the first importer that would
-                // claim them (Gradle first, then Maven).
+                // Assign all cached roots to the first importer that claims them.
                 for (Path root : allDiscoveredRoots) {
                     for (ProjectImporter importer : importers) {
-                        // Check if a build file for this importer exists
-                        if (importer instanceof GradleProjectImporter
-                                && (root.resolve("build.gradle").toFile().exists()
-                                    || root.resolve("build.gradle.kts").toFile().exists())) {
-                            importerMapLocal.put(root, importer);
-                            discoveredByImporter
-                                    .computeIfAbsent(importer, k -> new ArrayList<>())
-                                    .add(root);
-                            claimedRoots.add(root);
-                            break;
-                        } else if (importer instanceof MavenProjectImporter
-                                && root.resolve("pom.xml").toFile().exists()) {
+                        if (importer.claimsProject(root)) {
                             importerMapLocal.put(root, importer);
                             discoveredByImporter
                                     .computeIfAbsent(importer, k -> new ArrayList<>())
@@ -472,34 +452,24 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                     }
                 }
 
-                // Find roots that are freshly discovered but NOT in the cache
-                ProjectImporter gradleImp = null;
-                ProjectImporter mavenImp = null;
-                for (ProjectImporter importer : importers) {
-                    if (importer instanceof GradleProjectImporter) gradleImp = importer;
-                    if (importer instanceof MavenProjectImporter) mavenImp = importer;
-                }
+                // Find roots that are freshly discovered but NOT in the cache.
+                // Use the unified discovered lists and let each root find its importer.
+                List<Path> allFreshRoots = new ArrayList<>();
+                allFreshRoots.addAll(freshGradleRoots);
+                allFreshRoots.addAll(freshMavenRoots);
 
                 List<Path> newRoots = newUncachedRoots;
-                if (gradleImp != null) {
-                    for (Path p : freshGradleRoots) {
-                        if (claimedRoots.add(p)) {
-                            newRoots.add(p);
-                            importerMapLocal.put(p, gradleImp);
-                            discoveredByImporter
-                                    .computeIfAbsent(gradleImp, k -> new ArrayList<>())
-                                    .add(p);
-                        }
-                    }
-                }
-                if (mavenImp != null) {
-                    for (Path p : freshMavenRoots) {
-                        if (claimedRoots.add(p)) {
-                            newRoots.add(p);
-                            importerMapLocal.put(p, mavenImp);
-                            discoveredByImporter
-                                    .computeIfAbsent(mavenImp, k -> new ArrayList<>())
-                                    .add(p);
+                for (Path p : allFreshRoots) {
+                    if (claimedRoots.add(p)) {
+                        for (ProjectImporter importer : importers) {
+                            if (importer.claimsProject(p)) {
+                                newRoots.add(p);
+                                importerMapLocal.put(p, importer);
+                                discoveredByImporter
+                                        .computeIfAbsent(importer, k -> new ArrayList<>())
+                                        .add(p);
+                                break;
+                            }
                         }
                     }
                 }
@@ -548,53 +518,36 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                     }
                 }
 
-                // Map discovered roots to their importers, respecting priority
-                // (Gradle first — if a dir has both build.gradle and pom.xml, Gradle wins)
-                ProjectImporter gradleImporter = null;
-                ProjectImporter mavenImporter = null;
+                // Map discovered roots to their importers using claimsProject(),
+                // respecting priority (importers list order — Gradle first).
+                // Collect all discovered roots and let each find its importer.
+                List<Path> allFreshDiscovered = new ArrayList<>();
+                allFreshDiscovered.addAll(gradleRoots);
+                allFreshDiscovered.addAll(mavenRoots);
+
+                for (Path p : allFreshDiscovered) {
+                    if (claimedRoots.add(p)) {
+                        for (ProjectImporter importer : importers) {
+                            if (importer.claimsProject(p)) {
+                                discoveredByImporter
+                                        .computeIfAbsent(importer, k -> new ArrayList<>())
+                                        .add(p);
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Log per-importer discovery counts
                 for (ProjectImporter importer : importers) {
-                    if (importer instanceof GradleProjectImporter) gradleImporter = importer;
-                    if (importer instanceof MavenProjectImporter) mavenImporter = importer;
-                }
-
-                if (gradleImporter != null) {
-                    for (Path p : gradleRoots) {
-                        if (claimedRoots.add(p)) {
-                            discoveredByImporter
-                                    .computeIfAbsent(gradleImporter, k -> new ArrayList<>())
-                                    .add(p);
-                        }
-                    }
-                    if (!gradleRoots.isEmpty()) {
-                        String gradleMsg = "Found " + gradleRoots.size() + " Gradle project(s)";
-                        logProgress(gradleMsg);
-                        sendStatusUpdate("importing", gradleMsg);
+                    List<Path> discovered = discoveredByImporter.getOrDefault(importer, List.of());
+                    if (!discovered.isEmpty()) {
+                        String msg = "Found " + discovered.size() + " " + importer.getName() + " project(s)";
+                        logProgress(msg);
+                        sendStatusUpdate("importing", msg);
                     } else {
-                        logProgress("No Gradle projects found");
-                        sendStatusUpdate("importing", "No Gradle projects found");
-                    }
-                }
-
-                if (mavenImporter != null) {
-                    List<Path> unclaimed = new ArrayList<>();
-                    for (Path p : mavenRoots) {
-                        if (claimedRoots.add(p)) {
-                            unclaimed.add(p);
-                            discoveredByImporter
-                                    .computeIfAbsent(mavenImporter, k -> new ArrayList<>())
-                                    .add(p);
-                        }
-                    }
-                    if (!mavenRoots.isEmpty()) {
-                        String mavenMsg = "Found " + unclaimed.size() + " Maven project(s)"
-                                + (unclaimed.size() < mavenRoots.size()
-                                        ? " (" + (mavenRoots.size() - unclaimed.size()) + " already claimed by Gradle)"
-                                        : "");
-                        logProgress(mavenMsg);
-                        sendStatusUpdate("importing", mavenMsg);
-                    } else {
-                        logProgress("No Maven projects found");
-                        sendStatusUpdate("importing", "No Maven projects found");
+                        logProgress("No " + importer.getName() + " projects found");
+                        sendStatusUpdate("importing", "No " + importer.getName() + " projects found");
                     }
                 }
 

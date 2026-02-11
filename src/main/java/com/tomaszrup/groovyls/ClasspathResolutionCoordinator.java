@@ -20,7 +20,6 @@
 package com.tomaszrup.groovyls;
 
 import com.tomaszrup.groovyls.config.ClasspathCache;
-import com.tomaszrup.groovyls.importers.GradleProjectImporter;
 import com.tomaszrup.groovyls.importers.ProjectImporter;
 import org.eclipse.lsp4j.MessageParams;
 import org.eclipse.lsp4j.MessageType;
@@ -209,62 +208,59 @@ public class ClasspathResolutionCoordinator {
         // Schedule low-priority background source JAR download so that
         // Go-to-Definition can show real source.  This is NOT on the
         // critical path to first diagnostic.
-        if (importer instanceof GradleProjectImporter) {
-            importPool.submit(() -> {
-                try {
-                    ((GradleProjectImporter) importer).downloadSourceJarsAsync(projectRoot);
-                } catch (Exception e) {
-                    logger.debug("Background source JAR download failed: {}", e.getMessage());
-                }
-            });
-        }
+        importPool.submit(() -> {
+            try {
+                importer.downloadSourceJarsAsync(projectRoot);
+            } catch (Exception e) {
+                logger.debug("Background source JAR download failed: {}", e.getMessage());
+            }
+        });
     }
 
     /**
      * Schedule a delayed backfill for unresolved sibling subprojects under the
-     * same Gradle root. Uses a coalescing delay so rapid file opens across
-     * multiple subprojects are batched into one Gradle daemon interaction.
+     * same build-tool root. Uses a coalescing delay so rapid file opens across
+     * multiple subprojects are batched into one build-tool interaction.
      */
     private void scheduleBackfill(ProjectImporter importer, Path resolvedProjectRoot) {
-        if (!(importer instanceof GradleProjectImporter)) {
-            // Maven projects are independent — no sibling batching benefit
+        if (!importer.supportsSiblingBatching()) {
+            // This build tool doesn't support batching siblings
             return;
         }
 
-        GradleProjectImporter gradleImporter = (GradleProjectImporter) importer;
-        Path gradleRoot = gradleImporter.getGradleRoot(resolvedProjectRoot);
+        Path buildToolRoot = importer.getBuildToolRoot(resolvedProjectRoot);
 
         // Cancel any pending backfill for this root (coalescing)
-        ScheduledFuture<?> existing = pendingBackfills.get(gradleRoot);
+        ScheduledFuture<?> existing = pendingBackfills.get(buildToolRoot);
         if (existing != null && !existing.isDone()) {
             existing.cancel(false);
         }
 
         ScheduledFuture<?> future = schedulingPool.schedule(() -> {
-            importPool.submit(() -> doBackfill(gradleImporter, gradleRoot));
+            importPool.submit(() -> doBackfill(importer, buildToolRoot));
         }, BACKFILL_DELAY_MS, TimeUnit.MILLISECONDS);
 
-        pendingBackfills.put(gradleRoot, future);
+        pendingBackfills.put(buildToolRoot, future);
     }
 
-    private void doBackfill(GradleProjectImporter gradleImporter, Path gradleRoot) {
-        MdcProjectContext.setProject(gradleRoot);
-        // Find all unresolved sibling scopes under this Gradle root
+    private void doBackfill(ProjectImporter importer, Path buildToolRoot) {
+        MdcProjectContext.setProject(buildToolRoot);
+        // Find all unresolved sibling scopes under this build-tool root
         List<ProjectScope> unresolvedSiblings = new ArrayList<>();
         for (ProjectScope scope : scopeManager.getProjectScopes()) {
             if (scope.getProjectRoot() != null
                     && !scope.isClasspathResolved()
                     && !scopeManager.isResolutionInFlight(scope.getProjectRoot())) {
-                Path scopeGradleRoot = gradleImporter.getGradleRoot(scope.getProjectRoot());
-                if (gradleRoot.equals(scopeGradleRoot)) {
+                Path scopeBuildToolRoot = importer.getBuildToolRoot(scope.getProjectRoot());
+                if (buildToolRoot.equals(scopeBuildToolRoot)) {
                     unresolvedSiblings.add(scope);
                 }
             }
         }
 
         if (unresolvedSiblings.isEmpty()) {
-            logger.debug("Backfill: no unresolved siblings under {}", gradleRoot);
-            pendingBackfills.remove(gradleRoot);
+            logger.debug("Backfill: no unresolved siblings under {}", buildToolRoot);
+            pendingBackfills.remove(buildToolRoot);
             return;
         }
 
@@ -277,19 +273,19 @@ public class ClasspathResolutionCoordinator {
         }
 
         if (toResolve.isEmpty()) {
-            pendingBackfills.remove(gradleRoot);
+            pendingBackfills.remove(buildToolRoot);
             return;
         }
 
         logProgress("Backfill: resolving " + toResolve.size()
-                + " sibling project(s) under " + gradleRoot.getFileName() + "...");
+                + " sibling project(s) under " + buildToolRoot.getFileName() + "...");
         sendStatusUpdate("importing", "Backfill: resolving " + toResolve.size()
-                + " sibling project(s) under " + gradleRoot.getFileName() + "...");
+                + " sibling project(s) under " + buildToolRoot.getFileName() + "...");
         long start = System.currentTimeMillis();
 
         try {
             Map<Path, List<String>> batchResult =
-                    gradleImporter.resolveClasspathsForRoot(gradleRoot, toResolve);
+                    importer.resolveClasspathsForRoot(buildToolRoot, toResolve);
 
             for (Map.Entry<Path, List<String>> entry : batchResult.entrySet()) {
                 Path root = entry.getKey();
@@ -312,12 +308,12 @@ public class ClasspathResolutionCoordinator {
             // diagnose memory pressure in large workspaces early.
             logMemoryStats();
         } catch (Exception e) {
-            logger.error("Backfill failed for Gradle root {}: {}", gradleRoot, e.getMessage(), e);
+            logger.error("Backfill failed for root {}: {}", buildToolRoot, e.getMessage(), e);
         } finally {
             for (Path root : toResolve) {
                 scopeManager.markResolutionComplete(root);
             }
-            pendingBackfills.remove(gradleRoot);
+            pendingBackfills.remove(buildToolRoot);
         }
     }
 

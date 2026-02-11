@@ -22,6 +22,11 @@ package com.tomaszrup.groovyls.importers;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+
+import com.tomaszrup.groovyls.util.TempFileUtils;
+
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -220,6 +225,22 @@ public class MavenProjectImporter implements ProjectImporter {
     }
 
     @Override
+    public boolean claimsProject(Path projectRoot) {
+        return projectRoot != null
+                && projectRoot.resolve("pom.xml").toFile().exists();
+    }
+
+    @Override
+    public void applySettings(JsonObject settings) {
+        if (settings != null && settings.has("maven") && settings.get("maven").isJsonObject()) {
+            JsonObject maven = settings.get("maven").getAsJsonObject();
+            JsonElement homeElem = maven.get("home");
+            String home = (homeElem != null && !homeElem.isJsonNull()) ? homeElem.getAsString() : null;
+            setMavenHome(home);
+        }
+    }
+
+    @Override
     public boolean isProjectFile(String filePath) {
         return filePath != null && filePath.endsWith("pom.xml");
     }
@@ -268,7 +289,7 @@ public class MavenProjectImporter implements ProjectImporter {
         List<String> classpathEntries = new ArrayList<>();
         Path cpFile = null;
         try {
-            cpFile = Files.createTempFile("groovyls-mvn-cp", ".txt");
+            cpFile = TempFileUtils.createSecureTempFile("groovyls-mvn-cp", ".txt");
             int exitCode = runMaven(projectRoot,
                     "dependency:build-classpath",
                     "-DincludeScope=test",
@@ -451,13 +472,13 @@ public class MavenProjectImporter implements ProjectImporter {
         int depth = 0;
         while (dir != null && depth < maxDepth) {
             Path wrapper = dir.resolve(isWindows() ? "mvnw.cmd" : "mvnw");
-            if (Files.isRegularFile(wrapper)) {
+            if (Files.isRegularFile(wrapper) && isLegitMavenWrapper(wrapper)) {
                 return wrapper.toAbsolutePath().toString();
             }
             // On Windows also check for mvnw (batch-less wrapper)
             if (isWindows()) {
                 Path wrapperAlt = dir.resolve("mvnw");
-                if (Files.isRegularFile(wrapperAlt)) {
+                if (Files.isRegularFile(wrapperAlt) && isLegitMavenWrapper(wrapperAlt)) {
                     return wrapperAlt.toAbsolutePath().toString();
                 }
             }
@@ -465,6 +486,62 @@ public class MavenProjectImporter implements ProjectImporter {
             depth++;
         }
         return null;
+    }
+
+    /**
+     * Basic content validation of a Maven Wrapper script.
+     *
+     * <p>Reads the first 512 bytes and checks for expected markers:
+     * <ul>
+     * <li>Unix ({@code mvnw}): must start with {@code #!} (shebang) and
+     *     contain "maven" or "mvn" (case-insensitive).</li>
+     * <li>Windows ({@code mvnw.cmd}): must start with {@code @} or {@code ::}
+     *     (batch preamble/comment) and contain "maven" or "mvn"
+     *     (case-insensitive).</li>
+     * </ul>
+     *
+     * <p>This is a best-effort check to reject obviously tampered wrapper
+     * scripts (e.g. a shell script that runs {@code rm -rf /} but is named
+     * {@code mvnw}). It does not cryptographically verify the wrapper.</p>
+     *
+     * @return {@code true} if the file looks like a legitimate Maven wrapper
+     */
+    private boolean isLegitMavenWrapper(Path wrapperPath) {
+        try {
+            byte[] buf = new byte[512];
+            int bytesRead;
+            try (InputStream in = Files.newInputStream(wrapperPath)) {
+                bytesRead = in.read(buf);
+            }
+            if (bytesRead <= 0) {
+                logger.warn("Skipping empty Maven wrapper at {}", wrapperPath);
+                return false;
+            }
+            String header = new String(buf, 0, bytesRead, StandardCharsets.UTF_8).toLowerCase();
+
+            boolean hasShebangOrBatch;
+            if (wrapperPath.getFileName().toString().endsWith(".cmd")) {
+                // Windows batch: first non-whitespace should be @ or ::
+                String trimmed = header.stripLeading();
+                hasShebangOrBatch = trimmed.startsWith("@") || trimmed.startsWith("::");
+            } else {
+                // Unix shell: must start with #!
+                hasShebangOrBatch = header.startsWith("#!");
+            }
+
+            boolean hasMavenMarker = header.contains("maven") || header.contains("mvn");
+
+            if (!hasShebangOrBatch || !hasMavenMarker) {
+                logger.warn("Skipping suspicious Maven wrapper at {}: content does not match " +
+                        "expected format (shebang/batch={}, maven-marker={})",
+                        wrapperPath, hasShebangOrBatch, hasMavenMarker);
+                return false;
+            }
+            return true;
+        } catch (IOException e) {
+            logger.warn("Could not read Maven wrapper at {}: {}", wrapperPath, e.getMessage());
+            return false;
+        }
     }
 
     private static boolean isWindows() {

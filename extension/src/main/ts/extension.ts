@@ -48,6 +48,19 @@ const LABEL_RESTART_SERVER = "Restart Server";
 const LABEL_RELOAD_WINDOW = "Reload Window";
 const MAX_SERVER_RESTARTS = 5;
 
+// JVM argument prefixes that could allow arbitrary code execution when set
+// via workspace-level settings. If any of these are detected in
+// groovy.java.vmargs, the language server will refuse to start.
+const BLOCKED_VM_ARG_PREFIXES = [
+  "-javaagent:",
+  "-agentpath:",
+  "-agentlib:",
+  "-Xbootclasspath",
+  "-Xbootclasspath/a:",
+  "-Xbootclasspath/p:",
+  "-XX:+EnableDynamicAgentLoading",
+];
+
 /**
  * Estimate appropriate JVM heap size by counting build files in the workspace.
  * Each Gradle/Maven project scope consumes ~30-40 MB (classloader, AST,
@@ -57,7 +70,7 @@ const MAX_SERVER_RESTARTS = 5;
  * to be fully loaded at any time, so we use a smaller per-project estimate
  * capped to a maximum number of active scopes.
  */
-async function estimateHeapSize(): Promise<number> {
+export async function estimateHeapSize(): Promise<number> {
   const MIN_HEAP = 512;
   const MAX_HEAP = 4096;
   const BASE_HEAP = 256;
@@ -143,7 +156,7 @@ export function deactivate(): Thenable<void> | undefined {
   return languageClient.stop();
 }
 
-function setStatusBar(
+export function setStatusBar(
   state: "starting" | "importing" | "ready" | "error" | "stopped",
   detail?: string
 ): void {
@@ -188,7 +201,7 @@ function setStatusBar(
  * Returns a formatted memory suffix for the status bar (e.g. " [128/512 MB]")
  * if the setting is enabled and memory data is available, otherwise "".
  */
-function getMemorySuffix(): string {
+export function getMemorySuffix(): string {
   const config = vscode.workspace.getConfiguration("groovy");
   if (!config.get<boolean>("showMemoryUsage") || !lastMemoryText) {
     return "";
@@ -200,7 +213,7 @@ function getMemorySuffix(): string {
  * Shorten a server progress message for display in the status bar.
  * Keeps it concise so it doesn't take too much horizontal space.
  */
-function shortenDetail(message: string): string {
+export function shortenDetail(message: string): string {
   // Truncate overly long messages (e.g. long project names)
   const maxLen = 60;
   if (message.length > maxLen) {
@@ -266,7 +279,7 @@ function restartLanguageServer() {
  * Reads VS Code settings and translates them into the format expected by
  * GroovyLanguageServer.initialize().
  */
-function buildInitializationOptions(): Record<string, unknown> {
+export function buildInitializationOptions(): Record<string, unknown> {
   const config = vscode.workspace.getConfiguration("groovy");
   const options: Record<string, unknown> = {};
 
@@ -360,6 +373,21 @@ function startLanguageServer() {
           const vmargs = config.get<string>("java.vmargs");
           if (vmargs) {
             const vmTokens = vmargs.match(/\S+/g) || [];
+            const blockedArgs = vmTokens.filter((token) =>
+              BLOCKED_VM_ARG_PREFIXES.some((prefix) =>
+                token.toLowerCase().startsWith(prefix.toLowerCase())
+              )
+            );
+            if (blockedArgs.length > 0) {
+              resolve();
+              setStatusBar("error");
+              vscode.window.showErrorMessage(
+                `Groovy language server refused to start: groovy.java.vmargs contains ` +
+                `blocked JVM flag(s) that could allow arbitrary code execution: ${blockedArgs.join(", ")}. ` +
+                `Remove them and reload the window.`
+              );
+              return;
+            }
             args.unshift(...vmTokens);
           } else {
             const heapMb = await estimateHeapSize();

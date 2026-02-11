@@ -21,9 +21,11 @@
 package com.tomaszrup.groovyls;
 
 import java.net.URI;
+import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -35,6 +37,8 @@ import org.codehaus.groovy.control.CompilationFailedException;
 import org.codehaus.groovy.control.CompilerConfiguration;
 import org.codehaus.groovy.control.ErrorCollector;
 import org.codehaus.groovy.control.Phases;
+import org.codehaus.groovy.control.messages.Message;
+import org.codehaus.groovy.control.messages.SyntaxErrorMessage;
 import org.eclipse.lsp4j.Diagnostic;
 import org.eclipse.lsp4j.MessageParams;
 import org.eclipse.lsp4j.MessageType;
@@ -111,15 +115,35 @@ public class CompilationService {
 	// --- AST visiting ---
 
 	public void visitAST(ProjectScope scope) {
-		ASTNodeVisitor visitor = compilationOrchestrator.visitAST(scope.getCompilationUnit());
-		if (visitor != null) {
-			scope.setAstVisitor(visitor);
-		}
+		visitAST(scope, Collections.emptySet());
 	}
 
 	public void visitAST(ProjectScope scope, Set<URI> uris) {
-		scope.setAstVisitor(compilationOrchestrator.visitAST(
-				scope.getCompilationUnit(), scope.getAstVisitor(), uris));
+		visitAST(scope, uris, Collections.emptySet());
+	}
+
+	/**
+	 * Visits the AST for the given scope, optionally preserving the
+	 * last-known-good AST data for files that have compilation errors
+	 * and produced a degraded AST.
+	 *
+	 * @param scope     the project scope
+	 * @param uris      URIs to visit (empty = full visit)
+	 * @param errorURIs URIs that had compilation errors
+	 */
+	public void visitAST(ProjectScope scope, Set<URI> uris, Set<URI> errorURIs) {
+		ASTNodeVisitor oldVisitor = scope.getAstVisitor();
+		ASTNodeVisitor visitor;
+		if (uris.isEmpty()) {
+			visitor = compilationOrchestrator.visitAST(scope.getCompilationUnit());
+		} else {
+			visitor = compilationOrchestrator.visitAST(
+					scope.getCompilationUnit(), oldVisitor, uris);
+		}
+		if (visitor != null) {
+			preserveASTForErrorFiles(visitor, oldVisitor, errorURIs);
+			scope.setAstVisitor(visitor);
+		}
 	}
 
 	// --- Compilation unit management ---
@@ -129,24 +153,22 @@ public class CompilationService {
 	}
 
 	public boolean createOrUpdateCompilationUnit(ProjectScope scope, Set<URI> additionalInvalidations) {
-		GroovyLSCompilationUnit[] cuHolder = { scope.getCompilationUnit() };
-		ASTNodeVisitor[] avHolder = { scope.getAstVisitor() };
-		ScanResult[] srHolder = { scope.getClassGraphScanResult() };
 		GroovyClassLoader oldClassLoader = scope.getClassLoader();
-		GroovyClassLoader[] clHolder = { oldClassLoader };
 
-		boolean result = compilationOrchestrator.createOrUpdateCompilationUnit(
-				cuHolder, avHolder, scope.getProjectRoot(),
-				scope.getCompilationUnitFactory(), fileContentsTracker,
-				srHolder, clHolder, additionalInvalidations);
+		com.tomaszrup.groovyls.compiler.CompilationResult result =
+				compilationOrchestrator.createOrUpdateCompilationUnit(
+						scope.getCompilationUnit(), scope.getProjectRoot(),
+						scope.getCompilationUnitFactory(), fileContentsTracker,
+						scope.getClassGraphScanResult(), oldClassLoader,
+						additionalInvalidations);
 
-		scope.setCompilationUnit(cuHolder[0]);
-		scope.setClassLoader(clHolder[0]);
+		scope.setCompilationUnit(result.getCompilationUnit());
+		scope.setClassLoader(result.getClassLoader());
 
 		// If the classloader changed, the lazily-acquired ClassGraph scan
 		// result is stale — release it so the next ensureClassGraphScanned()
 		// call acquires a fresh one for the new classpath.
-		if (clHolder[0] != oldClassLoader) {
+		if (result.getClassLoader() != oldClassLoader) {
 			ScanResult oldScan = scope.getClassGraphScanResult();
 			if (oldScan != null) {
 				com.tomaszrup.groovyls.compiler.SharedClassGraphCache.getInstance().release(oldScan);
@@ -154,7 +176,7 @@ public class CompilationService {
 			}
 		} else {
 			// Classloader unchanged — keep the existing scan result
-			scope.setClassGraphScanResult(srHolder[0]);
+			scope.setClassGraphScanResult(result.getScanResult());
 		}
 
 		// Keep the source locator in sync with the compilation classloader
@@ -162,12 +184,18 @@ public class CompilationService {
 		if (scope.getJavaSourceLocator() != null && scope.getClassLoader() != null) {
 			scope.getJavaSourceLocator().setCompilationClassLoader(scope.getClassLoader());
 		}
-		return result;
+		return result.isSameUnit();
 	}
 
 	// --- Compilation ---
 
-	public void compile(ProjectScope scope) {
+	/**
+	 * Compiles the scope and publishes diagnostics.
+	 *
+	 * @return the set of URIs that had compilation errors (syntax errors),
+	 *         or an empty set if compilation succeeded without errors
+	 */
+	public Set<URI> compile(ProjectScope scope) {
 		MdcProjectContext.setProject(scope.getProjectRoot());
 		Semaphore permits = compilationPermits;
 		if (permits != null) {
@@ -176,7 +204,7 @@ public class CompilationService {
 			} catch (InterruptedException e) {
 				Thread.currentThread().interrupt();
 				logger.debug("Compilation interrupted for {}", scope.getProjectRoot());
-				return;
+				return Collections.emptySet();
 			}
 		}
 		try {
@@ -190,12 +218,73 @@ public class CompilationService {
 				if (client != null) {
 					result.getDiagnosticsToPublish().forEach(client::publishDiagnostics);
 				}
+				return extractErrorURIs(collector);
 			}
 		} catch (VirtualMachineError e) {
 			handleCompilationOOM(scope, e, "compile");
 		} finally {
 			if (permits != null) {
 				permits.release();
+			}
+		}
+		return Collections.emptySet();
+	}
+
+	/**
+	 * Extracts the set of source file URIs that have syntax errors from
+	 * the given error collector.
+	 */
+	private Set<URI> extractErrorURIs(ErrorCollector collector) {
+		Set<URI> errorURIs = new HashSet<>();
+		List<? extends Message> errors = collector.getErrors();
+		if (errors == null || errors.isEmpty()) {
+			return errorURIs;
+		}
+		for (Message message : errors) {
+			if (message instanceof SyntaxErrorMessage) {
+				SyntaxErrorMessage sem = (SyntaxErrorMessage) message;
+				String sourceLocator = sem.getCause().getSourceLocator();
+				if (sourceLocator != null && !sourceLocator.isEmpty()) {
+					try {
+						errorURIs.add(Paths.get(sourceLocator).normalize().toUri());
+					} catch (InvalidPathException e) {
+						// skip invalid source locators
+					}
+				}
+			}
+		}
+		return errorURIs;
+	}
+
+	/**
+	 * For files that had compilation errors and produced a degraded AST
+	 * (significantly fewer nodes than the previous compilation), restore
+	 * the last-known-good AST data so semantic tokens remain intact.
+	 *
+	 * @param newVisitor  the newly built AST visitor
+	 * @param oldVisitor  the previous (last-known-good) AST visitor, may be null
+	 * @param errorURIs   URIs that had compilation errors
+	 */
+	private void preserveASTForErrorFiles(ASTNodeVisitor newVisitor, ASTNodeVisitor oldVisitor, Set<URI> errorURIs) {
+		if (oldVisitor == null || errorURIs.isEmpty()) {
+			return;
+		}
+		for (URI errorURI : errorURIs) {
+			int oldCount = oldVisitor.getNodeCount(errorURI);
+			if (oldCount == 0) {
+				// No previous data to preserve
+				continue;
+			}
+			int newCount = newVisitor.getNodeCount(errorURI);
+			// Only restore when the new AST has SOME nodes but significantly
+			// fewer than the old one. A newCount of 0 typically means the
+			// file wasn't found in the compilation unit (URI mismatch), not
+			// true AST degradation — let existing fallback mechanisms
+			// (e.g. completion placeholder injection) handle that case.
+			if (newCount > 0 && newCount < oldCount / 2) {
+				logger.debug("Preserving last-known-good AST for {} (old: {} nodes, new: {} nodes)",
+						errorURI, oldCount, newCount);
+				newVisitor.restoreFromPrevious(errorURI, oldVisitor);
 			}
 		}
 	}
@@ -328,8 +417,8 @@ public class CompilationService {
 		try {
 			createOrUpdateCompilationUnit(scope);
 			resetChangedFilesForScope(scope);
-			compile(scope);
-			visitAST(scope);
+			Set<URI> errorURIs = compile(scope);
+			visitAST(scope, Collections.emptySet(), errorURIs);
 			// Build the full dependency graph after initial compilation
 			if (scope.getAstVisitor() != null) {
 				scope.getDependencyGraph().clear();
@@ -468,11 +557,11 @@ public class CompilationService {
 
 		boolean isSameUnit = createOrUpdateCompilationUnit(scope, affectedDependents);
 		clearProcessedChanges(scope, changedSnapshot);
-		compile(scope);
+		Set<URI> errorURIs = compile(scope);
 		if (isSameUnit) {
-			visitAST(scope, allAffectedURIs);
+			visitAST(scope, allAffectedURIs, errorURIs);
 		} else {
-			visitAST(scope);
+			visitAST(scope, Collections.emptySet(), errorURIs);
 		}
 
 		updateDependencyGraph(scope, allAffectedURIs);
@@ -509,8 +598,14 @@ public class CompilationService {
 
 		ErrorCollector collector = compilationOrchestrator.compileIncremental(incrementalUnit, scope.getProjectRoot());
 
+		Set<URI> errorURIs = collector != null ? extractErrorURIs(collector) : Collections.emptySet();
+
+		ASTNodeVisitor oldVisitor = scope.getAstVisitor();
 		ASTNodeVisitor newVisitor = compilationOrchestrator.visitAST(
 				incrementalUnit, scope.getAstVisitor(), changedPlusContext);
+
+		// Preserve last-known-good AST for files with errors
+		preserveASTForErrorFiles(newVisitor, oldVisitor, errorURIs);
 
 		Map<String, ClassSignature> newSignatures = captureClassSignatures(newVisitor, changedPlusContext);
 		if (!oldSignatures.equals(newSignatures)) {

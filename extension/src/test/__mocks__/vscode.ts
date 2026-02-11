@@ -17,6 +17,8 @@ const workspace = {
     onDidDelete: vi.fn(),
     dispose: vi.fn(),
   }),
+  findFiles: vi.fn().mockResolvedValue([]),
+  registerTextDocumentContentProvider: vi.fn().mockReturnValue({ dispose: vi.fn() }),
 };
 
 const window = {

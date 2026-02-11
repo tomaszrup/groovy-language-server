@@ -362,6 +362,72 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 	}
 
 	/**
+	 * Returns the number of AST nodes recorded for the given source file.
+	 *
+	 * @param uri the source file URI
+	 * @return the node count, or 0 if no data for that URI
+	 */
+	public int getNodeCount(URI uri) {
+		List<ASTNode> nodes = nodesByURI.get(uri);
+		return nodes != null ? nodes.size() : 0;
+	}
+
+	/**
+	 * Restores AST data for a specific URI from a previous (last-known-good)
+	 * visitor into this visitor. This is used to preserve semantic token data
+	 * when a recompilation produces a degraded AST due to syntax errors.
+	 *
+	 * <p>Any existing data for the URI in this visitor is replaced.</p>
+	 *
+	 * @param uri      the source file URI to restore
+	 * @param previous the previous visitor containing good data for the URI
+	 */
+	public void restoreFromPrevious(URI uri, ASTNodeVisitor previous) {
+		if (previous == null || uri == null) {
+			return;
+		}
+
+		// Restore nodes
+		List<ASTNode> prevNodes = previous.nodesByURI.get(uri);
+		if (prevNodes != null) {
+			nodesByURI.put(uri, prevNodes);
+		}
+
+		// Restore class nodes
+		List<ClassNode> prevClassNodes = previous.classNodesByURI.get(uri);
+		if (prevClassNodes != null) {
+			// Remove any class names from the new compilation for this URI
+			List<ClassNode> currentClassNodes = classNodesByURI.get(uri);
+			if (currentClassNodes != null) {
+				for (ClassNode cn : currentClassNodes) {
+					classNodesByName.remove(cn.getName());
+				}
+			}
+			classNodesByURI.put(uri, prevClassNodes);
+			// Restore class names from previous
+			for (ClassNode cn : prevClassNodes) {
+				classNodesByName.put(cn.getName(), cn);
+			}
+		}
+
+		// Restore dependencies
+		Set<String> prevDeps = previous.dependenciesByURI.get(uri);
+		if (prevDeps != null) {
+			dependenciesByURI.put(uri, prevDeps);
+		}
+
+		// Restore lookup entries for the URI
+		// First remove any new lookup entries for this URI
+		lookup.entrySet().removeIf(entry -> uri.equals(entry.getValue().uri));
+		// Then copy from previous
+		for (Map.Entry<ASTLookupKey, ASTNodeLookupData> entry : previous.lookup.entrySet()) {
+			if (uri.equals(entry.getValue().uri)) {
+				lookup.put(entry.getKey(), entry.getValue());
+			}
+		}
+	}
+
+	/**
 	 * Creates a new {@code ASTNodeVisitor} that is a copy-on-write snapshot
 	 * of this visitor. Data for URIs in {@code excludedURIs} is omitted from
 	 * the copy (those URIs are about to be re-visited from fresh compilation

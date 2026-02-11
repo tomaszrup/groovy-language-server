@@ -214,11 +214,11 @@ public class FileChangeHandler {
 					if (!didFullCompile) {
 						boolean isSameUnit = compilationService.createOrUpdateCompilationUnit(scope);
 						compilationService.resetChangedFilesForScope(scope);
-						compilationService.compile(scope);
+						Set<URI> errorURIs = compilationService.compile(scope);
 						if (isSameUnit) {
-							compilationService.visitAST(scope, scopeUris);
+							compilationService.visitAST(scope, scopeUris, errorURIs);
 						} else {
-							compilationService.visitAST(scope);
+							compilationService.visitAST(scope, java.util.Collections.emptySet(), errorURIs);
 						}
 						compilationService.updateDependencyGraph(scope, scopeUris);
 					}

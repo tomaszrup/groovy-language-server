@@ -25,6 +25,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
+import com.google.gson.JsonObject;
+
 /**
  * Abstraction for build-tool-specific project discovery, classpath resolution,
  * and recompilation. Implementations exist for Gradle and Maven.
@@ -119,4 +121,92 @@ public interface ProjectImporter {
      * pom.xml).
      */
     boolean isProjectFile(String filePath);
+
+    // ── Methods with default no-op implementations ───────────────────────
+    // These allow callers to work with the ProjectImporter abstraction
+    // without casting to specific subclasses.
+
+    /**
+     * Returns {@code true} if this importer claims the given project root
+     * (i.e. a build file for this build tool exists in the directory).
+     * Used during project discovery to map roots to importers.
+     *
+     * @param projectRoot the project root directory to check
+     * @return {@code true} if this importer's build file exists in the directory
+     */
+    boolean claimsProject(Path projectRoot);
+
+    /**
+     * Set an upper bound for build-tool root searches so they stop at the
+     * workspace root instead of walking to the filesystem root.
+     * Only meaningful for build tools with hierarchical project structures
+     * (e.g. Gradle multi-project builds).
+     *
+     * @param workspaceBound the workspace root path
+     */
+    default void setWorkspaceBound(Path workspaceBound) {
+        // No-op by default — only Gradle needs this
+    }
+
+    /**
+     * Apply build-tool-specific settings from the VS Code configuration.
+     * Implementations should extract relevant keys from the JSON object
+     * and configure themselves accordingly (e.g. Maven home path).
+     *
+     * @param settings the {@code "groovy"} section of VS Code settings
+     */
+    default void applySettings(JsonObject settings) {
+        // No-op by default
+    }
+
+    /**
+     * Download source JARs for dependencies of the given project in the
+     * background. This is a best-effort operation for "Go to Definition"
+     * support. Only meaningful for build tools that support source artifact
+     * resolution (e.g. Gradle).
+     *
+     * @param projectRoot the project root to download sources for
+     */
+    default void downloadSourceJarsAsync(Path projectRoot) {
+        // No-op by default — not all build tools support this
+    }
+
+    /**
+     * Returns the build-tool root for the given project root. For Gradle,
+     * this is the nearest ancestor with {@code settings.gradle}; for Maven,
+     * this is the project root itself. Used by backfill logic to batch
+     * sibling subproject resolution.
+     *
+     * @param projectRoot the project root to look up
+     * @return the build-tool root directory (defaults to {@code projectRoot})
+     */
+    default Path getBuildToolRoot(Path projectRoot) {
+        return projectRoot;
+    }
+
+    /**
+     * Resolve classpaths for subprojects under a specific build-tool root.
+     * Used by backfill logic to batch-resolve sibling subprojects sharing
+     * the same root (e.g. Gradle multi-project builds).
+     *
+     * <p>The default implementation delegates to {@link #resolveClasspaths}.</p>
+     *
+     * @param buildToolRoot the build-tool root directory
+     * @param subprojects   the subprojects to resolve under that root
+     * @return map from subproject root to its classpath entries
+     */
+    default Map<Path, List<String>> resolveClasspathsForRoot(Path buildToolRoot, List<Path> subprojects) {
+        return resolveClasspaths(subprojects);
+    }
+
+    /**
+     * Returns {@code true} if this importer supports batching sibling
+     * subprojects under a shared root for more efficient resolution.
+     * When {@code false}, the backfill coordinator skips sibling batching.
+     *
+     * @return {@code true} if sibling batching is supported
+     */
+    default boolean supportsSiblingBatching() {
+        return false;
+    }
 }

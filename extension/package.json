@@ -2,7 +2,7 @@
   "name": "groovy-spock-support",
   "displayName": "Groovy & Spock Language Support",
   "description": "Language support for Groovy and Spock",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "publisher": "TomaszRup",
   "homepage": "https://github.com/tomaszrup/groovy-language-server",
   "repository": {
@@ -32,9 +32,9 @@
     "test": "vitest run"
   },
   "devDependencies": {
-    "@types/node": "^20.17.50",
+    "@types/node": "^22.15.0",
     "@types/vscode": "^1.99.0",
-    "vitest": "^3.0.0",
+    "vitest": "^3.1.1",
     "ts-loader": "^9.5.2",
     "typescript": "^5.8.3",
     "@vscode/vsce": "^3.4.2",
