@@ -88,8 +88,20 @@ public class ProjectScope {
 	 * deferred/lazy compilation: scopes registered via {@code addProjects}
 	 * are not compiled eagerly — compilation is deferred until the first
 	 * request that actually needs the AST.
+	 *
+	 * <p>Set to {@code true} after staged Phase A (single-file) or full
+	 * compilation completes, so that subsequent LSP requests (e.g. semantic
+	 * tokens, hover) don't trigger redundant compilation.</p>
 	 */
 	private volatile boolean compiled = false;
+
+	/**
+	 * Whether this scope has completed a <b>full</b> project compilation
+	 * (all source files). Used by staged compilation: Phase A (single-file)
+	 * sets {@code compiled=true} but not {@code fullyCompiled}, so Phase B
+	 * knows to run the background full compilation.
+	 */
+	private volatile boolean fullyCompiled = false;
 
 	/**
 	 * Whether this scope's classpath has been resolved (dependency JARs
@@ -208,6 +220,14 @@ public class ProjectScope {
 		this.compiled = compiled;
 	}
 
+	public boolean isFullyCompiled() {
+		return fullyCompiled;
+	}
+
+	public void setFullyCompiled(boolean fullyCompiled) {
+		this.fullyCompiled = fullyCompiled;
+	}
+
 	public boolean isClasspathResolved() {
 		return classpathResolved;
 	}
@@ -232,6 +252,7 @@ public class ProjectScope {
 	public void resetCompilationFailed() {
 		this.compilationFailed = false;
 		this.compiled = false;
+		this.fullyCompiled = false;
 	}
 
 	/**
@@ -352,6 +373,7 @@ public class ProjectScope {
 
 		// Reset compilation state so next access triggers recompilation
 		compiled = false;
+		fullyCompiled = false;
 		compilationFailed = false;
 		evicted = true;
 

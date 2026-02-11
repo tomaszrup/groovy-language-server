@@ -80,10 +80,12 @@ export async function estimateHeapSize(): Promise<number> {
   const evictionEnabled = evictionTTL > 0;
 
   // Each active scope with AST + classloader + ClassGraph scan realistically
-  // needs ~40-80 MB. With eviction, only a handful of scopes are loaded at
-  // once; without eviction, every discovered project is potentially active.
+  // needs ~100-160 MB based on real-world usage. With eviction, only a handful
+  // of scopes are loaded at once; without eviction, every discovered project
+  // is potentially active.
   const MAX_ACTIVE_SCOPES = 8;
-  const PER_PROJECT_MB = evictionEnabled ? 48 : 64;
+  const perProjectMB = config.get<number>("memory.perProjectMB") ?? 128;
+  const PER_PROJECT_MB = evictionEnabled ? perProjectMB : Math.floor(perProjectMB * 1.25);
 
   try {
     const buildFiles = await vscode.workspace.findFiles(

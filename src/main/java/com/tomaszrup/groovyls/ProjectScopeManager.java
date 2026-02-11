@@ -126,6 +126,7 @@ public class ProjectScopeManager {
 			this.workspaceRoot = workspaceRoot;
 			ProjectScope ds = new ProjectScope(workspaceRoot, defaultScope.getCompilationUnitFactory());
 			ds.setCompiled(false);
+			ds.setFullyCompiled(false);
 			ds.setClasspathResolved(true);
 			this.defaultScope = ds;
 			scopeCache.clear();
@@ -327,8 +328,7 @@ public class ProjectScopeManager {
 					if (scope.isCompiled()) {
 						logger.info("Forcing recompilation of {} with resolved classpath",
 								scope.getProjectRoot());
-						scope.setCompiled(false);
-						scope.setCompilationUnit(null);
+						scope.setCompiled(false);					scope.setFullyCompiled(false);						scope.setCompilationUnit(null);
 						scope.setAstVisitor(null);
 					}
 				} finally {
@@ -368,6 +368,7 @@ public class ProjectScopeManager {
 			if (scope.isCompiled()) {
 				logger.info("Forcing recompilation of {} with newly resolved classpath", projectRoot);
 				scope.setCompiled(false);
+				scope.setFullyCompiled(false);
 				scope.setCompilationUnit(null);
 				scope.setAstVisitor(null);
 			}
@@ -485,6 +486,7 @@ public class ProjectScopeManager {
 			ds.getCompilationUnitFactory().setAdditionalClasspathList(classpathList);
 			// Mark as needing recompilation
 			ds.setCompiled(false);
+			ds.setFullyCompiled(false);
 		}
 	}
 

@@ -2,7 +2,7 @@
   "name": "groovy-spock-support",
   "displayName": "Groovy & Spock Language Support",
   "description": "Language support for Groovy and Spock",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "publisher": "TomaszRup",
   "homepage": "https://github.com/tomaszrup/groovy-language-server",
   "repository": {
@@ -187,6 +187,13 @@
           "type": "boolean",
           "default": false,
           "description": "When true, opening a file in one Gradle subproject automatically resolves classpaths for all sibling subprojects in the background. This improves cross-project navigation but increases memory usage. When false (default), each project's classpath is resolved on demand when you first open a file in it."
+        },
+        "groovy.memory.perProjectMB": {
+          "type": "number",
+          "default": 128,
+          "minimum": 32,
+          "maximum": 512,
+          "description": "Memory (in MB) allocated per project when auto-sizing the heap. With scope eviction enabled (default), up to 8 active projects use this allocation. Without eviction, all discovered projects count. Default: 128 MB."
         }
       }
     }

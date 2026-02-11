@@ -377,18 +377,24 @@ public class CompilationService {
 				long stageElapsed = System.currentTimeMillis() - stageStart;
 				logger.info("Staged Phase A for {} completed in {}ms (single-file diagnostic)",
 						scope.getProjectRoot(), stageElapsed);
+
+				// Mark as compiled so semantic tokens requests don't trigger
+				// redundant compilation while Phase B is running in background.
+				// Phase A provides a partial but usable AST for immediate feedback.
+				scope.setCompiled(true);
 			}
 
 			// Phase B: schedule full compilation in the background
 			backgroundCompiler.submit(() -> {
 				scope.getLock().writeLock().lock();
 				try {
-					// Guard: another Phase B (or standard compilation) may
-					// have completed while this task was queued.  This
-					// prevents N open tabs from causing N full compilations
-					// of the same project during startup.
-					if (scope.isCompiled()) {
-						logger.debug("Phase B skipped for {} — already compiled",
+					// Guard: another Phase B (or standard full compilation) may
+					// have completed while this task was queued.  This prevents
+					// N open tabs from causing N full compilations of the same
+					// project during startup.  Check fullyCompiled instead of
+					// compiled so Phase B runs even though Phase A set compiled=true.
+					if (scope.isFullyCompiled()) {
+						logger.debug("Phase B skipped for {} — already fully compiled",
 								scope.getProjectRoot());
 						return;
 					}
@@ -441,6 +447,7 @@ public class CompilationService {
 			// Always mark as compiled to prevent infinite retry loops.
 			// Even after OOM, retrying immediately would just OOM again.
 			scope.setCompiled(true);
+			scope.setFullyCompiled(true);
 			// If this scope was evicted, clear the evicted flag and update
 			// the last access time so it doesn't get immediately re-evicted.
 			if (scope.isEvicted()) {
@@ -568,6 +575,7 @@ public class CompilationService {
 
 		scope.setPreviousContext(contextURI);
 		scope.setCompiled(true);
+		scope.setFullyCompiled(true);
 	}
 
 	/**
@@ -821,6 +829,7 @@ public class CompilationService {
 		}
 		scope.setPreviousContext(null);
 		scope.setCompiled(true);
+		scope.setFullyCompiled(true);
 	}
 
 	/**
