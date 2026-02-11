@@ -114,6 +114,8 @@ let outputChannel: vscode.OutputChannel | null = null;
 let statusBarItem: vscode.StatusBarItem | null = null;
 /** Last known memory usage string from the server (e.g. "128/512 MB"). */
 let lastMemoryText: string | null = null;
+/** Last known scope counts from the server. */
+let lastScopeCounts: { active: number; evicted: number; total: number } | null = null;
 /** Current status bar state, used to re-render when memory updates arrive. */
 let currentStatusState: "starting" | "importing" | "ready" | "error" | "stopped" = "stopped";
 
@@ -181,12 +183,21 @@ export function setStatusBar(
       statusBarItem.show();
       break;
     }
-    case "ready":
+    case "ready": {
       statusBarItem.text = `$(check) Groovy${memSuffix}`;
-      statusBarItem.tooltip =
-        "Groovy Language Server: Ready (click to show output)";
+      let tooltip = "Groovy Language Server: Ready";
+      if (lastScopeCounts && lastScopeCounts.total > 0) {
+        tooltip += ` (${lastScopeCounts.active} active`;
+        if (lastScopeCounts.evicted > 0) {
+          tooltip += `, ${lastScopeCounts.evicted} evicted`;
+        }
+        tooltip += ` of ${lastScopeCounts.total} projects)`;
+      }
+      tooltip += " — click to show output";
+      statusBarItem.tooltip = tooltip;
       statusBarItem.show();
       break;
+    }
     case "error":
       statusBarItem.text = "$(error) Groovy";
       statusBarItem.tooltip =
@@ -233,7 +244,8 @@ function onDidChangeConfiguration(event: vscode.ConfigurationChangeEvent) {
     event.affectsConfiguration("groovy.semanticHighlighting.enabled") ||
     event.affectsConfiguration("groovy.formatting.enabled") ||
     event.affectsConfiguration("groovy.memory.scopeEvictionTTL") ||
-    event.affectsConfiguration("groovy.memory.backfillSiblingProjects")
+    event.affectsConfiguration("groovy.memory.backfillSiblingProjects") ||
+    event.affectsConfiguration("groovy.memory.pressureThreshold")
   ) {
     javaPath = findJava();
     //we're going to try to kill the language server and then restart
@@ -305,6 +317,11 @@ export function buildInitializationOptions(): Record<string, unknown> {
   const backfillSiblings = config.get<boolean>("memory.backfillSiblingProjects");
   if (backfillSiblings !== undefined) {
     options.backfillSiblingProjects = backfillSiblings;
+  }
+  const pressureThreshold = config.get<number>("memory.pressureThreshold");
+  if (pressureThreshold !== undefined) {
+    // Convert from percentage (30-95) to ratio (0.30-0.95) for the server
+    options.memoryPressureThreshold = pressureThreshold / 100;
   }
 
   return options;
@@ -595,8 +612,15 @@ function startLanguageServer() {
           });
 
           // Listen for periodic memory usage reports from the server
-          languageClient.onNotification("groovy/memoryUsage", (params: { usedMB: number; maxMB: number }) => {
+          languageClient.onNotification("groovy/memoryUsage", (params: { usedMB: number; maxMB: number; activeScopes?: number; evictedScopes?: number; totalScopes?: number }) => {
             lastMemoryText = `${params.usedMB}/${params.maxMB} MB`;
+            if (params.totalScopes !== undefined && params.totalScopes > 0) {
+              lastScopeCounts = {
+                active: params.activeScopes ?? 0,
+                evicted: params.evictedScopes ?? 0,
+                total: params.totalScopes,
+              };
+            }
             // Re-render the status bar if we're in "ready" state
             if (currentStatusState === "ready") {
               setStatusBar("ready");

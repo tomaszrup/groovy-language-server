@@ -20,6 +20,7 @@
 package com.tomaszrup.groovyls.compiler;
 
 import java.io.IOException;
+import java.lang.ref.SoftReference;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.charset.StandardCharsets;
@@ -120,17 +121,35 @@ public class SharedClassGraphCache {
 	}
 
 	/**
-	 * A cached entry: the scan result and its current reference count.
+	 * A cached entry: the scan result (wrapped in a {@link SoftReference} so
+	 * the GC can reclaim it under memory pressure) and its current reference
+	 * count.  When the soft reference is cleared, the entry is transparently
+	 * reloaded from the on-disk cache or re-scanned.
 	 */
 	static final class CacheEntry {
-		final ScanResult scanResult;
+		volatile SoftReference<ScanResult> scanResultRef;
 		final String classpathKey;
 		int refCount;
 
 		CacheEntry(ScanResult scanResult, String classpathKey) {
-			this.scanResult = scanResult;
+			this.scanResultRef = new SoftReference<>(scanResult);
 			this.classpathKey = classpathKey;
 			this.refCount = 1;
+		}
+
+		/**
+		 * Returns the scan result, or {@code null} if the GC has cleared
+		 * the soft reference.
+		 */
+		ScanResult get() {
+			return scanResultRef.get();
+		}
+
+		/**
+		 * Replace the scan result (e.g. after re-loading from disk).
+		 */
+		void set(ScanResult scanResult) {
+			this.scanResultRef = new SoftReference<>(scanResult);
 		}
 	}
 
@@ -161,10 +180,30 @@ public class SharedClassGraphCache {
 		String key = computeClasspathKey(classLoader);
 		CacheEntry entry = cache.get(key);
 		if (entry != null) {
-			entry.refCount++;
-			logger.debug("SharedClassGraphCache HIT for key {}… (refCount={}), cache size={}",
-					key.substring(0, Math.min(12, key.length())), entry.refCount, cache.size());
-			return entry.scanResult;
+			ScanResult existing = entry.get();
+			if (existing != null) {
+				entry.refCount++;
+				logger.debug("SharedClassGraphCache HIT for key {}… (refCount={}), cache size={}",
+						key.substring(0, Math.min(12, key.length())), entry.refCount, cache.size());
+				return existing;
+			}
+			// SoftReference was cleared by GC — reload from disk or rescan
+			logger.info("SharedClassGraphCache: SoftReference cleared for key {}… — reloading",
+					key.substring(0, Math.min(12, key.length())));
+			reverseIndex.values().remove(key);
+			ScanResult reloaded = loadFromDisk(key);
+			if (reloaded != null) {
+				entry.set(reloaded);
+				entry.refCount++;
+				reverseIndex.put(reloaded, key);
+				logger.info("SharedClassGraphCache: reloaded from disk for key {}…",
+						key.substring(0, Math.min(12, key.length())));
+				return reloaded;
+			}
+			// Disk cache also missing — need full rescan
+			cache.remove(key);
+			logger.info("SharedClassGraphCache: disk cache miss for key {}… — full rescan needed",
+					key.substring(0, Math.min(12, key.length())));
 		}
 
 		// Try loading from disk cache
@@ -253,6 +292,8 @@ public class SharedClassGraphCache {
 		if (entry.refCount <= 0) {
 			cache.remove(key);
 			reverseIndex.remove(scanResult);
+			// Clear the soft reference and close the scan result
+			entry.scanResultRef.clear();
 			scanResult.close();
 			logger.debug("SharedClassGraphCache evicted entry for key {}…, cache size={}",
 					key.substring(0, Math.min(12, key.length())), cache.size());
@@ -277,8 +318,12 @@ public class SharedClassGraphCache {
 						+ "Evicting unused entry for key {}…",
 						cache.size(), MAX_HELD_SCANS,
 						ce.classpathKey.substring(0, Math.min(12, ce.classpathKey.length())));
-				reverseIndex.remove(ce.scanResult);
-				ce.scanResult.close();
+				ScanResult sr = ce.get();
+				if (sr != null) {
+					reverseIndex.remove(sr);
+					ce.scanResultRef.clear();
+					sr.close();
+				}
 				iterator.remove();
 			}
 		}
@@ -354,7 +399,11 @@ public class SharedClassGraphCache {
 	public synchronized void clear() {
 		for (CacheEntry entry : cache.values()) {
 			try {
-				entry.scanResult.close();
+				ScanResult sr = entry.get();
+				if (sr != null) {
+					entry.scanResultRef.clear();
+					sr.close();
+				}
 			} catch (Exception e) {
 				logger.debug("Error closing ScanResult during cache clear", e);
 			}

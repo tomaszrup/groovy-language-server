@@ -24,6 +24,9 @@ package com.tomaszrup.groovyls;
  *
  * <p>Sent periodically from the server to the client so the extension
  * can display JVM heap usage in the status bar.</p>
+ *
+ * <p>Fields beyond {@code usedMB}/{@code maxMB} are optional and will
+ * be zero/absent when the scope manager is not yet initialized.</p>
  */
 public class MemoryUsageParams {
 
@@ -33,12 +36,29 @@ public class MemoryUsageParams {
     /** Maximum heap memory in megabytes. */
     private int maxMB;
 
+    /** Number of project scopes currently compiled and active (not evicted). */
+    private int activeScopes;
+
+    /** Number of project scopes whose heavy state has been evicted. */
+    private int evictedScopes;
+
+    /** Total number of discovered project scopes (active + evicted + uncompiled). */
+    private int totalScopes;
+
     public MemoryUsageParams() {
     }
 
     public MemoryUsageParams(int usedMB, int maxMB) {
         this.usedMB = usedMB;
         this.maxMB = maxMB;
+    }
+
+    public MemoryUsageParams(int usedMB, int maxMB, int activeScopes, int evictedScopes, int totalScopes) {
+        this.usedMB = usedMB;
+        this.maxMB = maxMB;
+        this.activeScopes = activeScopes;
+        this.evictedScopes = evictedScopes;
+        this.totalScopes = totalScopes;
     }
 
     public int getUsedMB() {
@@ -55,5 +75,29 @@ public class MemoryUsageParams {
 
     public void setMaxMB(int maxMB) {
         this.maxMB = maxMB;
+    }
+
+    public int getActiveScopes() {
+        return activeScopes;
+    }
+
+    public void setActiveScopes(int activeScopes) {
+        this.activeScopes = activeScopes;
+    }
+
+    public int getEvictedScopes() {
+        return evictedScopes;
+    }
+
+    public void setEvictedScopes(int evictedScopes) {
+        this.evictedScopes = evictedScopes;
+    }
+
+    public int getTotalScopes() {
+        return totalScopes;
+    }
+
+    public void setTotalScopes(int totalScopes) {
+        this.totalScopes = totalScopes;
     }
 }

@@ -265,6 +265,10 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                 scopeEvictionTTLSeconds = opts.get("scopeEvictionTTLSeconds").getAsLong();
                 logger.info("Scope eviction TTL: {}s", scopeEvictionTTLSeconds);
             }
+            if (opts.has("memoryPressureThreshold") && opts.get("memoryPressureThreshold").isJsonPrimitive()) {
+                double threshold = opts.get("memoryPressureThreshold").getAsDouble();
+                groovyServices.getScopeManager().setMemoryPressureThreshold(threshold);
+            }
         }
 
         // Apply memory settings to scope manager
@@ -749,7 +753,9 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                 long maxBytes = rt.maxMemory();
                 int usedMB = (int) (usedBytes / (1024 * 1024));
                 int maxMB = (int) (maxBytes / (1024 * 1024));
-                client.memoryUsage(new MemoryUsageParams(usedMB, maxMB));
+                int[] counts = groovyServices.getScopeManager().getScopeCounts();
+                client.memoryUsage(new MemoryUsageParams(usedMB, maxMB,
+                        counts[0], counts[1], counts[2]));
             } catch (Exception e) {
                 // Ignore — client may have disconnected
             }

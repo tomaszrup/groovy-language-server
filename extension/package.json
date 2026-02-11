@@ -194,6 +194,13 @@
           "minimum": 32,
           "maximum": 512,
           "description": "Memory (in MB) allocated per project when auto-sizing the heap. With scope eviction enabled (default), up to 8 active projects use this allocation. Without eviction, all discovered projects count. Default: 128 MB."
+        },
+        "groovy.memory.pressureThreshold": {
+          "type": "number",
+          "default": 75,
+          "minimum": 30,
+          "maximum": 95,
+          "description": "Heap usage percentage at which the language server triggers emergency scope eviction. When the JVM heap exceeds this threshold, the least-recently-used inactive scope is evicted immediately regardless of the TTL timer. Lower values are more aggressive (evict sooner). Default: 75%."
         }
       }
     }

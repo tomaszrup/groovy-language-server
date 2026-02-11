@@ -50,6 +50,27 @@ public interface ICompilationUnitFactory {
 	public void setAdditionalClasspathList(List<String> classpathList);
 
 	/**
+	 * Returns test-only classpath entries, or {@code null} if not separated.
+	 */
+	default List<String> getTestOnlyClasspathList() {
+		return null;
+	}
+
+	/**
+	 * Set test-only classpath entries separately from the main classpath.
+	 */
+	default void setTestOnlyClasspathList(List<String> testOnlyClasspathList) {
+		// no-op by default
+	}
+
+	/**
+	 * Returns the combined classpath (main + test-only).
+	 */
+	default List<String> getCombinedClasspathList() {
+		return getAdditionalClasspathList();
+	}
+
+	/**
 	 * Returns a compilation unit.
 	 */
 	public GroovyLSCompilationUnit create(Path workspaceRoot, FileContentsTracker fileContentsTracker);

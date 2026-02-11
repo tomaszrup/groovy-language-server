@@ -20,6 +20,7 @@
 ////////////////////////////////////////////////////////////////////////////////
 package com.tomaszrup.groovyls.compiler.ast;
 
+import java.lang.ref.SoftReference;
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -155,26 +156,39 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 
 	/**
 	 * Lazily-built reverse index: definition node → list of referencing nodes.
-	 * Built on first {@link #getReferenceIndex()} call after each compilation,
-	 * automatically invalidated when the visitor is replaced (copy-on-write).
+	 * Wrapped in a {@link SoftReference} so the GC can reclaim it under memory
+	 * pressure — it will be transparently rebuilt on the next
+	 * {@link #getReferenceIndex()} access.  Automatically invalidated when the
+	 * visitor is replaced (copy-on-write).
 	 */
-	private volatile Map<ASTNode, List<ASTNode>> referenceIndex;
+	private volatile SoftReference<Map<ASTNode, List<ASTNode>>> referenceIndexRef;
 
 	/**
 	 * Returns the lazily-built reference index, or {@code null} if it hasn't
-	 * been built yet. Callers should use
-	 * {@link #setReferenceIndex(Map)} to store a freshly built index.
+	 * been built yet <em>or</em> the GC reclaimed it.  Callers should use
+	 * {@link #setReferenceIndex(Map)} to store a freshly built index when
+	 * this returns {@code null}.
 	 */
 	public Map<ASTNode, List<ASTNode>> getReferenceIndex() {
-		return referenceIndex;
+		SoftReference<Map<ASTNode, List<ASTNode>>> ref = referenceIndexRef;
+		return ref != null ? ref.get() : null;
 	}
 
 	/**
 	 * Stores a pre-built reference index. The index maps each definition
-	 * node to the list of AST nodes that reference it.
+	 * node to the list of AST nodes that reference it.  The map is wrapped
+	 * in a {@link SoftReference} to allow GC reclamation under memory pressure.
 	 */
 	public void setReferenceIndex(Map<ASTNode, List<ASTNode>> index) {
-		this.referenceIndex = index;
+		this.referenceIndexRef = (index != null) ? new SoftReference<>(index) : null;
+	}
+
+	/**
+	 * Explicitly clears the reference index to free memory.  It will be
+	 * lazily rebuilt on the next {@code getReferences()} call.
+	 */
+	public void clearReferenceIndex() {
+		this.referenceIndexRef = null;
 	}
 
 	private void pushASTNode(ASTNode node) {
@@ -332,6 +346,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		classNodesByName.clear();
 		lookup.clear();
 		dependenciesByURI.clear();
+		clearReferenceIndex();
 		unit.iterator().forEachRemaining(sourceUnit -> {
 			visitSourceUnit(sourceUnit);
 		});

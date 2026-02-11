@@ -534,29 +534,62 @@ public class GradleProjectImporter implements ProjectImporter {
      * The output is tagged with the project directory so we can attribute
      * each classpath entry to the correct subproject.
      *
-     * <p>Output format: {@code GROOVYLS_CP:<projectDir>:<classpathEntry>}</p>
+     * <p>Output format: {@code GROOVYLS_CP_MAIN:<projectDir>:<classpathEntry>}
+     * for production dependencies and {@code GROOVYLS_CP_TEST:<projectDir>:<classpathEntry>}
+     * for test-only dependencies. The parser collects both; entries from
+     * {@code testCompileClasspath} that are not already in
+     * {@code compileClasspath}/{@code runtimeClasspath} are tagged as TEST.</p>
      */
     private Map<String, List<String>> resolveAllClasspathsViaInitScript(ProjectConnection connection) {
+        return resolveAllClasspathsViaInitScript(connection, null);
+    }
+
+    /**
+     * Overload that also populates a separate map of test-only classpath
+     * entries per project.
+     *
+     * @param connection        Tooling API connection
+     * @param testOnlyByProject if non-null, populated with test-only entries
+     * @return map of projectDir → full classpath (main + test)
+     */
+    private Map<String, List<String>> resolveAllClasspathsViaInitScript(
+            ProjectConnection connection,
+            Map<String, List<String>> testOnlyByProject) {
         // Use LinkedHashSet per project to deduplicate entries from overlapping
         // Gradle configurations (compileClasspath, runtimeClasspath, etc.)
-        Map<String, Set<String>> dedupByProject = new LinkedHashMap<>();
+        Map<String, Set<String>> mainByProject = new LinkedHashMap<>();
+        Map<String, Set<String>> testByProject = new LinkedHashMap<>();
         Path initScript = null;
         try {
             initScript = TempFileUtils.createSecureTempFile("groovyls-init", ".gradle");
+            // Resolve main configs first, then test configs, each tagged separately.
+            // This lets the Java parser differentiate main vs test-only entries.
             String initScriptContent =
                 "allprojects {\n" +
                 "    tasks.register('_groovyLSResolveClasspath') {\n" +
                 "        doLast {\n" +
-                "            ['testCompileClasspath', 'runtimeClasspath'].each { configName ->\n" +
+                "            def mainFiles = new LinkedHashSet()\n" +
+                "            ['compileClasspath', 'runtimeClasspath'].each { configName ->\n" +
                 "                def config = configurations.findByName(configName)\n" +
                 "                if (config != null && config.canBeResolved) {\n" +
                 "                    try {\n" +
                 "                        config.files.each { f ->\n" +
-                "                            println \"GROOVYLS_CP:${project.projectDir.absolutePath}:${f.absolutePath}\"\n" +
+                "                            mainFiles.add(f.absolutePath)\n" +
+                "                            println \"GROOVYLS_CP_MAIN:${project.projectDir.absolutePath}:${f.absolutePath}\"\n" +
                 "                        }\n" +
-                "                    } catch (Exception e) {\n" +
-                "                        // skip unresolvable configurations\n" +
-                "                    }\n" +
+                "                    } catch (Exception e) { /* skip */ }\n" +
+                "                }\n" +
+                "            }\n" +
+                "            ['testCompileClasspath', 'testRuntimeClasspath'].each { configName ->\n" +
+                "                def config = configurations.findByName(configName)\n" +
+                "                if (config != null && config.canBeResolved) {\n" +
+                "                    try {\n" +
+                "                        config.files.each { f ->\n" +
+                "                            if (!mainFiles.contains(f.absolutePath)) {\n" +
+                "                                println \"GROOVYLS_CP_TEST:${project.projectDir.absolutePath}:${f.absolutePath}\"\n" +
+                "                            }\n" +
+                "                        }\n" +
+                "                    } catch (Exception e) { /* skip */ }\n" +
                 "                }\n" +
                 "            }\n" +
                 "        }\n" +
@@ -575,25 +608,39 @@ public class GradleProjectImporter implements ProjectImporter {
             String output = baos.toString("UTF-8");
             for (String line : output.split("\\r?\\n")) {
                 line = line.trim();
-                if (line.startsWith("GROOVYLS_CP:")) {
-                    String rest = line.substring("GROOVYLS_CP:".length());
-                    // Format: <projectDir>:<classpathEntry>
-                    // On Windows, projectDir contains ":" (e.g. C:\...), so we
-                    // split carefully: find the last path separator pattern
-                    int separatorIdx = findProjectDirSeparator(rest);
-                    if (separatorIdx < 0) {
-                        continue;
+                boolean isMain = line.startsWith("GROOVYLS_CP_MAIN:");
+                boolean isTest = line.startsWith("GROOVYLS_CP_TEST:");
+                // Backward compat: also accept old untagged format
+                boolean isLegacy = !isMain && !isTest && line.startsWith("GROOVYLS_CP:");
+                if (!isMain && !isTest && !isLegacy) {
+                    continue;
+                }
+                String prefix = isMain ? "GROOVYLS_CP_MAIN:"
+                               : isTest ? "GROOVYLS_CP_TEST:"
+                               : "GROOVYLS_CP:";
+                String rest = line.substring(prefix.length());
+                // Format: <projectDir>:<classpathEntry>
+                // On Windows, projectDir contains ":" (e.g. C:\...), so we
+                // split carefully: find the last path separator pattern
+                int separatorIdx = findProjectDirSeparator(rest);
+                if (separatorIdx < 0) {
+                    continue;
+                }
+                String projectDir = normalise(rest.substring(0, separatorIdx));
+                String cpEntry = rest.substring(separatorIdx + 1);
+                if (new File(cpEntry).exists()) {
+                    // Canonicalize to handle Windows drive-letter casing (C:\ vs c:\)
+                    try {
+                        cpEntry = new File(cpEntry).getCanonicalPath();
+                    } catch (IOException ignored) {
+                        // fall back to original string
                     }
-                    String projectDir = normalise(rest.substring(0, separatorIdx));
-                    String cpEntry = rest.substring(separatorIdx + 1);
-                    if (new File(cpEntry).exists()) {
-                        // Canonicalize to handle Windows drive-letter casing (C:\ vs c:\)
-                        try {
-                            cpEntry = new File(cpEntry).getCanonicalPath();
-                        } catch (IOException ignored) {
-                            // fall back to original string
-                        }
-                        dedupByProject
+                    if (isTest) {
+                        testByProject
+                                .computeIfAbsent(projectDir, k -> new LinkedHashSet<>())
+                                .add(cpEntry);
+                    } else {
+                        mainByProject
                                 .computeIfAbsent(projectDir, k -> new LinkedHashSet<>())
                                 .add(cpEntry);
                     }
@@ -601,7 +648,7 @@ public class GradleProjectImporter implements ProjectImporter {
             }
 
             logger.info("Resolved classpaths for {} project(s) via batch init script",
-                    dedupByProject.size());
+                    mainByProject.size());
         } catch (Exception e) {
             logger.warn("Could not resolve classpaths via batch init script: {}", e.getMessage());
         } finally {
@@ -612,11 +659,33 @@ public class GradleProjectImporter implements ProjectImporter {
                 }
             }
         }
-        // Convert sets to lists for the public API
+        // Convert sets to lists for the public API (combined main + test)
         Map<String, List<String>> classpathsByProject = new LinkedHashMap<>();
-        for (Map.Entry<String, Set<String>> entry : dedupByProject.entrySet()) {
-            classpathsByProject.put(entry.getKey(), new ArrayList<>(entry.getValue()));
+        Set<String> allProjects = new LinkedHashSet<>(mainByProject.keySet());
+        allProjects.addAll(testByProject.keySet());
+        for (String projectDir : allProjects) {
+            List<String> combined = new ArrayList<>();
+            Set<String> main = mainByProject.get(projectDir);
+            if (main != null) {
+                combined.addAll(main);
+            }
+            Set<String> test = testByProject.get(projectDir);
+            if (test != null) {
+                combined.addAll(test);
+            }
+            classpathsByProject.put(projectDir, combined);
+
+            // Populate test-only output map if requested
+            if (testOnlyByProject != null && test != null && !test.isEmpty()) {
+                testOnlyByProject.put(projectDir, new ArrayList<>(test));
+            }
         }
+
+        int mainTotal = mainByProject.values().stream().mapToInt(Set::size).sum();
+        int testTotal = testByProject.values().stream().mapToInt(Set::size).sum();
+        logger.info("Classpath breakdown: {} main entries, {} test-only entries across {} project(s)",
+                mainTotal, testTotal, allProjects.size());
+
         return classpathsByProject;
     }
 
@@ -656,16 +725,28 @@ public class GradleProjectImporter implements ProjectImporter {
                 "            def normalizedProjectDir = project.projectDir.absolutePath.replace('\\\\', '/')\n" +
                 "            def normalizedTargetDir = targetDir.replace('\\\\', '/')\n" +
                 "            if (normalizedProjectDir.equalsIgnoreCase(normalizedTargetDir)) {\n" +
-                "                ['testCompileClasspath', 'runtimeClasspath'].each { configName ->\n" +
+                "                def mainFiles = new LinkedHashSet()\n" +
+                "                ['compileClasspath', 'runtimeClasspath'].each { configName ->\n" +
                 "                    def config = configurations.findByName(configName)\n" +
                 "                    if (config != null && config.canBeResolved) {\n" +
                 "                        try {\n" +
                 "                            config.files.each { f ->\n" +
-                "                                println \"GROOVYLS_CP:${project.projectDir.absolutePath}:${f.absolutePath}\"\n" +
+                "                                mainFiles.add(f.absolutePath)\n" +
+                "                                println \"GROOVYLS_CP_MAIN:${project.projectDir.absolutePath}:${f.absolutePath}\"\n" +
                 "                            }\n" +
-                "                        } catch (Exception e) {\n" +
-                "                            // skip unresolvable configurations\n" +
-                "                        }\n" +
+                "                        } catch (Exception e) { /* skip */ }\n" +
+                "                    }\n" +
+                "                }\n" +
+                "                ['testCompileClasspath', 'testRuntimeClasspath'].each { configName ->\n" +
+                "                    def config = configurations.findByName(configName)\n" +
+                "                    if (config != null && config.canBeResolved) {\n" +
+                "                        try {\n" +
+                "                            config.files.each { f ->\n" +
+                "                                if (!mainFiles.contains(f.absolutePath)) {\n" +
+                "                                    println \"GROOVYLS_CP_TEST:${project.projectDir.absolutePath}:${f.absolutePath}\"\n" +
+                "                                }\n" +
+                "                            }\n" +
+                "                        } catch (Exception e) { /* skip */ }\n" +
                 "                    }\n" +
                 "                }\n" +
                 "            }\n" +
@@ -685,23 +766,30 @@ public class GradleProjectImporter implements ProjectImporter {
             String output = baos.toString("UTF-8");
             for (String line : output.split("\\r?\\n")) {
                 line = line.trim();
-                if (line.startsWith("GROOVYLS_CP:")) {
-                    String rest = line.substring("GROOVYLS_CP:".length());
-                    int separatorIdx = findProjectDirSeparator(rest);
-                    if (separatorIdx < 0) {
-                        continue;
+                boolean isMain = line.startsWith("GROOVYLS_CP_MAIN:");
+                boolean isTest = line.startsWith("GROOVYLS_CP_TEST:");
+                boolean isLegacy = !isMain && !isTest && line.startsWith("GROOVYLS_CP:");
+                if (!isMain && !isTest && !isLegacy) {
+                    continue;
+                }
+                String prefix = isMain ? "GROOVYLS_CP_MAIN:"
+                               : isTest ? "GROOVYLS_CP_TEST:"
+                               : "GROOVYLS_CP:";
+                String rest = line.substring(prefix.length());
+                int separatorIdx = findProjectDirSeparator(rest);
+                if (separatorIdx < 0) {
+                    continue;
+                }
+                String projectDir = normalise(rest.substring(0, separatorIdx));
+                String cpEntry = rest.substring(separatorIdx + 1);
+                if (new File(cpEntry).exists()) {
+                    try {
+                        cpEntry = new File(cpEntry).getCanonicalPath();
+                    } catch (IOException ignored) {
                     }
-                    String projectDir = normalise(rest.substring(0, separatorIdx));
-                    String cpEntry = rest.substring(separatorIdx + 1);
-                    if (new File(cpEntry).exists()) {
-                        try {
-                            cpEntry = new File(cpEntry).getCanonicalPath();
-                        } catch (IOException ignored) {
-                        }
-                        dedupByProject
-                                .computeIfAbsent(projectDir, k -> new LinkedHashSet<>())
-                                .add(cpEntry);
-                    }
+                    dedupByProject
+                            .computeIfAbsent(projectDir, k -> new LinkedHashSet<>())
+                            .add(cpEntry);
                 }
             }
 

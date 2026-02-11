@@ -22,6 +22,7 @@ package com.tomaszrup.groovyls.util;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.lang.ref.SoftReference;
 import java.net.URI;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
@@ -124,16 +125,16 @@ public class JavaSourceLocator {
     private static final int DECOMPILED_CACHE_MAX_ENTRIES = 256;
 
     /**
-     * Cache of decompiled class content, keyed by FQCN. Populated lazily
-     * when a class has no source file or source JAR available.
-     * Uses a bounded LRU eviction policy to prevent unbounded memory growth
-     * in workspaces with many dependency classes.
+     * Cache of decompiled class content, keyed by FQCN. Values are wrapped
+     * in {@link SoftReference} so the GC can reclaim them under memory
+     * pressure (the content can be re-decompiled on demand).
+     * Uses a bounded LRU eviction policy to prevent unbounded growth.
      */
     @SuppressWarnings("serial")
-    private final Map<String, List<String>> decompiledContentCache =
+    private final Map<String, SoftReference<List<String>>> decompiledContentCache =
             new LinkedHashMap<>(64, 0.75f, true) {
                 @Override
-                protected boolean removeEldestEntry(Map.Entry<String, List<String>> eldest) {
+                protected boolean removeEldestEntry(Map.Entry<String, SoftReference<List<String>>> eldest) {
                     return size() > DECOMPILED_CACHE_MAX_ENTRIES;
                 }
             };
@@ -168,6 +169,24 @@ public class JavaSourceLocator {
 
     /** Shared source JAR index entry (may be null if not using shared indexing). */
     private volatile SharedSourceJarIndex.IndexEntry sharedIndexEntry;
+
+    // --- SoftReference decompiled-cache helpers ---
+
+    /**
+     * Get decompiled content from the cache, returning {@code null} if the
+     * entry is missing or the soft reference has been cleared by the GC.
+     */
+    private List<String> getDecompiledCacheEntry(String className) {
+        SoftReference<List<String>> ref = decompiledContentCache.get(className);
+        return ref != null ? ref.get() : null;
+    }
+
+    /**
+     * Put decompiled content into the cache wrapped in a {@link SoftReference}.
+     */
+    private void putDecompiledCacheEntry(String className, List<String> lines) {
+        decompiledContentCache.put(className, new SoftReference<>(lines));
+    }
 
     /** The classloader used by the Groovy compiler, for locating .class files. */
     private volatile ClassLoader compilationClassLoader;
@@ -286,7 +305,7 @@ public class JavaSourceLocator {
         // now have real source available.
         int evicted = 0;
         for (String className : classNameToSourceJar.keySet()) {
-            List<String> cached = decompiledContentCache.get(className);
+            List<String> cached = getDecompiledCacheEntry(className);
             if (cached != null && isDecompiledStub(cached)) {
                 decompiledContentCache.remove(className);
                 evicted++;
@@ -666,7 +685,7 @@ public class JavaSourceLocator {
             uriToClassName.put(uri.toString(), className);
             List<String> lines = readSourceFromJar(jarEntry);
             if (lines != null) {
-                decompiledContentCache.put(className, lines);
+                putDecompiledCacheEntry(className, lines);
                 return new SourceInfo(uri, lines);
             }
             // Fall back to JAR entry reference if reading fails
@@ -1044,7 +1063,7 @@ public class JavaSourceLocator {
             return realSource.uri;
         }
 
-        decompiledContentCache.put(className, lines);
+        decompiledContentCache.put(className, new SoftReference<>(lines));
         URI classFileURI = findClassFileURI(className);
         if (classFileURI != null) {
             uriToClassName.put(classFileURI.toString(), className);
@@ -1063,7 +1082,7 @@ public class JavaSourceLocator {
      * @return the decompiled source text, or {@code null} if not cached
      */
     public String getDecompiledContent(String className) {
-        List<String> lines = decompiledContentCache.get(className);
+        List<String> lines = getDecompiledCacheEntry(className);
         if (lines == null) {
             return null;
         }
@@ -1079,7 +1098,7 @@ public class JavaSourceLocator {
      *         available or the cached content is already real source
      */
     private String refreshFromRealSourceIfAvailable(String className) {
-        List<String> cached = decompiledContentCache.get(className);
+        List<String> cached = getDecompiledCacheEntry(className);
         // Refresh if:
         // (a) the cached content is a decompiled stub, OR
         // (b) the entry was previously evicted (null) but the class name is
@@ -1090,7 +1109,7 @@ public class JavaSourceLocator {
             SourceInfo realSource = resolveSource(className);
             if (realSource != null) {
                 // resolveSource() updated decompiledContentCache with real content
-                List<String> refreshed = decompiledContentCache.get(className);
+                List<String> refreshed = getDecompiledCacheEntry(className);
                 if (refreshed != null) {
                     return String.join("\n", refreshed);
                 }
@@ -1351,7 +1370,7 @@ public class JavaSourceLocator {
         if (source != null) {
             return source;
         }
-        List<String> decompiled = decompiledContentCache.get(className);
+        List<String> decompiled = getDecompiledCacheEntry(className);
         if (decompiled != null) {
             URI uri = decompiledContentToURI(className);
             return new SourceInfo(uri, decompiled);

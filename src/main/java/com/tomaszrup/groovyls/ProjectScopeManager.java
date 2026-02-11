@@ -104,6 +104,13 @@ public class ProjectScopeManager {
 	 */
 	private volatile long scopeEvictionTTLSeconds = 300;
 
+	/**
+	 * Heap usage ratio (0.0–1.0) above which emergency scope eviction is
+	 * triggered. Default: 0.75 (75%). Can be lowered to evict sooner under
+	 * memory pressure, or raised to allow more aggressive memory use.
+	 */
+	private volatile double memoryPressureThreshold = 0.75;
+
 	/** Handle for the periodic eviction sweep, cancelled on shutdown. */
 	private volatile ScheduledFuture<?> evictionFuture;
 
@@ -159,6 +166,25 @@ public class ProjectScopeManager {
 
 	public List<ProjectScope> getProjectScopes() {
 		return projectScopes;
+	}
+
+	/**
+	 * Returns a 3-element array: [activeScopes, evictedScopes, totalScopes].
+	 * Active = compiled and not evicted. Thread-safe snapshot.
+	 */
+	public int[] getScopeCounts() {
+		List<ProjectScope> scopes = projectScopes;
+		int total = scopes.size();
+		int active = 0;
+		int evicted = 0;
+		for (ProjectScope s : scopes) {
+			if (s.isEvicted()) {
+				evicted++;
+			} else if (s.isCompiled()) {
+				active++;
+			}
+		}
+		return new int[] { active, evicted, total };
 	}
 
 	// --- Scope lookup ---
@@ -514,6 +540,19 @@ public class ProjectScopeManager {
 	}
 
 	/**
+	 * Set the heap usage ratio above which emergency scope eviction triggers.
+	 * Valid range: 0.3–0.95. Values outside this range are clamped.
+	 */
+	public void setMemoryPressureThreshold(double threshold) {
+		this.memoryPressureThreshold = Math.max(0.3, Math.min(0.95, threshold));
+		logger.info("Memory pressure threshold set to {} %", (int) (this.memoryPressureThreshold * 100));
+	}
+
+	public double getMemoryPressureThreshold() {
+		return memoryPressureThreshold;
+	}
+
+	/**
 	 * Start the periodic eviction scheduler. Should be called once after
 	 * the server is fully initialized.
 	 *
@@ -540,10 +579,16 @@ public class ProjectScopeManager {
 	 * cleans up expired entries from the closed-file cache.
 	 *
 	 * <p>In addition to TTL-based eviction, this sweep also performs
-	 * <b>memory-pressure eviction</b>: when heap usage exceeds 75% of max
-	 * heap, the least-recently-accessed compiled scope (without open files)
-	 * is evicted immediately regardless of TTL.  This acts as a safety
-	 * valve to prevent OOM in large multi-project workspaces.</p>
+	 * <b>memory-pressure eviction</b>: when heap usage exceeds the
+	 * configured {@link #memoryPressureThreshold}, the least-recently-accessed
+	 * compiled scope (without open files) is evicted immediately regardless
+	 * of TTL.  This acts as a safety valve to prevent OOM in large
+	 * multi-project workspaces.</p>
+	 *
+	 * <p><b>Dynamic TTL scaling</b>: when heap usage is between 60% and the
+	 * pressure threshold, the effective TTL is linearly scaled down to half
+	 * its configured value. This causes idle scopes to be evicted sooner as
+	 * memory fills up, before reaching the emergency eviction trigger.</p>
 	 */
 	private void performEvictionSweep() {
 		// Sweep expired closed-file cache entries
@@ -560,18 +605,39 @@ public class ProjectScopeManager {
 		Set<URI> openURIs = fileContentsTracker.getOpenURIs();
 
 		// --- Memory-pressure eviction ---
-		// When heap usage exceeds 75%, aggressively evict the least-recently
-		// accessed compiled scope to reclaim memory before OOM.
 		Runtime rt = Runtime.getRuntime();
 		long usedBytes = rt.totalMemory() - rt.freeMemory();
 		long maxBytes = rt.maxMemory();
 		double heapUsageRatio = (double) usedBytes / maxBytes;
-		if (heapUsageRatio > 0.75) {
-			logger.warn("High memory pressure: heap at {}/{} MB ({} %). "
+		double threshold = memoryPressureThreshold;
+
+		if (heapUsageRatio > threshold) {
+			logger.warn("High memory pressure: heap at {}/{} MB ({} %, threshold {} %). "
 					+ "Attempting emergency scope eviction.",
 					usedBytes / (1024 * 1024), maxBytes / (1024 * 1024),
-					(int) (heapUsageRatio * 100));
+					(int) (heapUsageRatio * 100), (int) (threshold * 100));
 			evictLeastRecentScope(openURIs, now);
+		}
+
+		// --- Dynamic TTL scaling ---
+		// When heap usage is between 60% and the pressure threshold, linearly
+		// scale TTL down to 50% of its configured value. This evicts idle
+		// scopes sooner as memory fills up, reducing peak usage.
+		long effectiveTtlMs = ttlMs;
+		double scalingFloor = 0.60;
+		if (heapUsageRatio > scalingFloor && heapUsageRatio <= threshold) {
+			double scaleFactor = 1.0 - 0.5 * ((heapUsageRatio - scalingFloor) / (threshold - scalingFloor));
+			effectiveTtlMs = (long) (ttlMs * scaleFactor);
+			logger.debug("Dynamic TTL scaling: heap at {} %, effective TTL reduced to {}s (base {}s)",
+					(int) (heapUsageRatio * 100), effectiveTtlMs / 1000, scopeEvictionTTLSeconds);
+
+			// Also shed reference indexes — they're large, lazily-rebuilt,
+			// and only needed for Find References / Rename operations.
+			for (ProjectScope scope : projectScopes) {
+				if (scope.getAstVisitor() != null) {
+					scope.getAstVisitor().clearReferenceIndex();
+				}
+			}
 		}
 
 		// --- Standard TTL-based eviction ---
@@ -581,7 +647,7 @@ public class ProjectScopeManager {
 			}
 
 			long idleMs = now - scope.getLastAccessedAt();
-			if (idleMs < ttlMs) {
+			if (idleMs < effectiveTtlMs) {
 				continue;
 			}
 
