@@ -163,6 +163,7 @@ jobs:
           echo "SUCCESS: Badge accessible from root at extension/.badges/extension-coverage.json"
 
       - name: Copy badges to root for upload
+        shell: bash
         run: |
           cd "$GITHUB_WORKSPACE"
           mkdir -p .badges-extension
