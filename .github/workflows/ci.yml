@@ -43,6 +43,25 @@ jobs:
           coverage-label: GLS Coverage
           branches-label: GLS Branches
 
+      - name: Generate GLS Coverage JSON for shields.io
+        run: |
+          COVERAGE=$(echo "${{ steps.jacoco.outputs.coverage }}" | sed 's/%//')
+          COLOR="red"
+          if (( $(echo "$COVERAGE >= 90" | bc -l) )); then COLOR="brightgreen"
+          elif (( $(echo "$COVERAGE >= 80" | bc -l) )); then COLOR="green"
+          elif (( $(echo "$COVERAGE >= 70" | bc -l) )); then COLOR="yellowgreen"
+          elif (( $(echo "$COVERAGE >= 60" | bc -l) )); then COLOR="yellow"
+          elif (( $(echo "$COVERAGE >= 50" | bc -l) )); then COLOR="orange"
+          fi
+          cat > .badges/gls-coverage.json << EOF
+          {
+            "schemaVersion": 1,
+            "label": "GLS Coverage",
+            "message": "${COVERAGE}%",
+            "color": "${COLOR}"
+          }
+          EOF
+
       - name: Upload GLS badges
         uses: actions/upload-artifact@v4
         with:

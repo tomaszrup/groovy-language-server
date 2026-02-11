@@ -1,9 +1,8 @@
 # Groovy Language Server
 
 [![CI](https://github.com/tomaszrup/groovy-language-server/actions/workflows/ci.yml/badge.svg)](https://github.com/tomaszrup/groovy-language-server/actions/workflows/ci.yml)
-![GLS Coverage](https://raw.githubusercontent.com/tomaszrup/groovy-language-server/badges/.badges/gls-coverage.svg)
-![GLS Branches](https://raw.githubusercontent.com/tomaszrup/groovy-language-server/badges/.badges/gls-branches.svg)
-![Extension Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/tomaszrup/groovy-language-server/badges/.badges/extension-coverage.json)
+[![GLS Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/tomaszrup/groovy-language-server/badges/.badges/gls-coverage.json)](https://github.com/tomaszrup/groovy-language-server)
+[![Extension Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/tomaszrup/groovy-language-server/badges/.badges/extension-coverage.json)](https://github.com/tomaszrup/groovy-language-server)
 
 A [Language Server Protocol](https://microsoft.github.io/language-server-protocol/) implementation for [Groovy](http://groovy-lang.org/), with first-class support for Gradle and Maven projects.
 
