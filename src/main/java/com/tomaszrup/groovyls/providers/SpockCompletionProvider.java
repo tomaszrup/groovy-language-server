@@ -26,6 +26,8 @@ import java.util.List;
 import org.codehaus.groovy.ast.ASTNode;
 import org.codehaus.groovy.ast.ClassNode;
 import org.codehaus.groovy.ast.MethodNode;
+import org.codehaus.groovy.ast.expr.MethodCallExpression;
+import org.codehaus.groovy.ast.expr.PropertyExpression;
 import org.eclipse.lsp4j.CompletionItem;
 import org.eclipse.lsp4j.CompletionItemKind;
 import org.eclipse.lsp4j.InsertTextFormat;
@@ -57,6 +59,14 @@ public class SpockCompletionProvider {
         List<CompletionItem> items = new ArrayList<>();
 
         if (ast == null || offsetNode == null) {
+            return items;
+        }
+
+        // Skip Spock completions for member-access expressions (e.g. instanceOfX.)
+        // where block labels, annotations, and assertion helpers are irrelevant.
+        ASTNode parentNode = ast.getParent(offsetNode);
+        if (offsetNode instanceof PropertyExpression || offsetNode instanceof MethodCallExpression
+                || parentNode instanceof PropertyExpression || parentNode instanceof MethodCallExpression) {
             return items;
         }
 

@@ -281,6 +281,11 @@ public class CompletionProvider {
 
 	private void populateItemsFromPropertiesAndFields(List<PropertyNode> properties, List<FieldNode> fields,
 			String memberNamePrefix, Set<String> existingNames, List<CompletionItem> items) {
+		populateItemsFromPropertiesAndFields(properties, fields, memberNamePrefix, existingNames, null, items);
+	}
+
+	private void populateItemsFromPropertiesAndFields(List<PropertyNode> properties, List<FieldNode> fields,
+			String memberNamePrefix, Set<String> existingNames, ClassNode targetClass, List<CompletionItem> items) {
 		List<CompletionItem> propItems = properties.stream().filter(property -> {
 			String name = property.getName();
 			// sometimes, a property and a field will have the same name
@@ -293,6 +298,9 @@ public class CompletionProvider {
 			CompletionItem item = new CompletionItem();
 			item.setLabel(property.getName());
 			item.setKind(GroovyLanguageServerUtils.astNodeToCompletionItemKind(property));
+			if (targetClass != null) {
+				item.setSortText(getMemberSortPrefix(property.getDeclaringClass(), targetClass) + property.getName());
+			}
 			// Documentation deferred to completionItem/resolve
 			return item;
 		}).collect(Collectors.toList());
@@ -309,6 +317,9 @@ public class CompletionProvider {
 			CompletionItem item = new CompletionItem();
 			item.setLabel(field.getName());
 			item.setKind(GroovyLanguageServerUtils.astNodeToCompletionItemKind(field));
+			if (targetClass != null) {
+				item.setSortText(getMemberSortPrefix(field.getDeclaringClass(), targetClass) + field.getName());
+			}
 			// Documentation deferred to completionItem/resolve
 			return item;
 		}).collect(Collectors.toList());
@@ -317,6 +328,11 @@ public class CompletionProvider {
 
 	private void populateItemsFromMethods(List<MethodNode> methods, String memberNamePrefix, Set<String> existingNames,
 			List<CompletionItem> items) {
+		populateItemsFromMethods(methods, memberNamePrefix, existingNames, null, items);
+	}
+
+	private void populateItemsFromMethods(List<MethodNode> methods, String memberNamePrefix, Set<String> existingNames,
+			ClassNode targetClass, List<CompletionItem> items) {
 		List<CompletionItem> methodItems = methods.stream().filter(method -> {
 			String methodName = method.getName();
 			// overloads can cause duplicates
@@ -332,6 +348,9 @@ public class CompletionProvider {
 			item.setInsertText(buildMethodSnippet(method));
 			item.setInsertTextFormat(InsertTextFormat.Snippet);
 			item.setFilterText(method.getName());
+			if (targetClass != null) {
+				item.setSortText(getMemberSortPrefix(method.getDeclaringClass(), targetClass) + method.getName());
+			}
 			CompletionItemLabelDetails labelDetails = new CompletionItemLabelDetails();
 			labelDetails.setDetail(buildMethodParamsLabel(method));
 			labelDetails.setDescription(method.getReturnType().getNameWithoutPackage());
@@ -347,12 +366,14 @@ public class CompletionProvider {
 	private void populateItemsFromExpression(Expression leftSide, String memberNamePrefix, List<CompletionItem> items) {
 		Set<String> existingNames = new HashSet<>();
 
+		ClassNode targetClass = GroovyASTUtils.getTypeOfNode(leftSide, ast);
+
 		List<PropertyNode> properties = GroovyASTUtils.getPropertiesForLeftSideOfPropertyExpression(leftSide, ast);
 		List<FieldNode> fields = GroovyASTUtils.getFieldsForLeftSideOfPropertyExpression(leftSide, ast);
-		populateItemsFromPropertiesAndFields(properties, fields, memberNamePrefix, existingNames, items);
+		populateItemsFromPropertiesAndFields(properties, fields, memberNamePrefix, existingNames, targetClass, items);
 
 		List<MethodNode> methods = GroovyASTUtils.getMethodsForLeftSideOfPropertyExpression(leftSide, ast);
-		populateItemsFromMethods(methods, memberNamePrefix, existingNames, items);
+		populateItemsFromMethods(methods, memberNamePrefix, existingNames, targetClass, items);
 	}
 
 	private void populateItemsFromVariableScope(VariableScope variableScope, String memberNamePrefix,
@@ -586,6 +607,27 @@ public class CompletionProvider {
 			builder.append(groovydoc);
 		}
 		return new MarkupContent(MarkupKind.MARKDOWN, builder.toString());
+	}
+
+	private static final Set<String> BASE_CLASS_NAMES = new HashSet<>(Arrays.asList(
+			"java.lang.Object", "groovy.lang.GroovyObject", "groovy.lang.GroovyObjectSupport"));
+
+	/**
+	 * Returns a sort prefix for a completion item based on where the member is
+	 * declared relative to the target class. Members declared directly on the
+	 * target class sort first, inherited members from intermediate classes sort
+	 * second, and members from base classes (Object, GroovyObject) sort last.
+	 */
+	private String getMemberSortPrefix(ClassNode declaringClass, ClassNode targetClass) {
+		if (declaringClass != null && targetClass != null) {
+			if (declaringClass.getName().equals(targetClass.getName())) {
+				return "a_";
+			}
+			if (BASE_CLASS_NAMES.contains(declaringClass.getName())) {
+				return "c_";
+			}
+		}
+		return "b_";
 	}
 
 	private TextEdit createAddImportTextEdit(String className, Range range) {
