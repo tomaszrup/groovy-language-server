@@ -147,6 +147,17 @@ jobs:
           test -f .badges/extension-coverage.json
           echo "All badge files present"
 
+      - name: Debug - Check from workspace root
+        run: |
+          echo "=== Workspace root directory contents ==="
+          ls -la
+          echo "=== Extension directory contents ==="
+          ls -la extension/
+          echo "=== Looking for .badges ==="
+          find . -name ".badges" -type d
+          echo "=== All JSON files ==="
+          find . -name "*.json" -type f | grep -i badge
+
       - name: Upload Extension badges
         uses: actions/upload-artifact@v4
         with:
