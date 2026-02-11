@@ -45,7 +45,11 @@ jobs:
 
       - name: Generate GLS Coverage JSON for shields.io
         run: |
-          COVERAGE=$(printf "%.2f" "$(echo "${{ steps.jacoco.outputs.coverage }}" | sed 's/%//')")
+          RAW_COVERAGE=$(echo "${{ steps.jacoco.outputs.coverage }}" | sed 's/%//')
+          if (( $(echo "$RAW_COVERAGE <= 1" | bc -l) )); then
+            RAW_COVERAGE=$(echo "$RAW_COVERAGE * 100" | bc -l)
+          fi
+          COVERAGE=$(printf "%.2f" "$RAW_COVERAGE")
           COLOR="red"
           if (( $(echo "$COVERAGE >= 90" | bc -l) )); then COLOR="brightgreen"
           elif (( $(echo "$COVERAGE >= 80" | bc -l) )); then COLOR="green"
@@ -119,7 +123,8 @@ jobs:
           fi
           COVERAGE=$(node -e "
             const summary = require('./coverage/coverage-summary.json');
-            const pct = summary.total.lines.pct;
+            let pct = summary.total.lines.pct;
+            if (pct <= 1) pct = pct * 100;
             console.log(pct.toFixed(2));
           ")
           echo "Extension coverage: ${COVERAGE}%"
