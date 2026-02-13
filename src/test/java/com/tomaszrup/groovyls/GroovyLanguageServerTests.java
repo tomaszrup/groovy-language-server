@@ -168,6 +168,21 @@ class GroovyLanguageServerTests {
 	}
 
 	@Test
+	void testInitializeIgnoresJsonNullClasspathCacheOption() throws Exception {
+		InitializeParams params = new InitializeParams();
+		com.google.gson.JsonObject opts = new com.google.gson.JsonObject();
+		opts.add("classpathCache", com.google.gson.JsonNull.INSTANCE);
+		params.setInitializationOptions(opts);
+
+		server.initialize(params).get();
+
+		java.lang.reflect.Field classpathCacheEnabled = GroovyLanguageServer.class
+				.getDeclaredField("classpathCacheEnabled");
+		classpathCacheEnabled.setAccessible(true);
+		Assertions.assertTrue(classpathCacheEnabled.getBoolean(server));
+	}
+
+	@Test
 	void testInitializeWithWorkspaceFolderTriggersImportStatusFlow() throws Exception {
 		CapturingGroovyLanguageClient capturingClient = new CapturingGroovyLanguageClient();
 		server.connect(capturingClient);

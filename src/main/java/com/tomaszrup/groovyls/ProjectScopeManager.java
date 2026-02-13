@@ -465,13 +465,13 @@ public class ProjectScopeManager {
 		JsonObject groovy = settings.get("groovy").getAsJsonObject();
 		if (groovy.has("semanticHighlighting") && groovy.get("semanticHighlighting").isJsonObject()) {
 			JsonObject sh = groovy.get("semanticHighlighting").getAsJsonObject();
-			if (sh.has("enabled")) {
+			if (sh.has("enabled") && sh.get("enabled").isJsonPrimitive()) {
 				this.semanticHighlightingEnabled = sh.get("enabled").getAsBoolean();
 			}
 		}
 		if (groovy.has("formatting") && groovy.get("formatting").isJsonObject()) {
 			JsonObject fmt = groovy.get("formatting").getAsJsonObject();
-			if (fmt.has("enabled")) {
+			if (fmt.has("enabled") && fmt.get("enabled").isJsonPrimitive()) {
 				this.formattingEnabled = fmt.get("enabled").getAsBoolean();
 			}
 		}

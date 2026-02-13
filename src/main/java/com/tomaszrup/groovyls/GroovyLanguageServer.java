@@ -250,7 +250,9 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             if (opts.has("logLevel") && opts.get("logLevel").isJsonPrimitive()) {
                 applyLogLevel(opts.get("logLevel").getAsString());
             }
-            if (opts.has("classpathCache") && !opts.get("classpathCache").getAsBoolean()) {
+            if (opts.has("classpathCache")
+                    && opts.get("classpathCache").isJsonPrimitive()
+                    && !opts.get("classpathCache").getAsBoolean()) {
                 classpathCacheEnabled = false;
                 logger.info("Classpath caching disabled via initializationOptions");
             }

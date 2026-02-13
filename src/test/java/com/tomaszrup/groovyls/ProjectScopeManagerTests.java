@@ -138,6 +138,32 @@ class ProjectScopeManagerTests {
 	}
 
 	@Test
+	void testUpdateFeatureTogglesIgnoresJsonNullSemanticHighlightingEnabled() {
+		JsonObject settings = new JsonObject();
+		JsonObject groovy = new JsonObject();
+		JsonObject sh = new JsonObject();
+		sh.add("enabled", com.google.gson.JsonNull.INSTANCE);
+		groovy.add("semanticHighlighting", sh);
+		settings.add("groovy", groovy);
+
+		manager.updateFeatureToggles(settings);
+		Assertions.assertTrue(manager.isSemanticHighlightingEnabled());
+	}
+
+	@Test
+	void testUpdateFeatureTogglesIgnoresJsonNullFormattingEnabled() {
+		JsonObject settings = new JsonObject();
+		JsonObject groovy = new JsonObject();
+		JsonObject fmt = new JsonObject();
+		fmt.add("enabled", com.google.gson.JsonNull.INSTANCE);
+		groovy.add("formatting", fmt);
+		settings.add("groovy", groovy);
+
+		manager.updateFeatureToggles(settings);
+		Assertions.assertTrue(manager.isFormattingEnabled());
+	}
+
+	@Test
 	void testUpdateFeatureTogglesIgnoresUnrelatedSettings() {
 		JsonObject settings = new JsonObject();
 		settings.addProperty("unrelated", "value");
