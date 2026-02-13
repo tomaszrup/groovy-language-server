@@ -110,9 +110,7 @@ public class SemanticTokensProvider {
 	private static final int MOD_DECLARATION = 1;       // bit 0
 	private static final int MOD_STATIC = 1 << 1;       // bit 1
 	private static final int MOD_READONLY = 1 << 2;     // bit 2
-	private static final int MOD_DEPRECATED = 1 << 3;   // bit 3
 	private static final int MOD_ABSTRACT = 1 << 4;     // bit 4
-	private static final int MOD_DEFAULT_LIBRARY = 1 << 5; // bit 5
 
 	private ASTNodeVisitor ast;
 	private FileContentsTracker fileContentsTracker;

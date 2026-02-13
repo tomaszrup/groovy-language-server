@@ -34,11 +34,10 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Enumeration;
 import java.util.HashMap;
-import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
@@ -115,8 +114,6 @@ public class JavaSourceLocator {
      * Tracks which source JARs have already been indexed to avoid
      * re-scanning the same archive on repeated calls.
      */
-    private final Set<Path> indexedSourceJars = new HashSet<>();
-
     /**
      * Maximum number of entries in the decompiled content LRU cache.
      * Each entry is a list of source lines (~1-10 KB).  With 256 entries
@@ -132,7 +129,7 @@ public class JavaSourceLocator {
      */
     @SuppressWarnings("serial")
     private final Map<String, SoftReference<List<String>>> decompiledContentCache =
-            new LinkedHashMap<>(64, 0.75f, true) {
+            new LinkedHashMap<String, SoftReference<List<String>>>(64, 0.75f, true) {
                 @Override
                 protected boolean removeEldestEntry(Map.Entry<String, SoftReference<List<String>>> eldest) {
                     return size() > DECOMPILED_CACHE_MAX_ENTRIES;
@@ -150,7 +147,7 @@ public class JavaSourceLocator {
     /** Cache of FQCN → class-file URI (jar: or jrt: scheme). Bounded LRU. */
     @SuppressWarnings("serial")
     private final Map<String, URI> classFileURICache =
-            new LinkedHashMap<>(64, 0.75f, true) {
+            new LinkedHashMap<String, URI>(64, 0.75f, true) {
                 @Override
                 protected boolean removeEldestEntry(Map.Entry<String, URI> eldest) {
                     return size() > CLASS_FILE_CACHE_MAX_ENTRIES;
@@ -160,7 +157,7 @@ public class JavaSourceLocator {
     /** Reverse lookup: URI string → FQCN for serving decompiled content by URI. Bounded LRU. */
     @SuppressWarnings("serial")
     private final Map<String, String> uriToClassName =
-            new LinkedHashMap<>(64, 0.75f, true) {
+            new LinkedHashMap<String, String>(64, 0.75f, true) {
                 @Override
                 protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
                     return size() > CLASS_FILE_CACHE_MAX_ENTRIES;
@@ -313,7 +310,13 @@ public class JavaSourceLocator {
             return;
         }
 
-        classpathEntries.addAll(classpathJars);
+        LinkedHashSet<String> deduped = new LinkedHashSet<>(classpathEntries);
+        deduped.addAll(classpathJars);
+        if (deduped.size() == classpathEntries.size()) {
+            return;
+        }
+        classpathEntries.clear();
+        classpathEntries.addAll(deduped);
 
         // Use the shared source-JAR index to avoid per-scope duplication.
         // Release any previously held entry before acquiring a new one.
@@ -429,30 +432,6 @@ public class JavaSourceLocator {
         Path cacheDir = groupDir.getParent();
         if (cacheDir == null) return false;
         return "files-2.1".equals(cacheDir.getFileName().toString());
-    }
-
-    /**
-     * Index all {@code .java} and {@code .groovy} entries inside a source JAR.
-     */
-    private void indexSourceJar(Path sourceJar, Map<String, SourceJarEntry> target) {
-        try (JarFile jar = new JarFile(sourceJar.toFile())) {
-            Enumeration<JarEntry> entries = jar.entries();
-            while (entries.hasMoreElements()) {
-                JarEntry entry = entries.nextElement();
-                String name = entry.getName();
-                if ((name.endsWith(".java") || name.endsWith(".groovy")) && !entry.isDirectory()) {
-                    String fqcn = jarEntryToClassName(name);
-                    if (fqcn != null) {
-                        // Don't overwrite project sources — project sources take precedence
-                        if (!classNameToSource.containsKey(fqcn)) {
-                            target.putIfAbsent(fqcn, new SourceJarEntry(sourceJar, name));
-                        }
-                    }
-                }
-            }
-        } catch (IOException e) {
-            logger.warn("Failed to index source JAR {}: {}", sourceJar, e.getMessage());
-        }
     }
 
     /**
@@ -1390,21 +1369,4 @@ public class JavaSourceLocator {
         return URI.create("decompiled:" + className.replace('.', '/') + ".java");
     }
 
-    /**
-     * Resolve source considering decompiled content as a last resort.
-     * Unlike {@link #resolveSource(String)}, this also checks the
-     * decompiled content cache.
-     */
-    private SourceInfo resolveSourceWithDecompiled(String className) {
-        SourceInfo source = resolveSource(className);
-        if (source != null) {
-            return source;
-        }
-        List<String> decompiled = getDecompiledCacheEntry(className);
-        if (decompiled != null) {
-            URI uri = decompiledContentToURI(className);
-            return new SourceInfo(uri, decompiled);
-        }
-        return null;
-    }
 }

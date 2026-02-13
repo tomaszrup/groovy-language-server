@@ -37,16 +37,12 @@ import org.eclipse.lsp4j.MarkupKind;
 
 import com.tomaszrup.groovyls.compiler.ast.ASTNodeVisitor;
 import com.tomaszrup.groovyls.compiler.util.GroovydocUtils;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * Resolves documentation for completion items by searching AST nodes
  * (Groovydoc) and classpath source JARs (Javadoc).
  */
 public class DocumentResolverService {
-	private static final Logger logger = LoggerFactory.getLogger(DocumentResolverService.class);
-
 	private final ProjectScopeManager scopeManager;
 
 	public DocumentResolverService(ProjectScopeManager scopeManager) {

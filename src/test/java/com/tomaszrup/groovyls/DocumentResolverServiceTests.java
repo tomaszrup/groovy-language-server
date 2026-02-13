@@ -17,7 +17,6 @@ package com.tomaszrup.groovyls;
 
 import java.io.File;
 import java.io.IOException;
-import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
@@ -231,7 +230,7 @@ class DocumentResolverServiceTests {
 		methodData.addProperty("declaringClass", "Documented");
 		methodItem.setData(methodData);
 
-		CompletionItem resolvedMethod = resolverService.resolveCompletionItem(methodItem);
+		resolverService.resolveCompletionItem(methodItem);
 		// Note: documentation may or may not be found depending on Groovydoc support
 		// in the test environment — we verify no exception thrown
 
@@ -239,7 +238,7 @@ class DocumentResolverServiceTests {
 		CompletionItem classItem = new CompletionItem("Documented");
 		classItem.setKind(CompletionItemKind.Class);
 
-		CompletionItem resolvedClass = resolverService.resolveCompletionItem(classItem);
+		resolverService.resolveCompletionItem(classItem);
 		// Verify no exception
 	}
 

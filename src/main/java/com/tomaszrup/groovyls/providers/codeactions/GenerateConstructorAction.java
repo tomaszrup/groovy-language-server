@@ -23,7 +23,6 @@ import java.net.URI;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-import java.util.stream.Collectors;
 
 import org.codehaus.groovy.ast.ASTNode;
 import org.codehaus.groovy.ast.ClassNode;
@@ -88,9 +87,6 @@ public class GenerateConstructorAction {
         // Collect fields and properties (non-static, non-synthetic)
         List<FieldInfo> fields = collectFields(classNode);
 
-        // Check if there's already an explicit constructor
-        boolean hasExplicitConstructor = hasExplicitConstructor(classNode);
-
         // Generate constructor with all fields
         if (!fields.isEmpty()) {
             CodeAction allFieldsAction = createConstructorAction(uri, classNode, fields,
@@ -143,16 +139,6 @@ public class GenerateConstructorAction {
         }
 
         return fields;
-    }
-
-    private boolean hasExplicitConstructor(ClassNode classNode) {
-        List<ConstructorNode> constructors = classNode.getDeclaredConstructors();
-        for (ConstructorNode ctor : constructors) {
-            if (!ctor.isSynthetic()) {
-                return true;
-            }
-        }
-        return false;
     }
 
     private boolean hasNoArgConstructor(ClassNode classNode) {

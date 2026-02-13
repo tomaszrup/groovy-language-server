@@ -14,6 +14,16 @@ export default defineConfig({
       provider: "v8",
       reporter: ["text", "json-summary", "html"],
       reportsDirectory: "./coverage",
+      include: ["src/main/ts/**/*.ts"],
+      exclude: [
+        "src/test/**",
+        "**/*.d.ts",
+        "build/**",
+        "node_modules/**",
+      ],
+      thresholds: {
+        lines: 85,
+      },
     },
   },
 });

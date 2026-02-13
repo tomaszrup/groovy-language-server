@@ -26,7 +26,6 @@ import org.codehaus.groovy.ast.FieldNode;
 import org.codehaus.groovy.syntax.SyntaxException;
 import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.Parameter;
-import org.codehaus.groovy.ast.expr.VariableExpression;
 import org.eclipse.lsp4j.CompletionItemKind;
 import org.eclipse.lsp4j.Location;
 import org.eclipse.lsp4j.Position;
@@ -41,6 +40,7 @@ import org.junit.jupiter.api.Test;
  * AST-node-to-LSP mappings (CompletionItemKind, SymbolKind, Location),
  * and SymbolInformation creation.
  */
+@SuppressWarnings("deprecation")
 class GroovyLanguageServerUtilsTests {
 
 	// ------------------------------------------------------------------

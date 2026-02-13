@@ -25,7 +25,6 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
-import java.util.TreeSet;
 import java.util.stream.Collectors;
 
 import org.codehaus.groovy.ast.ASTNode;
@@ -44,7 +43,6 @@ import org.eclipse.lsp4j.TextEdit;
 import org.eclipse.lsp4j.WorkspaceEdit;
 
 import com.tomaszrup.groovyls.compiler.ast.ASTNodeVisitor;
-import com.tomaszrup.groovyls.compiler.util.GroovyASTUtils;
 import com.tomaszrup.groovyls.util.GroovyLanguageServerUtils;
 
 /**

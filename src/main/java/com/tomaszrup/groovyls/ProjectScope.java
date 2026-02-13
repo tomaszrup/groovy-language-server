@@ -35,7 +35,9 @@ import org.slf4j.LoggerFactory;
 
 import groovy.lang.GroovyClassLoader;
 import io.github.classgraph.ScanResult;
+import com.tomaszrup.groovyls.compiler.ClasspathSymbolIndex;
 import com.tomaszrup.groovyls.compiler.DependencyGraph;
+import com.tomaszrup.groovyls.compiler.SharedClasspathIndexCache;
 import com.tomaszrup.groovyls.compiler.ast.ASTNodeVisitor;
 import com.tomaszrup.groovyls.compiler.control.GroovyLSCompilationUnit;
 import com.tomaszrup.groovyls.config.ICompilationUnitFactory;
@@ -69,6 +71,7 @@ public class ProjectScope {
 
 	/** Published via volatile write when the classloader changes. */
 	private volatile ScanResult classGraphScanResult;
+	private volatile ClasspathSymbolIndex classpathSymbolIndex;
 
 	/**
 	 * When the {@link #classGraphScanResult} is a shared superset (obtained
@@ -82,6 +85,7 @@ public class ProjectScope {
 	 * scope's classpath (no filtering needed).</p>
 	 */
 	private volatile Set<File> classGraphClasspathFiles;
+	private volatile Set<String> classpathSymbolClasspathElements;
 
 	private GroovyClassLoader classLoader;
 	private volatile URI previousContext;
@@ -198,6 +202,20 @@ public class ProjectScope {
 	public void setClassGraphScanResult(ScanResult classGraphScanResult) {
 		this.classGraphScanResult = classGraphScanResult;
 		this.classGraphClasspathFiles = null; // clear filter when result changes externally
+	}
+
+	public ClasspathSymbolIndex getClasspathSymbolIndex() {
+		return classpathSymbolIndex;
+	}
+
+	public Set<String> getClasspathSymbolClasspathElements() {
+		return classpathSymbolClasspathElements;
+	}
+
+	public void clearClasspathIndexes() {
+		classpathSymbolIndex = null;
+		classpathSymbolClasspathElements = null;
+		classGraphClasspathFiles = null;
 	}
 
 	/**
@@ -325,23 +343,61 @@ public class ProjectScope {
 					sharedCache.acquireWithResult(cl);
 			if (ar != null) {
 				classGraphScanResult = ar.getScanResult();
-				classGraphClasspathFiles = ar.getOwnClasspathFiles(); // null when exact match
+				classGraphClasspathFiles = ar.getOwnClasspathFiles();
 			} else {
 				classGraphScanResult = null;
 				classGraphClasspathFiles = null;
 			}
 		} catch (VirtualMachineError e) {
-			// ClassGraph scan OOM — log and return null. Completion/code
-			// actions will degrade (no classpath type suggestions) but
-			// the server survives.
 			org.slf4j.LoggerFactory.getLogger(ProjectScope.class)
 					.error("ClassGraph scan failed with {}: {} — classpath type suggestions "
 							+ "will be unavailable for {}", e.getClass().getSimpleName(),
-							e.getMessage(), projectRoot);
+						e.getMessage(), projectRoot);
 			classGraphScanResult = null;
 			classGraphClasspathFiles = null;
 		}
 		return classGraphScanResult;
+	}
+
+	public ClasspathSymbolIndex ensureClasspathSymbolIndex() {
+		if (classpathSymbolIndex != null) {
+			return classpathSymbolIndex;
+		}
+		lock.writeLock().lock();
+		try {
+			return ensureClasspathSymbolIndexUnsafe();
+		} finally {
+			lock.writeLock().unlock();
+		}
+	}
+
+	public ClasspathSymbolIndex ensureClasspathSymbolIndexUnsafe() {
+		if (classpathSymbolIndex != null) {
+			return classpathSymbolIndex;
+		}
+		GroovyClassLoader cl = classLoader;
+		if (cl == null) {
+			return null;
+		}
+		try {
+			SharedClasspathIndexCache.AcquireResult ar =
+					SharedClasspathIndexCache.getInstance().acquireWithResult(cl);
+			if (ar != null) {
+				classpathSymbolIndex = ar.getIndex();
+				classpathSymbolClasspathElements = ar.getOwnClasspathElementPaths();
+			} else {
+				classpathSymbolIndex = null;
+				classpathSymbolClasspathElements = null;
+			}
+		} catch (VirtualMachineError e) {
+			org.slf4j.LoggerFactory.getLogger(ProjectScope.class)
+					.error("Classpath symbol index build failed with {}: {} — classpath type suggestions "
+							+ "will be unavailable for {}", e.getClass().getSimpleName(),
+						e.getMessage(), projectRoot);
+			classpathSymbolIndex = null;
+			classpathSymbolClasspathElements = null;
+		}
+		return classpathSymbolIndex;
 	}
 
 	/**
@@ -388,6 +444,8 @@ public class ProjectScope {
 			classGraphScanResult = null;
 			classGraphClasspathFiles = null;
 		}
+		classpathSymbolIndex = null;
+		classpathSymbolClasspathElements = null;
 
 		// Close classloader
 		GroovyClassLoader cl = classLoader;
@@ -411,11 +469,9 @@ public class ProjectScope {
 		compilationFailed = false;
 		evicted = true;
 
-		// Suggest GC to reclaim freed objects
-		System.gc();
 		long usedAfter = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
 		long freedMB = (usedBefore - usedAfter) / (1024 * 1024);
-		logger.info("Evicted heavy state for scope {} (freed ~{}MB)", projectRoot, freedMB);
+		logger.info("Evicted heavy state for scope {} (heap delta ~{}MB, async GC may reclaim more later)", projectRoot, freedMB);
 	}
 
 	/**

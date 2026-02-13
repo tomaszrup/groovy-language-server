@@ -93,6 +93,17 @@ public class SharedClassGraphCache {
 	private static final int MAX_HELD_SCANS = 6;
 
 	/**
+	 * Max fraction of JVM heap that this cache is allowed to consume
+	 * (estimated) before refusing to create a new in-memory scan.
+	 */
+	private static final double DEFAULT_HEAP_BUDGET_FRACTION = 0.35;
+
+	/**
+	 * Minimum estimated in-memory budget for scan cache, even on small heaps.
+	 */
+	private static final long MIN_BUDGET_BYTES = 256L * 1024L * 1024L;
+
+	/**
 	 * Version prefix for the disk cache key. Bump this whenever the ClassGraph
 	 * scan configuration changes (e.g. adding/removing rejectPackages filters)
 	 * so that stale cached results are naturally orphaned.
@@ -287,6 +298,13 @@ public class SharedClassGraphCache {
 	/** Key = classpath hash → entry. */
 	private final ConcurrentHashMap<String, CacheEntry> cache = new ConcurrentHashMap<>();
 
+	private long acquireRequests;
+	private long exactHits;
+	private long overlapHits;
+	private long diskHits;
+	private long scanBuilds;
+	private long budgetRejects;
+
 	/**
 	 * Reverse lookup: ScanResult identity → cache key.  Needed so that
 	 * {@link #release(ScanResult)} can find the entry without the caller
@@ -341,6 +359,7 @@ public class SharedClassGraphCache {
 	 * @return the acquire result, or {@code null} if scanning failed
 	 */
 	public synchronized AcquireResult acquireWithResult(GroovyClassLoader classLoader) {
+		acquireRequests++;
 		String key = computeClasspathKey(classLoader);
 		Set<String> requestedUrls = extractUrlSet(classLoader);
 
@@ -354,6 +373,7 @@ public class SharedClassGraphCache {
 		if (entry != null) {
 			ScanResult existing = entry.get();
 			if (existing != null) {
+				exactHits++;
 				entry.refCount++;
 				logger.debug("SharedClassGraphCache HIT for key {}… (refCount={}), cache size={}",
 						key.substring(0, Math.min(12, key.length())), entry.refCount, cache.size());
@@ -365,6 +385,7 @@ public class SharedClassGraphCache {
 			reverseIndex.values().remove(key);
 			ScanResult reloaded = loadFromDisk(key);
 			if (reloaded != null) {
+				diskHits++;
 				entry.set(reloaded);
 				entry.refCount++;
 				reverseIndex.put(reloaded, key);
@@ -381,6 +402,7 @@ public class SharedClassGraphCache {
 		// --- Similarity-based sharing: check existing entries ---
 		AcquireResult supersetHit = findSupersetEntry(requestedUrls, classLoader);
 		if (supersetHit != null) {
+			overlapHits++;
 			return supersetHit;
 		}
 
@@ -388,6 +410,7 @@ public class SharedClassGraphCache {
 		long loadStart = System.currentTimeMillis();
 		ScanResult scanResult = loadFromDisk(key);
 		if (scanResult != null) {
+			diskHits++;
 			long loadElapsed = System.currentTimeMillis() - loadStart;
 			logger.info("SharedClassGraphCache DISK HIT for key {}… ({}ms)",
 					key.substring(0, Math.min(12, key.length())), loadElapsed);
@@ -404,6 +427,11 @@ public class SharedClassGraphCache {
 		// Before scanning, enforce the held-entries limit by evicting
 		// zero-refcount entries.  This caps total ClassGraph memory.
 		evictUnusedEntries();
+		if (isOverAdmissionBudget(classLoader, key)) {
+			budgetRejects++;
+			logger.warn("ClassGraph scan budget exceeded for key {}… but continuing scan to preserve usability",
+					key.substring(0, Math.min(12, key.length())));
+		}
 
 		try {
 			String[] mergedRejected = getMergedRejectedPackages();
@@ -417,6 +445,7 @@ public class SharedClassGraphCache {
 			long scanElapsed = System.currentTimeMillis() - scanStart;
 			logger.info("ClassGraph scan completed in {}ms ({} URLs)",
 					scanElapsed, classLoader.getURLs().length);
+			scanBuilds++;
 			entry = new CacheEntry(scanResult, key, requestedUrls);
 			cache.put(key, entry);
 			reverseIndex.put(scanResult, key);
@@ -436,6 +465,35 @@ public class SharedClassGraphCache {
 			try { System.gc(); } catch (Throwable ignored) { }
 			return null;
 		}
+	}
+
+	private boolean isOverAdmissionBudget(GroovyClassLoader classLoader, String key) {
+		if (cache.size() >= MAX_HELD_SCANS) {
+			logger.warn("ClassGraph scan budget pressure for key {}…: entry count {} at/above configured limit {}",
+					key.substring(0, Math.min(12, key.length())), cache.size(), MAX_HELD_SCANS);
+			return true;
+		}
+
+		long estimatedBytes = estimateMemoryBytes();
+		long budgetBytes = computeBudgetBytes();
+		if (estimatedBytes >= budgetBytes) {
+			logger.warn("ClassGraph scan budget pressure for key {}…: estimated usage {} MB exceeds budget {} MB "
+					+ "(maxHeap={} MB, urls={})",
+					key.substring(0, Math.min(12, key.length())),
+					estimatedBytes / (1024 * 1024),
+					budgetBytes / (1024 * 1024),
+					Runtime.getRuntime().maxMemory() / (1024 * 1024),
+					classLoader.getURLs().length);
+			return true;
+		}
+
+		return false;
+	}
+
+	private long computeBudgetBytes() {
+		long heapMax = Runtime.getRuntime().maxMemory();
+		long dynamic = (long) (heapMax * DEFAULT_HEAP_BUDGET_FRACTION);
+		return Math.max(MIN_BUDGET_BYTES, dynamic);
 	}
 
 	/**
@@ -784,6 +842,30 @@ public class SharedClassGraphCache {
 		return total;
 	}
 
+	public static final class StatsSnapshot {
+		public final long acquireRequests;
+		public final long exactHits;
+		public final long overlapHits;
+		public final long diskHits;
+		public final long scanBuilds;
+		public final long budgetRejects;
+
+		StatsSnapshot(long acquireRequests, long exactHits, long overlapHits,
+				long diskHits, long scanBuilds, long budgetRejects) {
+			this.acquireRequests = acquireRequests;
+			this.exactHits = exactHits;
+			this.overlapHits = overlapHits;
+			this.diskHits = diskHits;
+			this.scanBuilds = scanBuilds;
+			this.budgetRejects = budgetRejects;
+		}
+	}
+
+	public synchronized StatsSnapshot getStatsSnapshot() {
+		return new StatsSnapshot(acquireRequests, exactHits, overlapHits,
+				diskHits, scanBuilds, budgetRejects);
+	}
+
 	/**
 	 * Close all cached entries and clear the cache. Call on server shutdown.
 	 */
@@ -801,6 +883,12 @@ public class SharedClassGraphCache {
 		}
 		cache.clear();
 		reverseIndex.clear();
+		acquireRequests = 0;
+		exactHits = 0;
+		overlapHits = 0;
+		diskHits = 0;
+		scanBuilds = 0;
+		budgetRejects = 0;
 		logger.info("SharedClassGraphCache cleared");
 	}
 

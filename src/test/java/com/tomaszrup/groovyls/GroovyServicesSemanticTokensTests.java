@@ -22,16 +22,20 @@ package com.tomaszrup.groovyls;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Collections;
 import java.util.List;
 
+import org.eclipse.lsp4j.DidChangeTextDocumentParams;
 import org.eclipse.lsp4j.DidOpenTextDocumentParams;
 import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.Range;
 import org.eclipse.lsp4j.SemanticTokens;
 import org.eclipse.lsp4j.SemanticTokensParams;
 import org.eclipse.lsp4j.SemanticTokensRangeParams;
+import org.eclipse.lsp4j.TextDocumentContentChangeEvent;
 import org.eclipse.lsp4j.TextDocumentIdentifier;
 import org.eclipse.lsp4j.TextDocumentItem;
+import org.eclipse.lsp4j.VersionedTextDocumentIdentifier;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
@@ -126,6 +130,43 @@ class GroovyServicesSemanticTokensTests {
 			}
 		}
 		Assertions.assertTrue(foundClassDecl, "Should find a class declaration token for 'Foo'");
+	}
+
+	@Test
+	void testSemanticTokensRemainAvailableAfterSyntaxErrorOnDidChange() throws Exception {
+		Path filePath = srcRoot.resolve("SemanticBrokenEdit.groovy");
+		String uri = filePath.toUri().toString();
+		String validSource = "class BrokenEdit {\n"
+				+ "  String name\n"
+				+ "  void run() {\n"
+				+ "    println name\n"
+				+ "  }\n"
+				+ "}";
+
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, validSource);
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+
+		SemanticTokens before = services.semanticTokensFull(new SemanticTokensParams(textDocument)).get();
+		Assertions.assertNotNull(before);
+		Assertions.assertFalse(before.getData().isEmpty(),
+				"Precondition failed: expected semantic tokens before introducing syntax error");
+
+		String brokenSource = "class BrokenEdit {\n"
+				+ "  String name\n"
+				+ "  void run() {\n"
+				+ "    println name\n"
+				+ "  }\n";
+
+		DidChangeTextDocumentParams changeParams = new DidChangeTextDocumentParams(
+				new VersionedTextDocumentIdentifier(uri, 2),
+				Collections.singletonList(new TextDocumentContentChangeEvent(brokenSource)));
+		services.didChange(changeParams);
+
+		SemanticTokens after = services.semanticTokensFull(new SemanticTokensParams(textDocument)).get();
+		Assertions.assertNotNull(after);
+		Assertions.assertFalse(after.getData().isEmpty(),
+				"Semantic tokens should remain available after transient syntax errors");
 	}
 
 	@Test
@@ -574,9 +615,182 @@ class GroovyServicesSemanticTokensTests {
 	}
 
 	@Test
+	void testSemanticTokensAnnotationDecorator() throws Exception {
+		Path filePath = srcRoot.resolve("SemanticAnnotation.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("@Deprecated\n");
+		contents.append("class AnnotatedClass {}\n");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+
+		SemanticTokens result = services.semanticTokensFull(new SemanticTokensParams(new TextDocumentIdentifier(uri))).get();
+		List<Integer> data = result.getData();
+		Assertions.assertFalse(data.isEmpty());
+
+		int decoratorIndex = SemanticTokensProvider.TOKEN_TYPES.indexOf("decorator");
+		boolean foundDecorator = false;
+		for (int i = 0; i + 4 < data.size(); i += 5) {
+			int tokenType = data.get(i + 3);
+			int length = data.get(i + 2);
+			if (tokenType == decoratorIndex && length == "Deprecated".length() + 1) {
+				foundDecorator = true;
+				break;
+			}
+		}
+		Assertions.assertTrue(foundDecorator, "Should find decorator token for @Deprecated");
+	}
+
+	@Test
+	void testSemanticTokensEnumMembers() throws Exception {
+		Path filePath = srcRoot.resolve("SemanticEnumMembers.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("enum Flag {\n");
+		contents.append("  ON, OFF\n");
+		contents.append("}\n");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+
+		SemanticTokens result = services.semanticTokensFull(new SemanticTokensParams(new TextDocumentIdentifier(uri))).get();
+		List<Integer> data = result.getData();
+		Assertions.assertFalse(data.isEmpty());
+
+		int enumMemberIndex = SemanticTokensProvider.TOKEN_TYPES.indexOf("enumMember");
+		boolean foundEnumMember = false;
+		for (int i = 0; i + 4 < data.size(); i += 5) {
+			int tokenType = data.get(i + 3);
+			int length = data.get(i + 2);
+			if (tokenType == enumMemberIndex && (length == "ON".length() || length == "OFF".length())) {
+				foundEnumMember = true;
+				break;
+			}
+		}
+		Assertions.assertTrue(foundEnumMember, "Should find enumMember token for enum constants");
+	}
+
+	@Test
+	void testSemanticTokensStaticMethodCallAndMapEntryKey() throws Exception {
+		Path filePath = srcRoot.resolve("SemanticStaticAndMap.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("class StaticAndMap {\n");
+		contents.append("  void run() {\n");
+		contents.append("    Math.abs(-1)\n");
+		contents.append("    foo(name: 'x')\n");
+		contents.append("  }\n");
+		contents.append("  void foo(Map args) {}\n");
+		contents.append("}\n");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+
+		SemanticTokens result = services.semanticTokensFull(new SemanticTokensParams(new TextDocumentIdentifier(uri))).get();
+		List<Integer> data = result.getData();
+		Assertions.assertFalse(data.isEmpty());
+
+		int methodIndex = SemanticTokensProvider.TOKEN_TYPES.indexOf("method");
+		int parameterIndex = SemanticTokensProvider.TOKEN_TYPES.indexOf("parameter");
+		int staticBit = 1 << 1;
+
+		boolean foundStaticMethod = false;
+		boolean foundMapEntryParameter = false;
+		for (int i = 0; i + 4 < data.size(); i += 5) {
+			int tokenType = data.get(i + 3);
+			int modifiers = data.get(i + 4);
+			int length = data.get(i + 2);
+
+			if (tokenType == methodIndex && length == "abs".length() && (modifiers & staticBit) == staticBit) {
+				foundStaticMethod = true;
+			}
+			if (tokenType == parameterIndex && length == "name".length()) {
+				foundMapEntryParameter = true;
+			}
+		}
+
+		Assertions.assertTrue(foundStaticMethod, "Should find static method token for Math.abs");
+		Assertions.assertTrue(foundMapEntryParameter, "Should find parameter token for named arg key 'name'");
+	}
+
+	@Test
 	void testSemanticTokensTypeParameterIndex() throws Exception {
 		// Verify that typeParameter index is 13
 		Assertions.assertEquals(13, SemanticTokensProvider.TOKEN_TYPES.indexOf("typeParameter"),
 				"typeParameter should be at index 13 in TOKEN_TYPES");
+	}
+
+	@Test
+	void testSemanticTokensGenericTypeParametersAreEmitted() throws Exception {
+		Path filePath = srcRoot.resolve("SemanticGenerics.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("class GenericBox<T extends Number> {\n");
+		contents.append("  T value\n");
+		contents.append("  <E extends CharSequence> E id(E input) { input }\n");
+		contents.append("}\n");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+
+		SemanticTokens result = services.semanticTokensFull(new SemanticTokensParams(new TextDocumentIdentifier(uri))).get();
+		List<Integer> data = result.getData();
+		Assertions.assertFalse(data.isEmpty());
+
+		int typeParamIndex = SemanticTokensProvider.TOKEN_TYPES.indexOf("typeParameter");
+		boolean foundTypeParam = false;
+		for (int i = 0; i + 4 < data.size(); i += 5) {
+			int tokenType = data.get(i + 3);
+			if (tokenType == typeParamIndex) {
+				foundTypeParam = true;
+				break;
+			}
+		}
+
+		Assertions.assertTrue(foundTypeParam,
+				"Should find semantic tokens for generic type parameters (T/E)");
+	}
+
+	@Test
+	void testSemanticTokensConstructorCallAndPropertyExpression() throws Exception {
+		Path filePath = srcRoot.resolve("SemanticCtorProperty.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("import java.util.ArrayList\n");
+		contents.append("class CtorProperty {\n");
+		contents.append("  void run() {\n");
+		contents.append("    def list = new ArrayList<String>()\n");
+		contents.append("    def x = String.CASE_INSENSITIVE_ORDER\n");
+		contents.append("    list.size()\n");
+		contents.append("  }\n");
+		contents.append("}\n");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+
+		SemanticTokens result = services.semanticTokensFull(new SemanticTokensParams(new TextDocumentIdentifier(uri))).get();
+		List<Integer> data = result.getData();
+		Assertions.assertFalse(data.isEmpty());
+
+		int classIndex = SemanticTokensProvider.TOKEN_TYPES.indexOf("class");
+		int propertyIndex = SemanticTokensProvider.TOKEN_TYPES.indexOf("property");
+		int methodIndex = SemanticTokensProvider.TOKEN_TYPES.indexOf("method");
+
+		boolean foundConstructorType = false;
+		boolean foundPropertyExpr = false;
+		boolean foundMethodCall = false;
+		for (int i = 0; i + 4 < data.size(); i += 5) {
+			int tokenType = data.get(i + 3);
+			int length = data.get(i + 2);
+			if (tokenType == classIndex && length == "ArrayList".length()) {
+				foundConstructorType = true;
+			}
+			if (tokenType == propertyIndex && length == "CASE_INSENSITIVE_ORDER".length()) {
+				foundPropertyExpr = true;
+			}
+			if (tokenType == methodIndex && length == "size".length()) {
+				foundMethodCall = true;
+			}
+		}
+
+		Assertions.assertTrue(foundConstructorType, "Should find class token for constructor target ArrayList");
+		Assertions.assertTrue(foundPropertyExpr, "Should find property token for String.CASE_INSENSITIVE_ORDER");
+		Assertions.assertTrue(foundMethodCall, "Should find method token for list.size call");
 	}
 }

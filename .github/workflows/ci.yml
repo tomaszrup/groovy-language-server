@@ -29,7 +29,7 @@ jobs:
         run: chmod +x ./gradlew
 
       - name: Build & Test with Coverage
-        run: ./gradlew jacocoTestReport shadowJarSmokeTest
+        run: ./gradlew check jacocoTestReport shadowJarSmokeTest
 
       - name: Generate GLS Coverage Badge
         id: jacoco

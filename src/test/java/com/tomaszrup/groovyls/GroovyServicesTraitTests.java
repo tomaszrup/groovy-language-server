@@ -196,8 +196,11 @@ class GroovyServicesTraitTests {
 		Assertions.assertTrue(symbols.size() > 0);
 		// Trait should appear as Interface symbol kind
 		List<Either<SymbolInformation, DocumentSymbol>> traitSymbols = symbols.stream().filter(symbol -> {
-			SymbolInformation info = symbol.getLeft();
-			return info != null && info.getName().contains("SymTrait")
+			if (!symbol.isRight()) {
+				return false;
+			}
+			DocumentSymbol info = symbol.getRight();
+			return info.getName().contains("SymTrait")
 					&& info.getKind().equals(SymbolKind.Interface);
 		}).collect(Collectors.toList());
 		Assertions.assertEquals(1, traitSymbols.size());
@@ -217,8 +220,11 @@ class GroovyServicesTraitTests {
 		List<Either<SymbolInformation, DocumentSymbol>> symbols = services
 				.documentSymbol(new DocumentSymbolParams(textDocument)).get();
 		List<Either<SymbolInformation, DocumentSymbol>> methodSymbols = symbols.stream().filter(symbol -> {
-			SymbolInformation info = symbol.getLeft();
-			return info != null && info.getName().equals("hello")
+			if (!symbol.isRight()) {
+				return false;
+			}
+			DocumentSymbol info = symbol.getRight();
+			return info.getName().equals("hello")
 					&& info.getKind().equals(SymbolKind.Method);
 		}).collect(Collectors.toList());
 		Assertions.assertEquals(1, methodSymbols.size());

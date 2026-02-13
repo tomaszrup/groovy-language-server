@@ -16,8 +16,9 @@
 package com.tomaszrup.groovyls.util;
 
 import com.tomaszrup.groovyls.ProjectScope;
-import com.tomaszrup.groovyls.compiler.ast.ASTNodeVisitor;
 import com.tomaszrup.groovyls.config.CompilationUnitFactory;
+import io.github.classgraph.ClassGraph;
+import io.github.classgraph.ScanResult;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
@@ -298,6 +299,43 @@ class MemoryProfilerTests {
 		Assertions.assertNotNull(result);
 		Assertions.assertTrue(result.isEmpty(),
 				"Should return empty list when ScanResult is null");
+	}
+
+	@Test
+	void testEstimateScanResultByPackageWithRealScanResult() {
+		CompilationUnitFactory factory = new CompilationUnitFactory();
+		ProjectScope scope = new ProjectScope(PROJECT_A, factory);
+
+		try (ScanResult sr = new ClassGraph()
+				.acceptPackages("com.tomaszrup.groovyls")
+				.enableClassInfo()
+				.scan()) {
+			scope.setClassGraphScanResult(sr);
+			List<MemoryProfiler.PackageMemoryEntry> result = MemoryProfiler.estimateScanResultByPackage(scope);
+			Assertions.assertNotNull(result);
+			Assertions.assertFalse(result.isEmpty(), "Expected non-empty package memory list for project package scan");
+			Assertions.assertTrue(result.stream().allMatch(e -> e.classCount > 0));
+			Assertions.assertTrue(result.stream().allMatch(e -> e.estimatedMB > 0.0));
+		}
+	}
+
+	@Test
+	void testGroupClassesByPackageSortsDescending() {
+		try (ScanResult sr = new ClassGraph()
+				.acceptPackages("com.tomaszrup.groovyls")
+				.enableClassInfo()
+				.scan()) {
+			List<MemoryProfiler.PackageMemoryEntry> entries = MemoryProfiler.groupClassesByPackage(sr, 2);
+			Assertions.assertNotNull(entries);
+			Assertions.assertFalse(entries.isEmpty());
+
+			for (int i = 1; i < entries.size(); i++) {
+				Assertions.assertTrue(entries.get(i - 1).estimatedMB >= entries.get(i).estimatedMB,
+						"Entries should be sorted by estimatedMB descending");
+			}
+			Assertions.assertTrue(entries.stream().allMatch(e -> e.packagePrefix.endsWith(".*")
+					|| "(default)".equals(e.packagePrefix)));
+		}
 	}
 
 	// --- Helpers ---

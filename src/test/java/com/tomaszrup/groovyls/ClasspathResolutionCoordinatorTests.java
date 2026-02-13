@@ -115,7 +115,6 @@ class ClasspathResolutionCoordinatorTests {
 	@Test
 	void testRequestResolutionTriggersAsyncResolve() throws Exception {
 		CountDownLatch resolveCalled = new CountDownLatch(1);
-		CountDownLatch resolutionComplete = new CountDownLatch(1);
 		List<String> resolvedClasspath = Arrays.asList("/lib/resolved.jar");
 
 		// Stub importer that signals when resolve is called
@@ -152,6 +151,8 @@ class ClasspathResolutionCoordinatorTests {
 		}
 		Assertions.assertTrue(scope.isClasspathResolved(),
 				"Scope classpath should be resolved after async task completes");
+		Assertions.assertEquals(ClasspathResolutionCoordinator.ResolutionState.RESOLVED,
+				coordinator.getResolutionState(PROJECT_A));
 
 		// Resolution in-flight flag should be cleared
 		deadline = System.currentTimeMillis() + 5_000;
@@ -213,6 +214,8 @@ class ClasspathResolutionCoordinatorTests {
 		// Resolution completes (fails gracefully) but scope stays unresolved
 		Assertions.assertFalse(scope.isClasspathResolved());
 		Assertions.assertFalse(scopeManager.isResolutionInFlight(PROJECT_A));
+		Assertions.assertEquals(ClasspathResolutionCoordinator.ResolutionState.FAILED,
+				coordinator.getResolutionState(PROJECT_A));
 	}
 
 }

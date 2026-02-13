@@ -74,7 +74,7 @@ class ClasspathCacheTests {
         Files.createDirectories(buildFile);
         Files.write(buildFile.resolve("build.gradle"), "apply plugin: 'java'".getBytes(StandardCharsets.UTF_8));
 
-        Map<String, String> hashes = ClasspathCache.computeBuildFileHashes(
+        Map<String, String> hashes = ClasspathCache.computeBuildFileStamps(
                 Arrays.asList(workspaceRoot.resolve("projectA"), workspaceRoot.resolve("projectB")));
 
         List<Path> discoveredProjects = Arrays.asList(
@@ -109,7 +109,7 @@ class ClasspathCacheTests {
         Files.createDirectories(projectRoot);
         Files.write(projectRoot.resolve("build.gradle"), "v1".getBytes(StandardCharsets.UTF_8));
 
-        Map<String, String> hashes = ClasspathCache.computeBuildFileHashes(
+        Map<String, String> hashes = ClasspathCache.computeBuildFileStamps(
                 Collections.singletonList(projectRoot));
 
         ClasspathCache.CacheData data = new ClasspathCache.CacheData();
@@ -124,7 +124,7 @@ class ClasspathCacheTests {
         Files.createDirectories(projectRoot);
         Files.write(projectRoot.resolve("build.gradle"), "v1".getBytes(StandardCharsets.UTF_8));
 
-        Map<String, String> originalHashes = ClasspathCache.computeBuildFileHashes(
+        Map<String, String> originalHashes = ClasspathCache.computeBuildFileStamps(
                 Collections.singletonList(projectRoot));
 
         // Modify the build file — use different size to guarantee stamp change
@@ -132,7 +132,7 @@ class ClasspathCacheTests {
         Files.write(projectRoot.resolve("build.gradle"),
                 "version 2 — changed content with different length".getBytes(StandardCharsets.UTF_8));
 
-        Map<String, String> newHashes = ClasspathCache.computeBuildFileHashes(
+        Map<String, String> newHashes = ClasspathCache.computeBuildFileStamps(
                 Collections.singletonList(projectRoot));
 
         ClasspathCache.CacheData data = new ClasspathCache.CacheData();
@@ -147,14 +147,14 @@ class ClasspathCacheTests {
         Files.createDirectories(projectRoot);
         Files.write(projectRoot.resolve("build.gradle"), "v1".getBytes(StandardCharsets.UTF_8));
 
-        Map<String, String> originalHashes = ClasspathCache.computeBuildFileHashes(
+        Map<String, String> originalHashes = ClasspathCache.computeBuildFileStamps(
                 Collections.singletonList(projectRoot));
 
         // Add a settings.gradle that didn't exist before
         Files.write(projectRoot.resolve("settings.gradle"),
                 "rootProject.name = 'test'".getBytes(StandardCharsets.UTF_8));
 
-        Map<String, String> newHashes = ClasspathCache.computeBuildFileHashes(
+        Map<String, String> newHashes = ClasspathCache.computeBuildFileStamps(
                 Collections.singletonList(projectRoot));
 
         ClasspathCache.CacheData data = new ClasspathCache.CacheData();
@@ -171,13 +171,13 @@ class ClasspathCacheTests {
         Files.write(projectRoot.resolve("build.gradle"), "v1".getBytes(StandardCharsets.UTF_8));
         Files.write(projectRoot.resolve("settings.gradle"), "s1".getBytes(StandardCharsets.UTF_8));
 
-        Map<String, String> originalHashes = ClasspathCache.computeBuildFileHashes(
+        Map<String, String> originalHashes = ClasspathCache.computeBuildFileStamps(
                 Collections.singletonList(projectRoot));
 
         // Delete settings.gradle
         Files.delete(projectRoot.resolve("settings.gradle"));
 
-        Map<String, String> newHashes = ClasspathCache.computeBuildFileHashes(
+        Map<String, String> newHashes = ClasspathCache.computeBuildFileStamps(
                 Collections.singletonList(projectRoot));
 
         ClasspathCache.CacheData data = new ClasspathCache.CacheData();
@@ -261,7 +261,7 @@ class ClasspathCacheTests {
         // Only create build.gradle, not settings.gradle etc.
         Files.write(projectRoot.resolve("build.gradle"), "apply plugin: 'java'".getBytes(StandardCharsets.UTF_8));
 
-        Map<String, String> hashes = ClasspathCache.computeBuildFileHashes(
+        Map<String, String> hashes = ClasspathCache.computeBuildFileStamps(
                 Collections.singletonList(projectRoot));
 
         assertEquals(1, hashes.size(), "Only existing build files should be hashed");
@@ -276,7 +276,7 @@ class ClasspathCacheTests {
         Files.write(projectRoot.resolve("settings.gradle"), "s1".getBytes(StandardCharsets.UTF_8));
         Files.write(projectRoot.resolve("pom.xml"), "<project/>".getBytes(StandardCharsets.UTF_8));
 
-        Map<String, String> hashes = ClasspathCache.computeBuildFileHashes(
+        Map<String, String> hashes = ClasspathCache.computeBuildFileStamps(
                 Collections.singletonList(projectRoot));
 
         assertEquals(3, hashes.size());
@@ -291,7 +291,7 @@ class ClasspathCacheTests {
         Files.write(rootA.resolve("build.gradle"), "a".getBytes(StandardCharsets.UTF_8));
         Files.write(rootB.resolve("pom.xml"), "b".getBytes(StandardCharsets.UTF_8));
 
-        Map<String, String> hashes = ClasspathCache.computeBuildFileHashes(
+        Map<String, String> hashes = ClasspathCache.computeBuildFileStamps(
                 Arrays.asList(rootA, rootB));
 
         assertEquals(2, hashes.size());
@@ -342,7 +342,7 @@ class ClasspathCacheTests {
         Files.write(projectRoot.resolve("build.gradle"), "v1".getBytes(StandardCharsets.UTF_8));
         Files.write(gradleDir.resolve("libs.versions.toml"), "[versions]".getBytes(StandardCharsets.UTF_8));
 
-        Map<String, String> hashes = ClasspathCache.computeBuildFileHashes(
+        Map<String, String> hashes = ClasspathCache.computeBuildFileStamps(
                 Collections.singletonList(projectRoot));
 
         assertEquals(2, hashes.size());

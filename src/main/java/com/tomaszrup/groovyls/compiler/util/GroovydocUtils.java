@@ -232,16 +232,6 @@ public class GroovydocUtils {
 		}
 	}
 
-	/**
-	 * Placeholder overload used during initial line processing. Not actually
-	 * used in the final implementation but kept for API compatibility.
-	 */
-	private static void processGroovydocLine(String line, StringBuilder description,
-			List<String> paramDocs, List<String> throwsDocs, List<String> seeDocs,
-			String[] tagType, StringBuilder[] tagContent) {
-		// no-op; real processing happens in the main loop
-	}
-
 	private static String reformatLine(String line) {
 		// remove all attributes (including namespaced)
 		line = line.replaceAll("<(\\w+)(?:\\s+\\w+(?::\\w+)?=(\"|\')[^\"\']*\\2)*\\s*(\\/{0,1})>", "<$1$3>");

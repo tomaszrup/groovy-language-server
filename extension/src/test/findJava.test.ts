@@ -203,7 +203,6 @@ describe("findJava", () => {
   });
 
   it("should skip non-file entries in PATH", () => {
-    const dirPath = path.join("/some/dir", javaExe);
     process.env.PATH = "/some/dir";
 
     // existsSync returns true but isFile returns false (it's a directory)

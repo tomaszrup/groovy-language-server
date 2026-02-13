@@ -4,7 +4,13 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+
+import javax.tools.JavaCompiler;
+import javax.tools.ToolProvider;
 
 import org.eclipse.lsp4j.CodeAction;
 import org.eclipse.lsp4j.CodeActionContext;
@@ -12,7 +18,10 @@ import org.eclipse.lsp4j.CodeActionParams;
 import org.eclipse.lsp4j.Command;
 import org.eclipse.lsp4j.Diagnostic;
 import org.eclipse.lsp4j.DiagnosticSeverity;
+import org.eclipse.lsp4j.DidChangeWatchedFilesParams;
 import org.eclipse.lsp4j.DidOpenTextDocumentParams;
+import org.eclipse.lsp4j.FileChangeType;
+import org.eclipse.lsp4j.FileEvent;
 import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.Range;
 import org.eclipse.lsp4j.TextDocumentIdentifier;
@@ -145,6 +154,173 @@ class GroovyServicesCodeActionTests {
 
 		Assertions.assertTrue(result.isEmpty(),
 				"Should not suggest any imports for non-class-resolution errors");
+	}
+
+	@Test
+	void testCodeActionAfterClassMoveSuggestsNewPackageImport() throws Exception {
+		Path oldClassPath = srcRoot.resolve("com/example/SomeClass.groovy");
+		Files.createDirectories(oldClassPath.getParent());
+		Files.writeString(oldClassPath,
+				"package com.example\n\nclass SomeClass {\n}\n");
+
+		Path testFilePath = srcRoot.resolve("com/test/TestImportMove.groovy");
+		Files.createDirectories(testFilePath.getParent());
+		String testContents = "package com.test\n\nclass TestImportMove {\n  SomeClass value\n}\n";
+		Files.writeString(testFilePath, testContents);
+
+		String testUri = testFilePath.toUri().toString();
+		services.didOpen(new DidOpenTextDocumentParams(
+				new TextDocumentItem(testUri, LANGUAGE_GROOVY, 1, testContents)));
+
+		Path newClassPath = srcRoot.resolve("com/other/SomeClass.groovy");
+		Files.createDirectories(newClassPath.getParent());
+		Files.writeString(newClassPath,
+				"package com.other\n\nclass SomeClass {\n}\n");
+		Files.deleteIfExists(oldClassPath);
+
+		List<FileEvent> events = new ArrayList<>();
+		events.add(new FileEvent(oldClassPath.toUri().toString(), FileChangeType.Deleted));
+		events.add(new FileEvent(newClassPath.toUri().toString(), FileChangeType.Created));
+		services.didChangeWatchedFiles(new DidChangeWatchedFilesParams(events));
+
+		Diagnostic diagnostic = new Diagnostic();
+		diagnostic.setRange(new Range(new Position(3, 2), new Position(3, 11)));
+		diagnostic.setSeverity(DiagnosticSeverity.Error);
+		diagnostic.setMessage("unable to resolve class SomeClass");
+
+		CodeActionContext context = new CodeActionContext(Collections.singletonList(diagnostic));
+		CodeActionParams params = new CodeActionParams(
+				new TextDocumentIdentifier(testUri),
+				new Range(new Position(3, 2), new Position(3, 11)),
+				context);
+
+		List<Either<Command, CodeAction>> result = services.codeAction(params).get();
+
+		boolean hasNewPackageImport = result.stream()
+				.filter(Either::isRight)
+				.map(Either::getRight)
+				.anyMatch(action -> "Add import: com.other.SomeClass".equals(action.getTitle()));
+
+		boolean hasOldPackageImport = result.stream()
+				.filter(Either::isRight)
+				.map(Either::getRight)
+				.anyMatch(action -> "Add import: com.example.SomeClass".equals(action.getTitle()));
+
+		Assertions.assertTrue(hasNewPackageImport,
+				"Should suggest import from the new package after class move");
+		Assertions.assertFalse(hasOldPackageImport,
+				"Should not suggest stale import from the old package after class move");
+	}
+
+	@Test
+	void testCodeActionAfterJavaClassMoveSuggestsNewPackageImport() throws Exception {
+		services.connect(new org.eclipse.lsp4j.services.LanguageClient() {
+			@Override
+			public void telemetryEvent(Object object) {
+			}
+
+			@Override
+			public java.util.concurrent.CompletableFuture<org.eclipse.lsp4j.MessageActionItem> showMessageRequest(
+					org.eclipse.lsp4j.ShowMessageRequestParams requestParams) {
+				return java.util.concurrent.CompletableFuture.completedFuture(null);
+			}
+
+			@Override
+			public void showMessage(org.eclipse.lsp4j.MessageParams messageParams) {
+			}
+
+			@Override
+			public void publishDiagnostics(org.eclipse.lsp4j.PublishDiagnosticsParams diagnostics) {
+			}
+
+			@Override
+			public void logMessage(org.eclipse.lsp4j.MessageParams message) {
+			}
+
+			@Override
+			public java.util.concurrent.CompletableFuture<Void> refreshSemanticTokens() {
+				return java.util.concurrent.CompletableFuture.completedFuture(null);
+			}
+		});
+
+		Path classesDir = workspaceRoot.resolve("build/test-java-classes");
+		Files.createDirectories(classesDir);
+
+		Path oldJavaPath = workspaceRoot.resolve("src/main/java/com/example/SomeClass.java");
+		Files.createDirectories(oldJavaPath.getParent());
+		Files.writeString(oldJavaPath,
+				"package com.example;\n\npublic class SomeClass {\n}\n");
+		compileJavaSource(oldJavaPath, classesDir);
+
+		services.addProjects(Collections.singletonMap(workspaceRoot,
+				Collections.singletonList(classesDir.toString())));
+
+		Path testFilePath = srcRoot.resolve("com/test/TestJavaImportMove.groovy");
+		Files.createDirectories(testFilePath.getParent());
+		String testContents = "package com.test\n\nclass TestJavaImportMove {\n  SomeClass value\n}\n";
+		Files.writeString(testFilePath, testContents);
+		String testUri = testFilePath.toUri().toString();
+		services.didOpen(new DidOpenTextDocumentParams(
+				new TextDocumentItem(testUri, LANGUAGE_GROOVY, 1, testContents)));
+
+		Path newJavaPath = workspaceRoot.resolve("src/main/java/com/other/SomeClass.java");
+		Files.createDirectories(newJavaPath.getParent());
+		Files.writeString(newJavaPath,
+				"package com.other;\n\npublic class SomeClass {\n}\n");
+		compileJavaSource(newJavaPath, classesDir);
+		Files.deleteIfExists(oldJavaPath);
+		Files.deleteIfExists(classesDir.resolve("com/example/SomeClass.class"));
+
+		CountDownLatch javaMoveLatch = new CountDownLatch(1);
+		services.setJavaChangeListener(root -> javaMoveLatch.countDown());
+
+		List<FileEvent> events = new ArrayList<>();
+		events.add(new FileEvent(oldJavaPath.toUri().toString(), FileChangeType.Deleted));
+		events.add(new FileEvent(newJavaPath.toUri().toString(), FileChangeType.Created));
+		services.didChangeWatchedFiles(new DidChangeWatchedFilesParams(events));
+
+		Assertions.assertTrue(javaMoveLatch.await(5, TimeUnit.SECONDS),
+				"Expected Java move watcher events to trigger recompile callback");
+		Thread.sleep(300);
+
+		Diagnostic diagnostic = new Diagnostic();
+		diagnostic.setRange(new Range(new Position(3, 2), new Position(3, 11)));
+		diagnostic.setSeverity(DiagnosticSeverity.Error);
+		diagnostic.setMessage("unable to resolve class SomeClass");
+
+		CodeActionContext context = new CodeActionContext(Collections.singletonList(diagnostic));
+		CodeActionParams params = new CodeActionParams(
+				new TextDocumentIdentifier(testUri),
+				new Range(new Position(3, 2), new Position(3, 11)),
+				context);
+
+		List<Either<Command, CodeAction>> result = services.codeAction(params).get();
+
+		boolean hasNewPackageImport = result.stream()
+				.filter(Either::isRight)
+				.map(Either::getRight)
+				.anyMatch(action -> "Add import: com.other.SomeClass".equals(action.getTitle()));
+
+		boolean hasOldPackageImport = result.stream()
+				.filter(Either::isRight)
+				.map(Either::getRight)
+				.anyMatch(action -> "Add import: com.example.SomeClass".equals(action.getTitle()));
+
+		Assertions.assertTrue(hasNewPackageImport,
+				"Should suggest import from moved Java class package");
+		Assertions.assertFalse(hasOldPackageImport,
+				"Should not suggest stale import for old Java package after class move");
+	}
+
+	private static void compileJavaSource(Path sourceFile, Path outputDir) {
+		JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
+		Assertions.assertNotNull(compiler,
+				"System Java compiler is required for Java source move regression test");
+		int exitCode = compiler.run(null, null, null,
+				"-d", outputDir.toString(),
+				sourceFile.toString());
+		Assertions.assertEquals(0, exitCode,
+				"Expected Java fixture source compilation to succeed for " + sourceFile);
 	}
 
 	@Test

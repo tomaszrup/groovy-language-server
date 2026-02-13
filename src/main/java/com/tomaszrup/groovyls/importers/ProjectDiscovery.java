@@ -112,7 +112,7 @@ public final class ProjectDiscovery {
 
         // Use a FileVisitor so we can SKIP_SUBTREE for pruned directories
         Files.walkFileTree(workspaceRoot, EnumSet.noneOf(FileVisitOption.class),
-                Integer.MAX_VALUE, new SimpleFileVisitor<>() {
+            Integer.MAX_VALUE, new SimpleFileVisitor<Path>() {
 
             @Override
             public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {

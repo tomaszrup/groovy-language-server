@@ -443,7 +443,7 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 				logger.debug("  excludedSubRoots: {}", excludedSubRoots);
 				Path normalizedRoot = dirPath.normalize();
 
-				Files.walkFileTree(normalizedRoot, new SimpleFileVisitor<>() {
+				Files.walkFileTree(normalizedRoot, new SimpleFileVisitor<Path>() {
 					@Override
 					public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
 						// Never prune the root itself

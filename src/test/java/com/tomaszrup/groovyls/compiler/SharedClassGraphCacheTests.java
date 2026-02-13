@@ -25,9 +25,9 @@ import org.junit.jupiter.api.Test;
 
 import java.io.File;
 import java.io.IOException;
-import java.net.MalformedURLException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Set;
 
 /**
@@ -438,6 +438,55 @@ class SharedClassGraphCacheTests {
 		Assertions.assertTrue(urls.size() >= 1);
 
 		Files.deleteIfExists(tempJar);
+	}
+
+	// ------------------------------------------------------------------
+	// Additional coverage for stats/config APIs
+	// ------------------------------------------------------------------
+
+	@Test
+	void testSetAdditionalRejectedPackagesChangesClasspathKey() {
+		GroovyClassLoader cl = createClassLoader();
+		String keyBefore = cache.computeClasspathKey(cl);
+
+		cache.setAdditionalRejectedPackages(List.of("java.awt", "javax.swing"));
+		String keyAfter = cache.computeClasspathKey(cl);
+
+		Assertions.assertNotEquals(keyBefore, keyAfter,
+				"Changing rejected packages should produce a different classpath key");
+
+		cache.setAdditionalRejectedPackages(null);
+		String keyReset = cache.computeClasspathKey(cl);
+		Assertions.assertNotNull(keyReset);
+	}
+
+	@Test
+	void testStatsSnapshotAndRefCountAccessors() {
+		GroovyClassLoader cl = createClassLoader();
+		ScanResult first = cache.acquire(cl);
+		ScanResult second = cache.acquire(cl);
+
+		Assertions.assertSame(first, second);
+		Assertions.assertTrue(cache.getEntryCount() >= 1);
+		Assertions.assertTrue(cache.getTotalRefCount() >= 2);
+
+		SharedClassGraphCache.StatsSnapshot stats = cache.getStatsSnapshot();
+		Assertions.assertTrue(stats.acquireRequests >= 2);
+	}
+
+	@Test
+	void testGetTopPackagesByMemoryAndEstimateMemoryBytes() {
+		GroovyClassLoader cl = createClassLoader();
+		ScanResult result = cache.acquire(cl);
+		Assertions.assertNotNull(result);
+
+		long estimatedBytes = cache.estimateMemoryBytes();
+		Assertions.assertTrue(estimatedBytes > 0, "Estimated bytes should be positive after acquire");
+
+		List<com.tomaszrup.groovyls.util.MemoryProfiler.PackageMemoryEntry> topPackages =
+				cache.getTopPackagesByMemory(5);
+		Assertions.assertNotNull(topPackages);
+		Assertions.assertTrue(topPackages.size() <= 5);
 	}
 
 	// ------------------------------------------------------------------

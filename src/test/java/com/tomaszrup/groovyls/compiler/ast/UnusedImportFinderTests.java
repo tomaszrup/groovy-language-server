@@ -16,7 +16,6 @@
 package com.tomaszrup.groovyls.compiler.ast;
 
 import java.net.URI;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 

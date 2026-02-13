@@ -2,7 +2,7 @@
   "name": "groovy-spock-support",
   "displayName": "Groovy & Spock Language Support",
   "description": "Language support for Groovy and Spock",
-  "version": "0.1.19",
+  "version": "0.2.0",
   "publisher": "TomaszRup",
   "homepage": "https://github.com/tomaszrup/groovy-language-server",
   "repository": {
@@ -44,9 +44,6 @@
     "webpack": "^5.99.9",
     "webpack-cli": "^6.0.1"
   },
-  "activationEvents": [
-    "onLanguage:groovy"
-  ],
   "contributes": {
     "languages": [
       {
@@ -177,6 +174,11 @@
             "type": "string",
             "enum": ["Gradle", "Maven"]
           }
+        },
+        "groovy.classpath.cache.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable persistent classpath cache between language-server restarts. Disable for troubleshooting classpath-resolution issues at the cost of slower startup/classpath warmup."
         },
         "groovy.memory.scopeEvictionTTL": {
           "type": "number",

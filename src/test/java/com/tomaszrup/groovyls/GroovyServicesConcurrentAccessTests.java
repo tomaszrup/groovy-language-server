@@ -36,7 +36,6 @@ import org.eclipse.lsp4j.CompletionList;
 import org.eclipse.lsp4j.CompletionParams;
 import org.eclipse.lsp4j.DidChangeTextDocumentParams;
 import org.eclipse.lsp4j.DidOpenTextDocumentParams;
-import org.eclipse.lsp4j.Hover;
 import org.eclipse.lsp4j.HoverParams;
 import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.TextDocumentContentChangeEvent;
@@ -119,7 +118,7 @@ class GroovyServicesConcurrentAccessTests {
 					HoverParams params = new HoverParams(
 							new TextDocumentIdentifier(uri),
 							new Position(line, 5));
-					Hover result = services.hover(params).get(10, TimeUnit.SECONDS);
+					services.hover(params).get(10, TimeUnit.SECONDS);
 					// result may be null, that's OK; we just want no exception
 				} catch (Exception e) {
 					errors.incrementAndGet();

@@ -32,7 +32,6 @@ import java.nio.file.*;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.*;
-import java.util.stream.Collectors;
 
 /**
  * Persistent on-disk cache for resolved Gradle/Maven classpaths.
@@ -534,16 +533,6 @@ public class ClasspathCache {
     }
 
     // ---- Hashing helpers ----
-
-    private static String sha256(Path file) {
-        try {
-            byte[] bytes = Files.readAllBytes(file);
-            return sha256Hex(bytes);
-        } catch (IOException e) {
-            logger.debug("Could not read file for hashing: {}", file);
-            return null;
-        }
-    }
 
     static String sha256Hex(byte[] data) {
         try {

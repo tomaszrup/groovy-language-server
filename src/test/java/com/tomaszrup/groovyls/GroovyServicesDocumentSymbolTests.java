@@ -28,7 +28,6 @@ import java.util.stream.Collectors;
 import org.eclipse.lsp4j.DidOpenTextDocumentParams;
 import org.eclipse.lsp4j.DocumentSymbol;
 import org.eclipse.lsp4j.DocumentSymbolParams;
-import org.eclipse.lsp4j.SymbolInformation;
 import org.eclipse.lsp4j.SymbolKind;
 import org.eclipse.lsp4j.TextDocumentIdentifier;
 import org.eclipse.lsp4j.TextDocumentItem;
@@ -86,15 +85,15 @@ class GroovyServicesDocumentSymbolTests {
 		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
 
 		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
-		List<Either<SymbolInformation, DocumentSymbol>> symbols = services
+		List<Either<org.eclipse.lsp4j.SymbolInformation, DocumentSymbol>> symbols = services
 				.documentSymbol(new DocumentSymbolParams(textDocument)).get();
 
 		Assertions.assertNotNull(symbols, "Document symbols should not be null");
 		Assertions.assertFalse(symbols.isEmpty(), "Should have at least one symbol for the class");
 
-		List<SymbolInformation> classSymbols = symbols.stream()
-				.filter(Either::isLeft)
-				.map(Either::getLeft)
+		List<DocumentSymbol> classSymbols = symbols.stream()
+				.filter(Either::isRight)
+				.map(Either::getRight)
 				.filter(s -> s.getKind() == SymbolKind.Class)
 				.collect(Collectors.toList());
 		Assertions.assertFalse(classSymbols.isEmpty(), "Should have a class symbol");
@@ -115,12 +114,12 @@ class GroovyServicesDocumentSymbolTests {
 		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
 
 		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
-		List<Either<SymbolInformation, DocumentSymbol>> symbols = services
+		List<Either<org.eclipse.lsp4j.SymbolInformation, DocumentSymbol>> symbols = services
 				.documentSymbol(new DocumentSymbolParams(textDocument)).get();
 
-		List<SymbolInformation> methodSymbols = symbols.stream()
-				.filter(Either::isLeft)
-				.map(Either::getLeft)
+		List<DocumentSymbol> methodSymbols = symbols.stream()
+				.filter(Either::isRight)
+				.map(Either::getRight)
 				.filter(s -> s.getKind() == SymbolKind.Method)
 				.collect(Collectors.toList());
 		Assertions.assertTrue(methodSymbols.size() >= 2,
@@ -140,12 +139,12 @@ class GroovyServicesDocumentSymbolTests {
 		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
 
 		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
-		List<Either<SymbolInformation, DocumentSymbol>> symbols = services
+		List<Either<org.eclipse.lsp4j.SymbolInformation, DocumentSymbol>> symbols = services
 				.documentSymbol(new DocumentSymbolParams(textDocument)).get();
 
-		List<SymbolInformation> fieldSymbols = symbols.stream()
-				.filter(Either::isLeft)
-				.map(Either::getLeft)
+		List<DocumentSymbol> fieldSymbols = symbols.stream()
+				.filter(Either::isRight)
+				.map(Either::getRight)
 				.filter(s -> s.getKind() == SymbolKind.Field || s.getKind() == SymbolKind.Property)
 				.collect(Collectors.toList());
 		Assertions.assertTrue(fieldSymbols.size() >= 2,
@@ -164,12 +163,12 @@ class GroovyServicesDocumentSymbolTests {
 		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
 
 		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
-		List<Either<SymbolInformation, DocumentSymbol>> symbols = services
+		List<Either<org.eclipse.lsp4j.SymbolInformation, DocumentSymbol>> symbols = services
 				.documentSymbol(new DocumentSymbolParams(textDocument)).get();
 
-		List<SymbolInformation> interfaceSymbols = symbols.stream()
-				.filter(Either::isLeft)
-				.map(Either::getLeft)
+		List<DocumentSymbol> interfaceSymbols = symbols.stream()
+				.filter(Either::isRight)
+				.map(Either::getRight)
 				.filter(s -> s.getKind() == SymbolKind.Interface)
 				.collect(Collectors.toList());
 		Assertions.assertFalse(interfaceSymbols.isEmpty(), "Should have an interface symbol");
@@ -187,12 +186,12 @@ class GroovyServicesDocumentSymbolTests {
 		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
 
 		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
-		List<Either<SymbolInformation, DocumentSymbol>> symbols = services
+		List<Either<org.eclipse.lsp4j.SymbolInformation, DocumentSymbol>> symbols = services
 				.documentSymbol(new DocumentSymbolParams(textDocument)).get();
 
-		List<SymbolInformation> enumSymbols = symbols.stream()
-				.filter(Either::isLeft)
-				.map(Either::getLeft)
+		List<DocumentSymbol> enumSymbols = symbols.stream()
+				.filter(Either::isRight)
+				.map(Either::getRight)
 				.filter(s -> s.getKind() == SymbolKind.Enum)
 				.collect(Collectors.toList());
 		Assertions.assertFalse(enumSymbols.isEmpty(), "Should have an enum symbol");
@@ -212,7 +211,7 @@ class GroovyServicesDocumentSymbolTests {
 		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
 
 		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
-		List<Either<SymbolInformation, DocumentSymbol>> symbols = services
+		List<Either<org.eclipse.lsp4j.SymbolInformation, DocumentSymbol>> symbols = services
 				.documentSymbol(new DocumentSymbolParams(textDocument)).get();
 
 		// Should have at least 3 symbols: 1 class + 1 property/field + 1 method (+ possibly count field)
@@ -228,7 +227,7 @@ class GroovyServicesDocumentSymbolTests {
 		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
 
 		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
-		List<Either<SymbolInformation, DocumentSymbol>> symbols = services
+		List<Either<org.eclipse.lsp4j.SymbolInformation, DocumentSymbol>> symbols = services
 				.documentSymbol(new DocumentSymbolParams(textDocument)).get();
 
 		Assertions.assertNotNull(symbols, "Document symbols should not be null for empty file");
@@ -250,13 +249,13 @@ class GroovyServicesDocumentSymbolTests {
 		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
 
 		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
-		List<Either<SymbolInformation, DocumentSymbol>> symbols = services
+		List<Either<org.eclipse.lsp4j.SymbolInformation, DocumentSymbol>> symbols = services
 				.documentSymbol(new DocumentSymbolParams(textDocument)).get();
 
 		// Should include the constructor as a method symbol
-		List<SymbolInformation> methodSymbols = symbols.stream()
-				.filter(Either::isLeft)
-				.map(Either::getLeft)
+		List<DocumentSymbol> methodSymbols = symbols.stream()
+				.filter(Either::isRight)
+				.map(Either::getRight)
 				.filter(s -> s.getKind() == SymbolKind.Method || s.getKind() == SymbolKind.Constructor)
 				.collect(Collectors.toList());
 		Assertions.assertFalse(methodSymbols.isEmpty(),
@@ -275,16 +274,15 @@ class GroovyServicesDocumentSymbolTests {
 		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
 
 		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
-		List<Either<SymbolInformation, DocumentSymbol>> symbols = services
+		List<Either<org.eclipse.lsp4j.SymbolInformation, DocumentSymbol>> symbols = services
 				.documentSymbol(new DocumentSymbolParams(textDocument)).get();
 
 		// Verify that all symbols have valid locations
-		for (Either<SymbolInformation, DocumentSymbol> symbol : symbols) {
-			if (symbol.isLeft()) {
-				SymbolInformation info = symbol.getLeft();
-				Assertions.assertNotNull(info.getLocation(), "Symbol should have a location");
-				Assertions.assertEquals(uri, info.getLocation().getUri(),
-						"Symbol location URI should match the document");
+		for (Either<org.eclipse.lsp4j.SymbolInformation, DocumentSymbol> symbol : symbols) {
+			if (symbol.isRight()) {
+				DocumentSymbol info = symbol.getRight();
+				Assertions.assertNotNull(info.getRange(), "Symbol should have a range");
+				Assertions.assertNotNull(info.getSelectionRange(), "Symbol should have a selection range");
 			}
 		}
 	}

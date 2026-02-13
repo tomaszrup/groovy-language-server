@@ -147,6 +147,7 @@ public class GroovyLanguageServerUtils {
 		return new Location(uri.toString(), range);
 	}
 
+	@SuppressWarnings("deprecation")
 	public static SymbolInformation astNodeToSymbolInformation(ClassNode node, URI uri, String parentName) {
 		Location location = astNodeToLocation(node, uri);
 		if (location == null) {
@@ -157,6 +158,7 @@ public class GroovyLanguageServerUtils {
 				parentName);
 	}
 
+	@SuppressWarnings("deprecation")
 	public static SymbolInformation astNodeToSymbolInformation(MethodNode node, URI uri, String parentName) {
 		Location location = astNodeToLocation(node, uri);
 		if (location == null) {
@@ -167,6 +169,7 @@ public class GroovyLanguageServerUtils {
 				parentName);
 	}
 
+	@SuppressWarnings("deprecation")
 	public static SymbolInformation astNodeToSymbolInformation(Variable node, URI uri, String parentName) {
 		if (!(node instanceof ASTNode)) {
 			// DynamicVariable isn't an ASTNode

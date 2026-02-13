@@ -38,7 +38,7 @@ public interface GroovyLanguageClient extends LanguageClient {
      *               ({@code "importing"}, {@code "ready"}, {@code "error"})
      *               and an optional {@code message} detail
      */
-    @JsonNotification("groovy/statusUpdate")
+    @JsonNotification(Protocol.NOTIFICATION_STATUS_UPDATE)
     void statusUpdate(StatusUpdateParams params);
 
     /**
@@ -46,6 +46,6 @@ public interface GroovyLanguageClient extends LanguageClient {
      *
      * @param params a JSON object with {@code usedMB} and {@code maxMB} fields
      */
-    @JsonNotification("groovy/memoryUsage")
+    @JsonNotification(Protocol.NOTIFICATION_MEMORY_USAGE)
     void memoryUsage(MemoryUsageParams params);
 }

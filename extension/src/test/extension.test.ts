@@ -26,12 +26,44 @@
 import { vi } from "vitest";
 import * as vscode from "vscode";
 
-// Mock vscode-languageclient/node before importing extension
-vi.mock("vscode-languageclient/node", () => ({
-  LanguageClient: vi.fn().mockImplementation(() => ({
+const { mockLanguageClientCtor } = vi.hoisted(() => ({
+  mockLanguageClientCtor: vi.fn().mockImplementation(() => ({
     start: vi.fn().mockResolvedValue(undefined),
     stop: vi.fn().mockResolvedValue(undefined),
+    onDidChangeState: vi.fn(),
+    onNotification: vi.fn(),
+    sendRequest: vi.fn().mockResolvedValue(""),
   })),
+}));
+
+// Mock vscode-languageclient/node before importing extension
+vi.mock("vscode-languageclient/node", () => ({
+  LanguageClient: mockLanguageClientCtor,
+  State: {
+    Running: 2,
+    Stopped: 3,
+  },
+  ErrorAction: {
+    Continue: 1,
+  },
+  CloseAction: {
+    DoNotRestart: 1,
+    Restart: 2,
+  },
+}));
+vi.mock("vscode-languageclient/node.js", () => ({
+  LanguageClient: mockLanguageClientCtor,
+  State: {
+    Running: 2,
+    Stopped: 3,
+  },
+  ErrorAction: {
+    Continue: 1,
+  },
+  CloseAction: {
+    DoNotRestart: 1,
+    Restart: 2,
+  },
 }));
 
 // Mock findJava
@@ -48,6 +80,13 @@ describe("extension", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockLanguageClientCtor.mockImplementation(() => ({
+      start: vi.fn().mockResolvedValue(undefined),
+      stop: vi.fn().mockResolvedValue(undefined),
+      onDidChangeState: vi.fn(),
+      onNotification: vi.fn(),
+      sendRequest: vi.fn().mockResolvedValue(""),
+    }));
 
     // Reset findJava mock to return a valid path
     vi.mocked(findJava).mockReturnValue("/usr/bin/java");
@@ -121,6 +160,149 @@ describe("extension", () => {
     expect(findJava).toHaveBeenCalled();
   });
 
+  it("should construct language client on activation", async () => {
+    activate(mockContext);
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(mockLanguageClientCtor).toHaveBeenCalled();
+  });
+
+  it("restart command should stop existing client", async () => {
+    activate(mockContext);
+    await new Promise((r) => setTimeout(r, 30));
+
+    const firstClient = mockLanguageClientCtor.mock.results[0].value;
+    const restartHandler = (vscode.commands.registerCommand as ReturnType<typeof vi.fn>)
+      .mock.calls.find((c: any[]) => c[0] === "groovy.restartServer")?.[1];
+
+    await restartHandler();
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(firstClient.stop).toHaveBeenCalled();
+  });
+
+  it("error handler closed should restart up to limit then stop", async () => {
+    activate(mockContext);
+    await new Promise((r) => setTimeout(r, 30));
+
+    const clientOptions = mockLanguageClientCtor.mock.calls[0][3];
+    const closed = clientOptions.errorHandler.closed;
+
+    expect(closed().action).toBe(2);
+    expect(closed().action).toBe(2);
+    expect(closed().action).toBe(2);
+    expect(closed().action).toBe(2);
+    expect(closed().action).toBe(2);
+    expect(closed().action).toBe(1);
+  });
+
+  it("status and memory notifications should update extension state paths", async () => {
+    activate(mockContext);
+    await new Promise((r) => setTimeout(r, 30));
+
+    const client = mockLanguageClientCtor.mock.results[0].value;
+    const notificationCalls = client.onNotification.mock.calls as any[];
+
+    const statusHandler = notificationCalls.find((c) => c[0] === "groovy/statusUpdate")?.[1];
+    const memoryHandler = notificationCalls.find((c) => c[0] === "groovy/memoryUsage")?.[1];
+
+    expect(statusHandler).toBeDefined();
+    expect(memoryHandler).toBeDefined();
+
+    statusHandler({ state: "importing", message: "Loading project model" });
+    statusHandler({ state: "ready" });
+    memoryHandler({ usedMB: 128, maxMB: 512, activeScopes: 2, evictedScopes: 1, totalScopes: 3 });
+    statusHandler({ state: "error" });
+
+    const statusBarItem = (vscode.window.createStatusBarItem as ReturnType<typeof vi.fn>).mock.results[0].value;
+    expect(statusBarItem.show).toHaveBeenCalled();
+  });
+
+  it("stopped state after crash limit should surface restart prompt", async () => {
+    vi.mocked(vscode.window.showErrorMessage).mockResolvedValue("Restart Server" as any);
+
+    activate(mockContext);
+    await new Promise((r) => setTimeout(r, 30));
+
+    const client = mockLanguageClientCtor.mock.results[0].value;
+    const clientOptions = mockLanguageClientCtor.mock.calls[0][3];
+    const closed = clientOptions.errorHandler.closed;
+    const stateHandler = client.onDidChangeState.mock.calls[0][0];
+
+    closed();
+    closed();
+    closed();
+    closed();
+    closed();
+
+    stateHandler({ newState: 3 });
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(vscode.window.showErrorMessage).toHaveBeenCalledWith(
+      "The Groovy language server has crashed.",
+      "Restart Server"
+    );
+  });
+
+  it("running state should reset crash counter", async () => {
+    activate(mockContext);
+    await new Promise((r) => setTimeout(r, 30));
+
+    const client = mockLanguageClientCtor.mock.results[0].value;
+    const clientOptions = mockLanguageClientCtor.mock.calls[0][3];
+    const closed = clientOptions.errorHandler.closed;
+    const stateHandler = client.onDidChangeState.mock.calls[0][0];
+
+    closed();
+    stateHandler({ newState: 2 });
+    const afterReset = closed();
+
+    expect(afterReset.message).toContain("attempt 1/5");
+  });
+
+  it("content providers should request decompiled content from language client", async () => {
+    activate(mockContext);
+    await new Promise((r) => setTimeout(r, 30));
+
+    const client = mockLanguageClientCtor.mock.results[0].value;
+    const providerCalls = (vscode.workspace.registerTextDocumentContentProvider as ReturnType<typeof vi.fn>).mock.calls;
+
+    const decompiledProvider = providerCalls.find((c: any[]) => c[0] === "decompiled")?.[1];
+    const jarProvider = providerCalls.find((c: any[]) => c[0] === "jar")?.[1];
+
+    expect(decompiledProvider).toBeDefined();
+    expect(jarProvider).toBeDefined();
+
+    await decompiledProvider.provideTextDocumentContent({ toString: () => "decompiled://sample" } as any);
+    await jarProvider.provideTextDocumentContent({ toString: () => "jar:file:///tmp/a.jar!/Foo.class" } as any);
+
+    expect(client.sendRequest).toHaveBeenCalledWith(
+      "groovy/getDecompiledContent",
+      { uri: "decompiled://sample" }
+    );
+    expect(client.sendRequest).toHaveBeenCalledWith(
+      "groovy/getDecompiledContent",
+      { uri: "jar:file:///tmp/a.jar!/Foo.class" }
+    );
+  });
+
+  it("should show startup error when language client fails to start", async () => {
+    mockLanguageClientCtor.mockImplementationOnce(() => ({
+      start: vi.fn().mockRejectedValue(new Error("boom")),
+      stop: vi.fn().mockResolvedValue(undefined),
+      onDidChangeState: vi.fn(),
+      onNotification: vi.fn(),
+      sendRequest: vi.fn().mockResolvedValue(""),
+    }));
+
+    activate(mockContext);
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(vscode.window.showErrorMessage).toHaveBeenCalledWith(
+      "The Groovy extension failed to start."
+    );
+  });
+
   it("should show error message when java is not found", async () => {
     vi.mocked(findJava).mockReturnValue(null);
 
@@ -130,6 +312,40 @@ describe("extension", () => {
     await new Promise((r) => setTimeout(r, 50));
 
     expect(vscode.window.showErrorMessage).toHaveBeenCalled();
+  });
+
+  it("should show invalid java.home message when configured path is invalid", async () => {
+    vi.mocked(findJava).mockReturnValue(null);
+    vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
+      get: vi.fn().mockImplementation((key: string) => {
+        if (key === "java.home") return "/invalid/jdk";
+        return undefined;
+      }),
+    } as any);
+
+    activate(mockContext);
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(vscode.window.showErrorMessage).toHaveBeenCalledWith(
+      "The groovy.java.home setting does not point to a valid JDK."
+    );
+  });
+
+  it("should refuse startup when blocked vmargs are configured", async () => {
+    vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
+      get: vi.fn().mockImplementation((key: string) => {
+        if (key === "java.vmargs") return "-javaagent:evil.jar -Xms256m";
+        if (key === "debug.serverPort") return 0;
+        return undefined;
+      }),
+    } as any);
+
+    activate(mockContext);
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(vscode.window.showErrorMessage).toHaveBeenCalledWith(
+      expect.stringContaining("blocked JVM flag")
+    );
   });
 
   // ------------------------------------------------------------------
@@ -164,6 +380,7 @@ describe("extension", () => {
 
     expect(findJava).toHaveBeenCalled();
   });
+
 });
 
 // ====================================================================
@@ -349,6 +566,18 @@ describe("buildInitializationOptions", () => {
     expect(opts.scopeEvictionTTLSeconds).toBe(600);
   });
 
+  it("should include classpathCache when configured", () => {
+    vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
+      get: vi.fn().mockImplementation((key: string) => {
+        if (key === "classpath.cache.enabled") return false;
+        return undefined;
+      }),
+    } as any);
+
+    const opts = buildInitializationOptions();
+    expect(opts.classpathCache).toBe(false);
+  });
+
   it("should include backfillSiblingProjects when configured", () => {
     vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
       get: vi.fn().mockImplementation((key: string) => {
@@ -359,6 +588,18 @@ describe("buildInitializationOptions", () => {
 
     const opts = buildInitializationOptions();
     expect(opts.backfillSiblingProjects).toBe(true);
+  });
+
+  it("should convert memory pressure threshold percent to ratio", () => {
+    vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
+      get: vi.fn().mockImplementation((key: string) => {
+        if (key === "memory.pressureThreshold") return 75;
+        return undefined;
+      }),
+    } as any);
+
+    const opts = buildInitializationOptions();
+    expect(opts.memoryPressureThreshold).toBe(0.75);
   });
 });
 

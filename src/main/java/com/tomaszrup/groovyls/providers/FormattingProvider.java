@@ -626,15 +626,6 @@ public class FormattingProvider {
 		return net;
 	}
 
-	private char getCharAt(LexState[] charStates, int pos, String trimmedLine, int lineStart, int trimOffset) {
-		// Utility method for position mapping
-		int idx = pos - lineStart - trimOffset;
-		if (idx >= 0 && idx < trimmedLine.length()) {
-			return trimmedLine.charAt(idx);
-		}
-		return 0;
-	}
-
 	private String buildIndent(String singleIndent, int depth) {
 		if (depth <= 0) {
 			return "";

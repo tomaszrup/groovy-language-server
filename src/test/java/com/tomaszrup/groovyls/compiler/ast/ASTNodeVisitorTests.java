@@ -290,6 +290,92 @@ class ASTNodeVisitorTests {
 				"Should have at least 3 class nodes, got: " + classNodes.size());
 	}
 
+	@Test
+	void testRestoreFromPreviousReplacesDataForUri() {
+		ASTNodeVisitor previous = new ASTNodeVisitor();
+		ASTNodeVisitor current = new ASTNodeVisitor();
+
+		GroovyLSCompilationUnit oldCu = compileSource("class OldClass { void oldMethod() {} }\n");
+		GroovyLSCompilationUnit newCu = compileSource("class NewClass { void newMethod() {} }\n");
+		previous.visitCompilationUnit(oldCu);
+		current.visitCompilationUnit(newCu);
+
+		URI uri = oldCu.iterator().next().getSource().getURI();
+		Assertions.assertNotNull(current.getClassNodeByName("NewClass"));
+
+		current.restoreFromPrevious(uri, previous);
+
+		Assertions.assertNotNull(current.getClassNodeByName("OldClass"));
+		Assertions.assertNull(current.getClassNodeByName("NewClass"));
+		Assertions.assertTrue(current.getNodeCount(uri) > 0);
+	}
+
+	@Test
+	void testVisitCompilationUnitTraversesComplexStatementsAndExpressions() {
+		String source = "import com.dep.One\n"
+				+ "import com.dep.*\n"
+				+ "import static com.dep.One.VALUE\n"
+				+ "import static com.dep.One.*\n"
+				+ "class ComplexFlow {\n"
+				+ "  def run(def x) {\n"
+				+ "    assert x != null\n"
+				+ "    int i = 0\n"
+				+ "    do { i++; if (i == 2) continue; if (i > 3) break } while (i < 5)\n"
+				+ "    try {\n"
+				+ "      synchronized(this) {\n"
+				+ "        def t = x ? x : 0\n"
+				+ "        def e = x ?: 1\n"
+				+ "        def n = !false\n"
+				+ "        def p = ++i\n"
+				+ "        def c = { a -> a + 1 }\n"
+				+ "        def r = 1..3\n"
+				+ "        def m = [a:1, *:[b:2]]\n"
+				+ "        def mp = this.&run\n"
+				+ "        def um = -i\n"
+				+ "        def up = +i\n"
+				+ "        def bn = ~i\n"
+				+ "        def cs = (String) x\n"
+				+ "        def at = this.@metaClass\n"
+				+ "        def gs = \"v=${i}\"\n"
+				+ "        switch (i) { case 1: break; default: break }\n"
+				+ "      }\n"
+				+ "    } catch (Exception ex) { throw ex }\n"
+				+ "  }\n"
+				+ "}\n";
+
+		GroovyLSCompilationUnit cu = compileSource(source);
+		visitor.visitCompilationUnit(cu);
+
+		List<ASTNode> nodes = visitor.getNodes();
+		Assertions.assertFalse(nodes.isEmpty());
+		Assertions.assertTrue(containsNodeType(nodes, "DoWhileStatement"));
+		Assertions.assertTrue(containsNodeType(nodes, "AssertStatement"));
+		Assertions.assertTrue(containsNodeType(nodes, "TryCatchStatement"));
+		Assertions.assertTrue(containsNodeType(nodes, "CatchStatement"));
+		Assertions.assertTrue(containsNodeType(nodes, "SwitchStatement"));
+		Assertions.assertTrue(containsNodeType(nodes, "CaseStatement"));
+		Assertions.assertTrue(containsNodeType(nodes, "ContinueStatement"));
+		Assertions.assertTrue(containsNodeType(nodes, "BreakStatement"));
+		Assertions.assertTrue(containsNodeType(nodes, "SynchronizedStatement"));
+		Assertions.assertTrue(containsNodeType(nodes, "TernaryExpression"));
+		Assertions.assertTrue(containsNodeType(nodes, "ElvisOperatorExpression"));
+		Assertions.assertTrue(containsNodeType(nodes, "PrefixExpression"));
+		Assertions.assertTrue(containsNodeType(nodes, "NotExpression"));
+		Assertions.assertTrue(containsNodeType(nodes, "ClosureExpression"));
+		Assertions.assertTrue(containsNodeType(nodes, "RangeExpression"));
+		Assertions.assertTrue(containsNodeType(nodes, "SpreadMapExpression"));
+		Assertions.assertTrue(containsNodeType(nodes, "MethodPointerExpression"));
+		Assertions.assertTrue(containsNodeType(nodes, "UnaryMinusExpression"));
+		Assertions.assertTrue(containsNodeType(nodes, "UnaryPlusExpression"));
+		Assertions.assertTrue(containsNodeType(nodes, "BitwiseNegationExpression"));
+		Assertions.assertTrue(containsNodeType(nodes, "CastExpression"));
+		Assertions.assertTrue(containsNodeType(nodes, "AttributeExpression"));
+		Assertions.assertTrue(containsNodeType(nodes, "GStringExpression"));
+
+		URI uri = cu.iterator().next().getSource().getURI();
+		Assertions.assertFalse(visitor.getDependenciesByURI().get(uri).isEmpty());
+	}
+
 	// --- Helper ---
 
 	private GroovyLSCompilationUnit compileSource(String source) {
@@ -311,5 +397,9 @@ class ASTNodeVisitorTests {
 			// Compilation errors are expected in some test cases
 		}
 		return cu;
+	}
+
+	private boolean containsNodeType(List<ASTNode> nodes, String simpleName) {
+		return nodes.stream().anyMatch(n -> n.getClass().getSimpleName().equals(simpleName));
 	}
 }

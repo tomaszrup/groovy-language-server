@@ -33,6 +33,8 @@ import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.PropertyNode;
 import org.eclipse.lsp4j.DocumentSymbol;
 import org.eclipse.lsp4j.SymbolInformation;
+import org.eclipse.lsp4j.SymbolKind;
+import org.eclipse.lsp4j.Range;
 import org.eclipse.lsp4j.TextDocumentIdentifier;
 import org.eclipse.lsp4j.jsonrpc.messages.Either;
 
@@ -63,40 +65,65 @@ public class DocumentSymbolProvider {
 		}).map(node -> {
 			if (node instanceof ClassNode) {
 				ClassNode classNode = (ClassNode) node;
-				SymbolInformation symbol = GroovyLanguageServerUtils.astNodeToSymbolInformation(classNode, uri, null);
-				if (symbol != null && SpockUtils.isSpockSpecification(classNode)) {
-					// Mark Spock specifications with a distinct name prefix
-					symbol.setName("\u2731 " + symbol.getName());
+				Range range = GroovyLanguageServerUtils.astNodeToRange(classNode);
+				if (range == null) {
+					return null;
 				}
-				return symbol;
+				SymbolKind symbolKind = GroovyLanguageServerUtils.astNodeToSymbolKind(classNode);
+				String symbolName = classNode.getName();
+				if (SpockUtils.isSpockSpecification(classNode)) {
+					// Mark Spock specifications with a distinct name prefix
+					symbolName = "\u2731 " + symbolName;
+				}
+				return new DocumentSymbol(symbolName, symbolKind, range, range);
 			}
 			ClassNode classNode = (ClassNode) GroovyASTUtils.getEnclosingNodeOfType(node, ClassNode.class, ast);
 			if (node instanceof MethodNode) {
 				MethodNode methodNode = (MethodNode) node;
-				SymbolInformation symbol = GroovyLanguageServerUtils.astNodeToSymbolInformation(methodNode, uri,
-						classNode.getName());
-				if (symbol != null && SpockUtils.isSpockFeatureMethod(methodNode)) {
+				Range range = GroovyLanguageServerUtils.astNodeToRange(methodNode);
+				if (range == null) {
+					return null;
+				}
+				SymbolKind symbolKind = GroovyLanguageServerUtils.astNodeToSymbolKind(methodNode);
+				String symbolName = methodNode.getName();
+				if (SpockUtils.isSpockFeatureMethod(methodNode)) {
 					// Mark Spock feature methods with a test icon prefix
-					symbol.setName("\u25b6 " + symbol.getName());
-				} else if (symbol != null && SpockUtils.isSpockLifecycleMethod(methodNode.getName())
+					symbolName = "\u25b6 " + symbolName;
+				} else if (SpockUtils.isSpockLifecycleMethod(methodNode.getName())
 						&& SpockUtils.isSpockSpecification(classNode)) {
 					// Mark Spock lifecycle methods
-					symbol.setName("\u2699 " + symbol.getName());
+					symbolName = "\u2699 " + symbolName;
 				}
+				DocumentSymbol symbol = new DocumentSymbol(symbolName, symbolKind, range, range);
+				symbol.setDetail(classNode.getName());
 				return symbol;
 			}
 			if (node instanceof PropertyNode) {
 				PropertyNode propNode = (PropertyNode) node;
-				return GroovyLanguageServerUtils.astNodeToSymbolInformation(propNode, uri, classNode.getName());
+				Range range = GroovyLanguageServerUtils.astNodeToRange(propNode);
+				if (range == null) {
+					return null;
+				}
+				DocumentSymbol symbol = new DocumentSymbol(propNode.getName(),
+						GroovyLanguageServerUtils.astNodeToSymbolKind(propNode), range, range);
+				symbol.setDetail(classNode.getName());
+				return symbol;
 			}
 			if (node instanceof FieldNode) {
 				FieldNode fieldNode = (FieldNode) node;
-				return GroovyLanguageServerUtils.astNodeToSymbolInformation(fieldNode, uri, classNode.getName());
+				Range range = GroovyLanguageServerUtils.astNodeToRange(fieldNode);
+				if (range == null) {
+					return null;
+				}
+				DocumentSymbol symbol = new DocumentSymbol(fieldNode.getName(),
+						GroovyLanguageServerUtils.astNodeToSymbolKind(fieldNode), range, range);
+				symbol.setDetail(classNode.getName());
+				return symbol;
 			}
 			// this should never happen
 			return null;
-		}).filter(symbolInformation -> symbolInformation != null).map(node -> {
-			return Either.<SymbolInformation, DocumentSymbol>forLeft(node);
+		}).filter(symbol -> symbol != null).map(node -> {
+			return Either.<SymbolInformation, DocumentSymbol>forRight(node);
 		}).collect(Collectors.toList());
 		return CompletableFuture.completedFuture(symbols);
 	}

@@ -31,7 +31,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 
 import org.codehaus.groovy.ast.ASTNode;
-import org.codehaus.groovy.ast.AnnotatedNode;
 import org.codehaus.groovy.ast.ClassNode;
 import org.codehaus.groovy.ast.FieldNode;
 import org.codehaus.groovy.ast.ImportNode;
@@ -63,9 +62,7 @@ import org.eclipse.lsp4j.jsonrpc.messages.Either;
 
 import com.google.gson.JsonObject;
 
-import io.github.classgraph.ClassInfo;
-import io.github.classgraph.PackageInfo;
-import io.github.classgraph.ScanResult;
+import com.tomaszrup.groovyls.compiler.ClasspathSymbolIndex;
 import com.tomaszrup.groovyls.compiler.ast.ASTNodeVisitor;
 import com.tomaszrup.groovyls.compiler.util.GroovyASTUtils;
 import com.tomaszrup.groovyls.compiler.util.GroovydocUtils;
@@ -74,53 +71,37 @@ import com.tomaszrup.groovyls.util.GroovyNodeToStringUtils;
 
 public class CompletionProvider {
 	private ASTNodeVisitor ast;
-	private ScanResult classGraphScanResult;
+	private ClasspathSymbolIndex classpathSymbolIndex;
 	/**
 	 * When non-null, the scan result is a shared superset and should be
 	 * filtered to only include classes from these classpath files (JARs/dirs).
 	 * JDK module classes ({@code getClasspathElementFile() == null}) are
 	 * always included.
 	 */
-	private java.util.Set<java.io.File> classGraphClasspathFiles;
+	private java.util.Set<String> classpathSymbolClasspathElements;
 	private int maxItemCount = 1000;
 	private boolean isIncomplete = false;
 
-	public CompletionProvider(ASTNodeVisitor ast, ScanResult classGraphScanResult) {
-		this(ast, classGraphScanResult, null);
+	public CompletionProvider(ASTNodeVisitor ast, ClasspathSymbolIndex classpathSymbolIndex) {
+		this(ast, classpathSymbolIndex, null);
 	}
 
-	public CompletionProvider(ASTNodeVisitor ast, ScanResult classGraphScanResult,
-			java.util.Set<java.io.File> classGraphClasspathFiles) {
+	public CompletionProvider(ASTNodeVisitor ast, ClasspathSymbolIndex classpathSymbolIndex,
+			java.util.Set<String> classpathSymbolClasspathElements) {
 		this.ast = ast;
-		this.classGraphScanResult = classGraphScanResult;
-		this.classGraphClasspathFiles = classGraphClasspathFiles;
+		this.classpathSymbolIndex = classpathSymbolIndex;
+		this.classpathSymbolClasspathElements = classpathSymbolClasspathElements;
 	}
 
 	/**
 	 * Returns the list of all classes from the scan result, filtered by
 	 * the scope's classpath files if this is a shared superset scan.
 	 */
-	private List<ClassInfo> getFilteredClasses() {
-		if (classGraphScanResult == null) {
+	private List<ClasspathSymbolIndex.Symbol> getFilteredClasses() {
+		if (classpathSymbolIndex == null) {
 			return Collections.emptyList();
 		}
-		List<ClassInfo> all = classGraphScanResult.getAllClasses();
-		if (classGraphClasspathFiles == null) {
-			return all; // exact match, no filtering needed
-		}
-		// Shared superset: filter to only classes from this scope's JARs
-		return all.stream()
-				.filter(ci -> {
-					java.io.File cpElem = ci.getClasspathElementFile();
-					// null = JDK module class (always include)
-					if (cpElem == null) return true;
-					try {
-						return classGraphClasspathFiles.contains(cpElem.getCanonicalFile());
-					} catch (java.io.IOException e) {
-						return classGraphClasspathFiles.contains(cpElem);
-					}
-				})
-				.collect(Collectors.toList());
+		return classpathSymbolIndex.getSymbols(classpathSymbolClasspathElements);
 	}
 
 	public CompletableFuture<Either<List<CompletionItem>, CompletionList>> provideCompletion(
@@ -233,34 +214,33 @@ public class CompletionProvider {
 		}).collect(Collectors.toList());
 		items.addAll(localClassItems);
 
-		if (classGraphScanResult == null) {
+		if (classpathSymbolIndex == null) {
 			return;
 		}
-		List<ClassInfo> classes = getFilteredClasses();
-		List<PackageInfo> packages = classGraphScanResult.getPackageInfo();
+		List<ClasspathSymbolIndex.Symbol> classes = getFilteredClasses();
+		Set<String> packages = classpathSymbolIndex.getPackageNames();
 
-		List<CompletionItem> packageItems = packages.stream().filter(packageInfo -> {
-			String packageName = packageInfo.getName();
+		List<CompletionItem> packageItems = packages.stream().filter(packageName -> {
 			if (packageName.startsWith(importText)) {
 				return true;
 			}
 			return false;
-		}).map(packageInfo -> {
+		}).map(packageName -> {
 			CompletionItem item = new CompletionItem();
-			item.setLabel(packageInfo.getName());
-			item.setTextEdit(Either.forLeft(new TextEdit(importRange, packageInfo.getName())));
+			item.setLabel(packageName);
+			item.setTextEdit(Either.forLeft(new TextEdit(importRange, packageName)));
 			item.setKind(CompletionItemKind.Module);
 			return item;
 		}).collect(Collectors.toList());
 		items.addAll(packageItems);
 
-		List<CompletionItem> classItems = classes.stream().filter(classInfo -> {
-			String packageName = classInfo.getPackageName();
+		List<CompletionItem> classItems = classes.stream().filter(classSymbol -> {
+			String packageName = classSymbol.getPackageName();
 			if (packageName == null || packageName.length() == 0 || packageName.equals(enclosingPackageName)) {
 				return false;
 			}
-			String className = classInfo.getName();
-			String classNameWithoutPackage = classInfo.getSimpleName();
+			String className = classSymbol.getName();
+			String classNameWithoutPackage = classSymbol.getSimpleName();
 			if (!className.startsWith(importText) && !classNameWithoutPackage.startsWith(importText)) {
 				return false;
 			}
@@ -268,13 +248,13 @@ public class CompletionProvider {
 				return false;
 			}
 			return true;
-		}).map(classInfo -> {
+		}).map(classSymbol -> {
 			CompletionItem item = new CompletionItem();
-			item.setLabel(classInfo.getName());
-			item.setTextEdit(Either.forLeft(new TextEdit(importRange, classInfo.getName())));
-			item.setKind(classInfoToCompletionItemKind(classInfo));
-			if (classInfo.getSimpleName().startsWith(importText)) {
-				item.setSortText(classInfo.getSimpleName());
+			item.setLabel(classSymbol.getName());
+			item.setTextEdit(Either.forLeft(new TextEdit(importRange, classSymbol.getName())));
+			item.setKind(classSymbolToCompletionItemKind(classSymbol));
+			if (classSymbol.getSimpleName().startsWith(importText)) {
+				item.setSortText(classSymbol.getSimpleName());
 			}
 			return item;
 		}).collect(Collectors.toList());
@@ -508,12 +488,12 @@ public class CompletionProvider {
 		}).collect(Collectors.toList());
 		items.addAll(localClassItems);
 
-		if (classGraphScanResult == null) {
+		if (classpathSymbolIndex == null) {
 			return;
 		}
-		List<ClassInfo> classes = getFilteredClasses();
+		List<ClasspathSymbolIndex.Symbol> classes = getFilteredClasses();
 
-		List<CompletionItem> classItems = classes.stream().filter(classInfo -> {
+		List<CompletionItem> classItems = classes.stream().filter(classSymbol -> {
 			if (isIncomplete) {
 				return false;
 			}
@@ -521,20 +501,20 @@ public class CompletionProvider {
 				isIncomplete = true;
 				return false;
 			}
-			String className = classInfo.getName();
-			String classNameWithoutPackage = classInfo.getSimpleName();
+			String className = classSymbol.getName();
+			String classNameWithoutPackage = classSymbol.getSimpleName();
 			if (classNameWithoutPackage.startsWith(namePrefix) && !existingNames.contains(className)) {
 				existingNames.add(className);
 				return true;
 			}
 			return false;
-		}).map(classInfo -> {
-			String className = classInfo.getName();
-			String packageName = classInfo.getPackageName();
+		}).map(classSymbol -> {
+			String className = classSymbol.getName();
+			String packageName = classSymbol.getPackageName();
 			CompletionItem item = new CompletionItem();
-			item.setLabel(classInfo.getSimpleName());
+			item.setLabel(classSymbol.getSimpleName());
 			item.setDetail(packageName);
-			item.setKind(classInfoToCompletionItemKind(classInfo));
+			item.setKind(classSymbolToCompletionItemKind(classSymbol));
 			if (packageName != null && !packageName.equals(enclosingPackageName) && !importNames.contains(className)) {
 				List<TextEdit> additionalTextEdits = new ArrayList<>();
 				TextEdit addImportEdit = createAddImportTextEdit(className, addImportRange);
@@ -557,11 +537,11 @@ public class CompletionProvider {
 		return "";
 	}
 
-	private CompletionItemKind classInfoToCompletionItemKind(ClassInfo classInfo) {
-		if (classInfo.isInterface()) {
+	private CompletionItemKind classSymbolToCompletionItemKind(ClasspathSymbolIndex.Symbol classSymbol) {
+		if (classSymbol.getKind() == ClasspathSymbolIndex.SymbolKind.INTERFACE) {
 			return CompletionItemKind.Interface;
 		}
-		if (classInfo.isEnum()) {
+		if (classSymbol.getKind() == ClasspathSymbolIndex.SymbolKind.ENUM) {
 			return CompletionItemKind.Enum;
 		}
 		return CompletionItemKind.Class;

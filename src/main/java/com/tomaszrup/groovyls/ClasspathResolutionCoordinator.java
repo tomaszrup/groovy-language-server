@@ -23,7 +23,6 @@ import com.tomaszrup.groovyls.config.ClasspathCache;
 import com.tomaszrup.groovyls.importers.ProjectImporter;
 import org.eclipse.lsp4j.MessageParams;
 import org.eclipse.lsp4j.MessageType;
-import org.eclipse.lsp4j.services.LanguageClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -69,17 +68,24 @@ public class ClasspathResolutionCoordinator {
     /** Shared scheduling pool for delayed backfill tasks. */
     private final ScheduledExecutorService schedulingPool;
 
-    /** Shared background compilation pool for post-resolve compilation. */
-    private final ExecutorService backgroundCompilationPool;
-
     /** Tracks pending backfill per Gradle root to avoid duplicate scheduling. */
     private final ConcurrentHashMap<Path, ScheduledFuture<?>> pendingBackfills = new ConcurrentHashMap<>();
+
+    /** Explicit per-project resolution lifecycle state. */
+    private final ConcurrentHashMap<Path, ResolutionState> resolutionStates = new ConcurrentHashMap<>();
 
     private volatile GroovyLanguageClient languageClient;
     private volatile Path workspaceRoot;
     private volatile List<Path> allDiscoveredRoots;
     private volatile boolean classpathCacheEnabled = true;
     private volatile boolean backfillEnabled = false;
+
+    enum ResolutionState {
+        REQUESTED,
+        RESOLVING,
+        RESOLVED,
+        FAILED
+    }
 
     public ClasspathResolutionCoordinator(ProjectScopeManager scopeManager,
                                           CompilationService compilationService,
@@ -90,7 +96,6 @@ public class ClasspathResolutionCoordinator {
         this.projectImporterMap = projectImporterMap;
         this.importPool = executorPools.getImportPool();
         this.schedulingPool = executorPools.getSchedulingPool();
-        this.backgroundCompilationPool = executorPools.getBackgroundCompilationPool();
     }
 
     public void setLanguageClient(GroovyLanguageClient client) {
@@ -130,22 +135,26 @@ public class ClasspathResolutionCoordinator {
         if (scope == null || scope.isClasspathResolved() || scope.getProjectRoot() == null) {
             return;
         }
-        if (!scopeManager.markResolutionStarted(scope.getProjectRoot())) {
+        Path projectRoot = scope.getProjectRoot();
+        if (!scopeManager.markResolutionStarted(projectRoot)) {
             logger.debug("Resolution already in-flight for {}, skipping", scope.getProjectRoot());
             return;
         }
+        transitionState(projectRoot, ResolutionState.REQUESTED);
+        transitionState(projectRoot, ResolutionState.RESOLVING);
 
         // Set MDC so the MDC-propagating executor captures project context
-        MdcProjectContext.setProject(scope.getProjectRoot());
-        logger.info("Scheduling lazy classpath resolution for {}", scope.getProjectRoot());
+        MdcProjectContext.setProject(projectRoot);
+        logger.info("Scheduling lazy classpath resolution for {}", projectRoot);
         importPool.submit(() -> {
             try {
                 doResolve(scope, triggerURI);
             } catch (Exception e) {
                 logger.error("Lazy classpath resolution failed for {}: {}",
                         scope.getProjectRoot(), e.getMessage(), e);
+                transitionState(projectRoot, ResolutionState.FAILED);
             } finally {
-                scopeManager.markResolutionComplete(scope.getProjectRoot());
+                scopeManager.markResolutionComplete(projectRoot);
             }
         });
         MdcProjectContext.clear();
@@ -157,6 +166,7 @@ public class ClasspathResolutionCoordinator {
         ProjectImporter importer = projectImporterMap.get(projectRoot);
         if (importer == null) {
             logger.warn("No importer found for {}", projectRoot);
+            transitionState(projectRoot, ResolutionState.FAILED);
             return;
         }
 
@@ -175,6 +185,7 @@ public class ClasspathResolutionCoordinator {
 
         // Apply to scope
         ProjectScope updatedScope = scopeManager.updateProjectClasspath(projectRoot, classpath);
+        transitionState(projectRoot, ResolutionState.RESOLVED);
 
         // Save to cache
         if (classpathCacheEnabled && workspaceRoot != null) {
@@ -270,6 +281,7 @@ public class ClasspathResolutionCoordinator {
         for (ProjectScope scope : unresolvedSiblings) {
             if (scopeManager.markResolutionStarted(scope.getProjectRoot())) {
                 toResolve.add(scope.getProjectRoot());
+                transitionState(scope.getProjectRoot(), ResolutionState.RESOLVING);
             }
         }
 
@@ -293,9 +305,16 @@ public class ClasspathResolutionCoordinator {
                 List<String> classpath = entry.getValue();
 
                 scopeManager.updateProjectClasspath(root, classpath);
+                transitionState(root, ResolutionState.RESOLVED);
 
                 if (classpathCacheEnabled && workspaceRoot != null) {
                     ClasspathCache.mergeProject(workspaceRoot, root, classpath, allDiscoveredRoots);
+                }
+            }
+
+            for (Path root : toResolve) {
+                if (!batchResult.containsKey(root)) {
+                    transitionState(root, ResolutionState.FAILED);
                 }
             }
 
@@ -310,12 +329,29 @@ public class ClasspathResolutionCoordinator {
             logMemoryStats();
         } catch (Exception e) {
             logger.error("Backfill failed for root {}: {}", buildToolRoot, e.getMessage(), e);
+            for (Path root : toResolve) {
+                transitionState(root, ResolutionState.FAILED);
+            }
         } finally {
             for (Path root : toResolve) {
                 scopeManager.markResolutionComplete(root);
             }
             pendingBackfills.remove(buildToolRoot);
         }
+    }
+
+    private void transitionState(Path projectRoot, ResolutionState newState) {
+        if (projectRoot == null) {
+            return;
+        }
+        ResolutionState prev = resolutionStates.put(projectRoot, newState);
+        if (prev != newState) {
+            logger.debug("Resolution state {} -> {} for {}", prev, newState, projectRoot);
+        }
+    }
+
+    ResolutionState getResolutionState(Path projectRoot) {
+        return resolutionStates.get(projectRoot);
     }
 
     private void logProgress(String message) {
@@ -369,5 +405,6 @@ public class ClasspathResolutionCoordinator {
             future.cancel(false);
         }
         pendingBackfills.clear();
+        resolutionStates.clear();
     }
 }

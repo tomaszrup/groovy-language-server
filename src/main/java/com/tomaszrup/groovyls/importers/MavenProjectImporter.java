@@ -247,10 +247,6 @@ public class MavenProjectImporter implements ProjectImporter {
 
     // ---- private helpers ----
 
-    private boolean isJvmProject(Path projectDir) {
-        return ProjectDiscovery.isJvmProject(projectDir);
-    }
-
     /**
      * Compile both main and test sources. Failures are logged but not fatal —
      * classpath resolution can still succeed even if compilation fails.

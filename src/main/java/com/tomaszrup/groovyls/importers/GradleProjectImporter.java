@@ -846,10 +846,6 @@ public class GradleProjectImporter implements ProjectImporter {
         return Path.of(pathStr).toAbsolutePath().normalize().toString().replace('\\', '/').toLowerCase();
     }
 
-    private boolean isJvmProject(Path projectDir) {
-        return ProjectDiscovery.isJvmProject(projectDir);
-    }
-
     /**
      * Single-project classpath resolution (used by the fallback {@link #importProject(Path)}).
      * Resolves classpath entries for the current connection's project only.

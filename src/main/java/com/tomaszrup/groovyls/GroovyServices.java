@@ -24,11 +24,11 @@ import java.net.URI;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -46,8 +46,7 @@ import org.eclipse.lsp4j.services.LanguageClientAware;
 import org.eclipse.lsp4j.services.TextDocumentService;
 import org.eclipse.lsp4j.services.WorkspaceService;
 
-import io.github.classgraph.ScanResult;
-
+import com.tomaszrup.groovyls.compiler.ClasspathSymbolIndex;
 import com.tomaszrup.groovyls.compiler.ast.ASTNodeVisitor;
 import com.tomaszrup.groovyls.config.ICompilationUnitFactory;
 import com.tomaszrup.groovyls.util.JavaSourceLocator;
@@ -123,8 +122,6 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 
 	// --- Shared executor pools (owned by GroovyLanguageServer) ---
 
-	private final ExecutorPools executorPools;
-
 	/** Shared scheduling pool used for debounce timers. */
 	private final ScheduledExecutorService schedulingPool;
 
@@ -139,8 +136,14 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	 */
 	private final AtomicReference<ScheduledFuture<?>> pendingDebounce = new AtomicReference<>();
 
+	/**
+	 * Last non-empty semantic tokens per document URI.
+	 * Used as a fallback during transient syntax-error states where current
+	 * compilation yields no semantic tokens for a file.
+	 */
+	private final Map<URI, SemanticTokens> lastSemanticTokensByUri = new ConcurrentHashMap<>();
+
 	public GroovyServices(ICompilationUnitFactory factory, ExecutorPools executorPools) {
-		this.executorPools = executorPools;
 		this.schedulingPool = executorPools.getSchedulingPool();
 		this.backgroundCompiler = executorPools.getBackgroundCompilationPool();
 		this.scopeManager = new ProjectScopeManager(factory, fileContentsTracker);
@@ -541,6 +544,12 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	@Override
 	public void didClose(DidCloseTextDocumentParams params) {
 		fileContentsTracker.didClose(params);
+		try {
+			URI uri = URI.create(params.getTextDocument().getUri());
+			lastSemanticTokensByUri.remove(uri);
+		} catch (Exception ignored) {
+			// best effort cache cleanup
+		}
 		// Closing a file does not change its content — no recompilation needed.
 		// The AST remains valid. The next interaction (hover, edit, etc.) will
 		// lazily recompile if actual changes are pending.
@@ -574,42 +583,33 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	// --- Configuration / classpath ---
 
 	void updateClasspath(List<String> classpathList) {
-		if (!scopeManager.getProjectScopes().isEmpty()) {
-			logger.debug("updateClasspath() ignored — {} project scope(s) are active",
-					scopeManager.getProjectScopes().size());
+		ProjectScopeManager.ClasspathUpdateResult result = scopeManager.updateClasspath(classpathList);
+		if (result != ProjectScopeManager.ClasspathUpdateResult.UPDATED) {
 			return;
 		}
-		if (scopeManager.isImportInProgress()) {
-			logger.info("updateClasspath() deferred — project import in progress");
-			scopeManager.getDefaultScope().getCompilationUnitFactory().setAdditionalClasspathList(classpathList);
-			return;
-		}
+
 		ProjectScope ds = scopeManager.getDefaultScope();
 		ds.getLock().writeLock().lock();
 		try {
-			if (!classpathList.equals(ds.getCompilationUnitFactory().getAdditionalClasspathList())) {
-				ds.getCompilationUnitFactory().setAdditionalClasspathList(classpathList);
-				compilationService.recompileForClasspathChange(ds);
-			}
+			compilationService.recompileForClasspathChange(ds);
 		} finally {
 			ds.getLock().writeLock().unlock();
 		}
 	}
 
 	private void updateClasspath(JsonObject settings) {
-		List<String> classpathList = new ArrayList<>();
-
-		if (settings.has("groovy") && settings.get("groovy").isJsonObject()) {
-			JsonObject groovy = settings.get("groovy").getAsJsonObject();
-			if (groovy.has("classpath") && groovy.get("classpath").isJsonArray()) {
-				com.google.gson.JsonArray classpath = groovy.get("classpath").getAsJsonArray();
-				classpath.forEach(element -> {
-					classpathList.add(element.getAsString());
-				});
-			}
+		ProjectScopeManager.ClasspathUpdateResult result = scopeManager.updateClasspathFromSettings(settings);
+		if (result != ProjectScopeManager.ClasspathUpdateResult.UPDATED) {
+			return;
 		}
 
-		updateClasspath(classpathList);
+		ProjectScope ds = scopeManager.getDefaultScope();
+		ds.getLock().writeLock().lock();
+		try {
+			compilationService.recompileForClasspathChange(ds);
+		} finally {
+			ds.getLock().writeLock().unlock();
+		}
 	}
 
 	// --- TextDocumentService requests ---
@@ -658,8 +658,8 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 
 		// Capture AST snapshot under write-lock, then run providers lock-free.
 		ASTNodeVisitor visitor;
-		ScanResult scanResult;
-		java.util.Set<java.io.File> classGraphClasspathFiles;
+		ClasspathSymbolIndex classpathSymbolIndex;
+		java.util.Set<String> classpathSymbolClasspathElements;
 		scope.getLock().writeLock().lock();
 		try {
 			compilationService.ensureScopeCompiled(scope);
@@ -681,9 +681,8 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 
 			// Capture snapshot references before releasing the lock
 			visitor = scope.getAstVisitor();
-			// Lazily trigger ClassGraph scan on first completion request
-			scanResult = scope.ensureClassGraphScannedUnsafe();
-			classGraphClasspathFiles = scope.getClassGraphClasspathFiles();
+			classpathSymbolIndex = scope.ensureClasspathSymbolIndexUnsafe();
+			classpathSymbolClasspathElements = scope.getClasspathSymbolClasspathElements();
 
 			if (originalSource != null) {
 				compilationService.restoreDocumentSource(scope, uri, originalSource);
@@ -693,7 +692,8 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		}
 
 		// Provider logic runs lock-free on the captured AST snapshot
-		CompletionProvider provider = new CompletionProvider(visitor, scanResult, classGraphClasspathFiles);
+		CompletionProvider provider = new CompletionProvider(visitor, classpathSymbolIndex,
+				classpathSymbolClasspathElements);
 		CompletableFuture<Either<List<CompletionItem>, CompletionList>> result =
 				provider.provideCompletion(params.getTextDocument(), params.getPosition(),
 						params.getContext());
@@ -876,7 +876,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			}
 		}
 
-		List<CompletableFuture<List<? extends SymbolInformation>>> futures = new ArrayList<>();
+		List<CompletableFuture<List<? extends WorkspaceSymbol>>> futures = new ArrayList<>();
 		for (ProjectScope scope : scopeManager.getAllScopes()) {
 			ASTNodeVisitor visitor = scope.getAstVisitor();
 			if (visitor != null) {
@@ -886,11 +886,11 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		}
 		return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
 				.thenApply(v -> {
-					List<SymbolInformation> allSymbols = new ArrayList<>();
-					for (CompletableFuture<List<? extends SymbolInformation>> f : futures) {
+					List<WorkspaceSymbol> allSymbols = new ArrayList<>();
+					for (CompletableFuture<List<? extends WorkspaceSymbol>> f : futures) {
 						allSymbols.addAll(f.join());
 					}
-					return Either.forLeft(allSymbols);
+					return Either.forRight(allSymbols);
 				});
 	}
 
@@ -926,14 +926,16 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		URI uri = URI.create(params.getTextDocument().getUri());
 		ProjectScope scope = compilationService.ensureCompiledForContext(uri, scopeManager, backgroundCompiler);
 		ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
-		// Lazily trigger ClassGraph scan on first code action request
-		ScanResult scanResult = scope != null ? scope.ensureClassGraphScanned() : null;
-		java.util.Set<java.io.File> classGraphClasspathFiles = scope != null ? scope.getClassGraphClasspathFiles() : null;
+		ClasspathSymbolIndex classpathSymbolIndex =
+				scope != null ? scope.ensureClasspathSymbolIndex() : null;
+		java.util.Set<String> classpathSymbolClasspathElements =
+				scope != null ? scope.getClasspathSymbolClasspathElements() : null;
 		if (visitor == null) {
 			return CompletableFuture.completedFuture(Collections.emptyList());
 		}
 
-		CodeActionProvider provider = new CodeActionProvider(visitor, scanResult, classGraphClasspathFiles, fileContentsTracker);
+		CodeActionProvider provider = new CodeActionProvider(visitor, classpathSymbolIndex,
+				classpathSymbolClasspathElements, fileContentsTracker);
 		CompletableFuture<List<Either<Command, CodeAction>>> result = provider.provideCodeActions(params);
 
 		SpockCodeActionProvider spockProvider = new SpockCodeActionProvider(visitor);
@@ -971,11 +973,23 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		ProjectScope scope = compilationService.ensureCompiledForContext(uri, scopeManager, backgroundCompiler);
 		ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
 		if (visitor == null) {
+			SemanticTokens fallback = lastSemanticTokensByUri.get(uri);
+			if (fallback != null) {
+				return CompletableFuture.completedFuture(fallback);
+			}
 			return CompletableFuture.completedFuture(new SemanticTokens(Collections.emptyList()));
 		}
 
 		SemanticTokensProvider provider = new SemanticTokensProvider(visitor, fileContentsTracker);
-		return provider.provideSemanticTokensFull(params.getTextDocument());
+		return provider.provideSemanticTokensFull(params.getTextDocument())
+				.thenApply(tokens -> {
+					if (tokens != null && tokens.getData() != null && !tokens.getData().isEmpty()) {
+						lastSemanticTokensByUri.put(uri, tokens);
+						return tokens;
+					}
+					SemanticTokens fallback = lastSemanticTokensByUri.get(uri);
+					return fallback != null ? fallback : tokens;
+				});
 	}
 
 	@Override

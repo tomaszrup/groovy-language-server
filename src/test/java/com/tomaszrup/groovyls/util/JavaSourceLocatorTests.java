@@ -20,6 +20,7 @@
 package com.tomaszrup.groovyls.util;
 
 import java.io.IOException;
+import java.lang.reflect.Method;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -421,7 +422,7 @@ class JavaSourceLocatorTests {
 				"public class Lib {",
 				"    public void doWork() { }",
 				"}");
-		URI resultURI = locator.registerDecompiledContent("com.example.Lib", stubLines);
+		locator.registerDecompiledContent("com.example.Lib", stubLines);
 
 		// The cached content should be the REAL source, not the stub
 		String content = locator.getDecompiledContent("com.example.Lib");
@@ -672,5 +673,96 @@ class JavaSourceLocatorTests {
 		Assertions.assertEquals("com.example.Outer",
 				JavaSourceLocator.toOuterClassName("com.example.Outer$Inner$Deep"),
 				"Should strip all nested parts to get top-level class");
+	}
+
+	// ------------------------------------------------------------------
+	// URI/classfile helper coverage
+	// ------------------------------------------------------------------
+
+	@Test
+	void testClassFileURIToClassNameSupportsJarJrtAndVSCodeJarFormats() {
+		String legacyJar = "jar:file:///C:/repo/foo.jar!/com/example/Foo.class";
+		String vscodeJar = "jar:///foo.jar/com.example/Foo.class";
+		String jrt = "jrt:/java.base/java/util/List.class";
+		String sourceJava = "jar:file:///C:/repo/foo-sources.jar!/com/example/Foo.java";
+
+		Assertions.assertEquals("com.example.Foo", JavaSourceLocator.classFileURIToClassName(legacyJar));
+		Assertions.assertEquals("com.example.Foo", JavaSourceLocator.classFileURIToClassName(vscodeJar));
+		Assertions.assertEquals("java.util.List", JavaSourceLocator.classFileURIToClassName(jrt));
+		Assertions.assertEquals("com.example.Foo", JavaSourceLocator.classFileURIToClassName(sourceJava));
+	}
+
+	@Test
+	void testToVSCodeCompatibleURIForJarAndNonJar() throws Exception {
+		Method convert = JavaSourceLocator.class.getDeclaredMethod("toVSCodeCompatibleURI", URI.class);
+		convert.setAccessible(true);
+
+		URI jar = URI.create("jar:file:///C:/cache/lib-1.0.jar!/com/example/Foo.class");
+		URI jrt = URI.create("jrt:/java.base/java/util/List.class");
+
+		URI convertedJar = (URI) convert.invoke(null, jar);
+		URI convertedJrt = (URI) convert.invoke(null, jrt);
+
+		Assertions.assertEquals("jar:///lib-1.0.jar/com.example/Foo.class", convertedJar.toString());
+		Assertions.assertEquals(jrt, convertedJrt);
+	}
+
+	@Test
+	void testReadSourceFromJarURIReturnsSourceText() throws Exception {
+		String realSource = "package com.example;\npublic class JarOnly {\n  int n = 1;\n}\n";
+		Path sourceJar = createSourceJar("jars/jar-only-sources.jar", "com/example/JarOnly.java", realSource);
+
+		String jarUri = "jar:" + sourceJar.toUri() + "!/com/example/JarOnly.java";
+		Method readSourceFromJarURI = JavaSourceLocator.class
+				.getDeclaredMethod("readSourceFromJarURI", String.class);
+		readSourceFromJarURI.setAccessible(true);
+		String content = (String) readSourceFromJarURI.invoke(locator, jarUri);
+
+		Assertions.assertNotNull(content);
+		Assertions.assertTrue(content.contains("class JarOnly"));
+	}
+
+	@Test
+	void testIsGradleCacheLayoutRecognizesFiles21Layout() throws Exception {
+		Path versionDir = tempProjectRoot.resolve("files-2.1/com.example/lib/1.2.3");
+		Files.createDirectories(versionDir);
+
+		Method isGradleLayout = JavaSourceLocator.class.getDeclaredMethod("isGradleCacheLayout", Path.class);
+		isGradleLayout.setAccessible(true);
+
+		boolean match = (boolean) isGradleLayout.invoke(null, versionDir);
+		boolean nonMatch = (boolean) isGradleLayout.invoke(null, tempProjectRoot.resolve("repo/lib/1.2.3"));
+
+		Assertions.assertTrue(match);
+		Assertions.assertFalse(nonMatch);
+	}
+
+	@Test
+	void testEstimateMemoryBytesIsPositiveWhenCachesPopulated() throws Exception {
+		createJavaSource("src/main/java/com/example/Mem.java", "package com.example; public class Mem {}\n");
+		locator.addProjectRoot(tempProjectRoot);
+
+		locator.registerDecompiledContent("com.example.MemStub", java.util.List.of(
+				"// Decompiled from bytecode — source not available",
+				"package com.example;",
+				"public class MemStub {}"));
+
+		long bytes = locator.estimateMemoryBytes();
+		Assertions.assertTrue(bytes > 0);
+	}
+
+	@Test
+	void testSourceJarEntryToURIBuildsJarUri() throws Exception {
+		Method sourceJarEntryToURI = JavaSourceLocator.class.getDeclaredMethod(
+				"sourceJarEntryToURI", JavaSourceLocator.SourceJarEntry.class);
+		sourceJarEntryToURI.setAccessible(true);
+
+		Path sourceJar = createSourceJar("libs/legacy-sources.jar", "org/example/Legacy.java",
+				"package org.example; public class Legacy {}\n");
+		JavaSourceLocator.SourceJarEntry entry = new JavaSourceLocator.SourceJarEntry(sourceJar, "org/example/Legacy.java");
+
+		URI uri = (URI) sourceJarEntryToURI.invoke(null, entry);
+		Assertions.assertTrue(uri.toString().startsWith("jar:"));
+		Assertions.assertTrue(uri.toString().contains("!/org/example/Legacy.java"));
 	}
 }

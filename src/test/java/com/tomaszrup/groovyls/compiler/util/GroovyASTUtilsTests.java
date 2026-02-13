@@ -16,7 +16,6 @@
 package com.tomaszrup.groovyls.compiler.util;
 
 import java.net.URI;
-import java.util.Collections;
 import java.util.List;
 
 import org.codehaus.groovy.ast.ASTNode;
@@ -26,8 +25,6 @@ import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.ModuleNode;
 import org.codehaus.groovy.ast.PropertyNode;
 import org.codehaus.groovy.ast.expr.ConstructorCallExpression;
-import org.codehaus.groovy.ast.expr.MethodCallExpression;
-import org.codehaus.groovy.ast.expr.PropertyExpression;
 import org.codehaus.groovy.ast.expr.VariableExpression;
 import org.codehaus.groovy.control.CompilerConfiguration;
 import org.codehaus.groovy.control.Phases;
@@ -123,7 +120,7 @@ class GroovyASTUtilsTests {
 		MethodNode method = findMethod(ast, "Foo", "getName");
 		Assertions.assertNotNull(method);
 		// The type definition of a method is its return type resolved as a class
-		ASTNode typeDef = GroovyASTUtils.getTypeDefinition(method, ast);
+		GroovyASTUtils.getTypeDefinition(method, ast);
 		// May be null if String is not in the AST as a user class, that's OK
 		// Just verify it doesn't throw
 	}

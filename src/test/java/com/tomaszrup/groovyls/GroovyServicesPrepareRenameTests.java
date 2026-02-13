@@ -224,8 +224,7 @@ class GroovyServicesPrepareRenameTests {
 		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
 		Position position = new Position(1, 0); // on empty line
 		PrepareRenameParams params = new PrepareRenameParams(textDocument, position);
-		Either3<Range, PrepareRenameResult, PrepareRenameDefaultBehavior> result = services.prepareRename(params)
-				.get();
+		services.prepareRename(params).get();
 
 		// On empty space, the cursor may land on the enclosing ClassNode.
 		// If it does, that's fine (class is renamable). If not, null is acceptable.

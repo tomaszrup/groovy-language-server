@@ -25,11 +25,11 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Comparator;
 import java.util.List;
-import java.util.Map;
 
 /**
  * Additional tests for {@link GradleProjectImporter} covering:
@@ -260,5 +260,168 @@ class GradleProjectImporterAdditionalTests {
         // getGradleRoot should still work (traverses up without bound)
         Path gradleRoot = importer.getGradleRoot(project);
         Assertions.assertNotNull(gradleRoot);
+    }
+
+    @Test
+    void testClaimsProjectAndBatchingFlags() throws IOException {
+        Path project = tempDir.resolve("claims");
+        Files.createDirectories(project);
+        Files.createFile(project.resolve("build.gradle"));
+
+        Assertions.assertTrue(importer.claimsProject(project));
+        Assertions.assertFalse(importer.claimsProject(project.resolve("missing")));
+        Assertions.assertFalse(importer.claimsProject(null));
+        Assertions.assertTrue(importer.supportsSiblingBatching());
+    }
+
+    @Test
+    void testGetBuildToolRootDelegatesToFindGradleRoot() throws IOException {
+        Path root = tempDir.resolve("workspace");
+        Path sub = root.resolve("sub");
+        Files.createDirectories(sub);
+        Files.createFile(root.resolve("settings.gradle"));
+        Files.createFile(sub.resolve("build.gradle"));
+
+        importer.setWorkspaceBound(root);
+        Assertions.assertEquals(root, importer.getBuildToolRoot(sub));
+    }
+
+    @Test
+    void testFindProjectDirSeparatorUnixPath() throws Exception {
+        Method method = GradleProjectImporter.class
+                .getDeclaredMethod("findProjectDirSeparator", String.class);
+        method.setAccessible(true);
+
+        String sample;
+        if (java.io.File.separatorChar == '\\') {
+            sample = "C:/workspace/project:D:/repo/project/build/classes/java/main";
+        } else {
+            sample = "/workspace/project:/workspace/project/build/classes/java/main";
+        }
+        int idx = (int) method.invoke(importer, sample);
+        Assertions.assertTrue(idx > 0);
+        Assertions.assertEquals(':', sample.charAt(idx));
+    }
+
+    @Test
+    void testNormaliseHelpers() throws Exception {
+        Method normPath = GradleProjectImporter.class
+                .getDeclaredMethod("normalise", Path.class);
+        normPath.setAccessible(true);
+
+        Method normString = GradleProjectImporter.class
+                .getDeclaredMethod("normalise", String.class);
+        normString.setAccessible(true);
+
+        Path path = tempDir.resolve("A").resolve("..").resolve("B");
+        String a = (String) normPath.invoke(importer, path);
+        String b = (String) normString.invoke(importer, path.toString());
+
+        Assertions.assertNotNull(a);
+        Assertions.assertNotNull(b);
+        Assertions.assertEquals(a, b);
+        Assertions.assertEquals(a, a.toLowerCase());
+        Assertions.assertFalse(a.contains("\\"));
+    }
+
+    @Test
+    void testValidateGradleWrapperBranches() throws Exception {
+        Method validate = GradleProjectImporter.class
+                .getDeclaredMethod("validateGradleWrapper", Path.class);
+        validate.setAccessible(true);
+
+        // branch 1: no gradle-wrapper.properties
+        Path noWrapper = tempDir.resolve("no-wrapper");
+        Files.createDirectories(noWrapper);
+        validate.invoke(importer, noWrapper);
+
+        // branch 2: wrapper properties without checksum
+        Path missingSha = tempDir.resolve("missing-sha");
+        Path wrapperDir = missingSha.resolve("gradle/wrapper");
+        Files.createDirectories(wrapperDir);
+        Files.writeString(wrapperDir.resolve("gradle-wrapper.properties"),
+                "distributionUrl=https\\://services.gradle.org/distributions/gradle-8.10-bin.zip\n");
+        validate.invoke(importer, missingSha);
+
+        // branch 3: wrapper properties with checksum
+        Path withSha = tempDir.resolve("with-sha");
+        Path wrapperDir2 = withSha.resolve("gradle/wrapper");
+        Files.createDirectories(wrapperDir2);
+        Files.writeString(wrapperDir2.resolve("gradle-wrapper.properties"),
+                "distributionUrl=https\\://services.gradle.org/distributions/gradle-8.10-bin.zip\n"
+                        + "distributionSha256Sum=abc123\n");
+        validate.invoke(importer, withSha);
+
+        // branch 4: repeated validation hit cached path and returns quickly
+        validate.invoke(importer, withSha);
+    }
+
+    @Test
+    void testResolveClasspathsBatchPathReturnsEntriesForAllProjects() throws IOException {
+        Path root = tempDir.resolve("batch-root");
+        Path subA = root.resolve("subA");
+        Path subB = root.resolve("subB");
+        Files.createDirectories(subA.resolve("src/main/java"));
+        Files.createDirectories(subB.resolve("src/main/groovy"));
+        Files.createDirectories(subA.resolve("build/classes/java/main"));
+        Files.createDirectories(subB.resolve("build/classes/groovy/main"));
+        Files.createDirectories(root.resolve("gradle/wrapper"));
+        Files.createFile(root.resolve("settings.gradle"));
+        Files.createFile(subA.resolve("build.gradle"));
+        Files.createFile(subB.resolve("build.gradle"));
+        Files.writeString(root.resolve("gradle/wrapper/gradle-wrapper.properties"),
+                "distributionUrl=https\\://services.gradle.org/distributions/gradle-8.10-bin.zip\n"
+                        + "distributionSha256Sum=abc123\n");
+
+        importer.setWorkspaceBound(root);
+
+        List<Path> projects = List.of(subA, subB);
+        java.util.Map<Path, List<String>> result = importer.resolveClasspaths(projects);
+
+        Assertions.assertEquals(2, result.size());
+        Assertions.assertTrue(result.containsKey(subA));
+        Assertions.assertTrue(result.containsKey(subB));
+        // Even if tooling API fails in test env, class-dir discovery should still contribute.
+        Assertions.assertTrue(result.get(subA).stream().anyMatch(s -> s.contains("build") && s.contains("classes")));
+        Assertions.assertTrue(result.get(subB).stream().anyMatch(s -> s.contains("build") && s.contains("classes")));
+    }
+
+    @Test
+    void testImportProjectsBatchPathReturnsMapForAllProjects() throws IOException {
+        Path root = tempDir.resolve("import-root");
+        Path subA = root.resolve("subA");
+        Path subB = root.resolve("subB");
+        Files.createDirectories(subA.resolve("src/main/java"));
+        Files.createDirectories(subB.resolve("src/main/java"));
+        Files.createDirectories(root.resolve("gradle/wrapper"));
+        Files.createFile(root.resolve("settings.gradle"));
+        Files.createFile(subA.resolve("build.gradle"));
+        Files.createFile(subB.resolve("build.gradle"));
+        Files.writeString(root.resolve("gradle/wrapper/gradle-wrapper.properties"),
+                "distributionUrl=https\\://services.gradle.org/distributions/gradle-8.10-bin.zip\n");
+
+        importer.setWorkspaceBound(root);
+
+        java.util.Map<Path, List<String>> result = importer.importProjects(List.of(subA, subB));
+        Assertions.assertEquals(2, result.size());
+        Assertions.assertTrue(result.containsKey(subA));
+        Assertions.assertTrue(result.containsKey(subB));
+    }
+
+    @Test
+    void testRecompileAndDownloadSourcesAreBestEffort() throws IOException {
+        Path root = tempDir.resolve("recompile-root");
+        Path project = root.resolve("sub");
+        Files.createDirectories(project.resolve("src/main/java"));
+        Files.createDirectories(root.resolve("gradle/wrapper"));
+        Files.createFile(root.resolve("settings.gradle"));
+        Files.createFile(project.resolve("build.gradle"));
+        Files.writeString(root.resolve("gradle/wrapper/gradle-wrapper.properties"),
+                "distributionUrl=https\\://services.gradle.org/distributions/gradle-8.10-bin.zip\n");
+
+        importer.setWorkspaceBound(root);
+
+        Assertions.assertDoesNotThrow(() -> importer.recompile(project));
+        Assertions.assertDoesNotThrow(() -> importer.downloadSourceJarsAsync(project));
     }
 }

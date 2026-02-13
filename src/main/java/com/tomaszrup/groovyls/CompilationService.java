@@ -22,9 +22,8 @@ package com.tomaszrup.groovyls;
 
 import java.net.URI;
 import java.nio.file.InvalidPathException;
-import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -44,19 +43,18 @@ import org.eclipse.lsp4j.MessageParams;
 import org.eclipse.lsp4j.MessageType;
 import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.PublishDiagnosticsParams;
+import org.eclipse.lsp4j.Range;
 import org.eclipse.lsp4j.services.LanguageClient;
 
 import groovy.lang.GroovyClassLoader;
 import io.github.classgraph.ScanResult;
 import com.tomaszrup.groovyls.compiler.ClassSignature;
 import com.tomaszrup.groovyls.compiler.CompilationOrchestrator;
-import com.tomaszrup.groovyls.compiler.DependencyGraph;
 import com.tomaszrup.groovyls.compiler.DiagnosticHandler;
 import com.tomaszrup.groovyls.compiler.ast.ASTNodeVisitor;
 import com.tomaszrup.groovyls.compiler.control.GroovyLSCompilationUnit;
 import com.tomaszrup.groovyls.util.FileContentsTracker;
 import com.tomaszrup.groovyls.util.MdcProjectContext;
-import com.tomaszrup.groovyls.util.MemoryProfiler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -142,7 +140,7 @@ public class CompilationService {
 					scope.getCompilationUnit(), oldVisitor, uris);
 		}
 		if (visitor != null) {
-			preserveASTForErrorFiles(visitor, oldVisitor, errorURIs);
+			preserveASTForErrorFiles(visitor, oldVisitor, errorURIs, uris);
 			scope.setAstVisitor(visitor);
 		}
 	}
@@ -175,6 +173,7 @@ public class CompilationService {
 				com.tomaszrup.groovyls.compiler.SharedClassGraphCache.getInstance().release(oldScan);
 				scope.setClassGraphScanResult(null);
 			}
+			scope.clearClasspathIndexes();
 		} else {
 			// Classloader unchanged — keep the existing scan result
 			scope.setClassGraphScanResult(result.getScanResult());
@@ -217,7 +216,7 @@ public class CompilationService {
 				scope.setPrevDiagnosticsByFile(result.getDiagnosticsByFile());
 				LanguageClient client = languageClient;
 				if (client != null) {
-					result.getDiagnosticsToPublish().forEach(client::publishDiagnostics);
+					publishDiagnosticsBatch(client, result.getDiagnosticsToPublish());
 				}
 				return extractErrorURIs(collector);
 			}
@@ -266,23 +265,30 @@ public class CompilationService {
 	 * @param oldVisitor  the previous (last-known-good) AST visitor, may be null
 	 * @param errorURIs   URIs that had compilation errors
 	 */
-	private void preserveASTForErrorFiles(ASTNodeVisitor newVisitor, ASTNodeVisitor oldVisitor, Set<URI> errorURIs) {
-		if (oldVisitor == null || errorURIs.isEmpty()) {
+	private void preserveASTForErrorFiles(ASTNodeVisitor newVisitor, ASTNodeVisitor oldVisitor,
+			Set<URI> errorURIs, Set<URI> recompiledURIs) {
+		if (oldVisitor == null) {
 			return;
 		}
-		for (URI errorURI : errorURIs) {
+		Set<URI> candidates = !errorURIs.isEmpty() ? errorURIs : recompiledURIs;
+		if (candidates == null || candidates.isEmpty()) {
+			return;
+		}
+		for (URI errorURI : candidates) {
 			int oldCount = oldVisitor.getNodeCount(errorURI);
 			if (oldCount == 0) {
 				// No previous data to preserve
 				continue;
 			}
 			int newCount = newVisitor.getNodeCount(errorURI);
-			// Only restore when the new AST has SOME nodes but significantly
-			// fewer than the old one. A newCount of 0 typically means the
-			// file wasn't found in the compilation unit (URI mismatch), not
-			// true AST degradation — let existing fallback mechanisms
-			// (e.g. completion placeholder injection) handle that case.
-			if (newCount > 0 && newCount < oldCount / 2) {
+			// Restore when the new AST appears degraded due to errors.
+			// This includes both:
+			// 1) significantly fewer nodes than before, and
+			// 2) a complete collapse to zero nodes for an error URI.
+			// The second case commonly occurs during transient edit-time
+			// syntax breaks (e.g. missing brace) and would otherwise drop
+			// semantic tokens for the entire file.
+			if (newCount == 0 || newCount < oldCount / 2) {
 				logger.debug("Preserving last-known-good AST for {} (old: {} nodes, new: {} nodes)",
 						errorURI, oldCount, newCount);
 				newVisitor.restoreFromPrevious(errorURI, oldVisitor);
@@ -371,7 +377,7 @@ public class CompilationService {
 					scope.setPrevDiagnosticsByFile(result.getDiagnosticsByFile());
 					LanguageClient client = languageClient;
 					if (client != null) {
-						result.getDiagnosticsToPublish().forEach(client::publishDiagnostics);
+						publishDiagnosticsBatch(client, result.getDiagnosticsToPublish());
 					}
 				}
 
@@ -566,10 +572,15 @@ public class CompilationService {
 		boolean isSameUnit = createOrUpdateCompilationUnit(scope, affectedDependents);
 		clearProcessedChanges(scope, changedSnapshot);
 		Set<URI> errorURIs = compile(scope);
+		ASTNodeVisitor previousVisitor = scope.getAstVisitor();
 		if (isSameUnit) {
 			visitAST(scope, allAffectedURIs, errorURIs);
 		} else {
 			visitAST(scope, Collections.emptySet(), errorURIs);
+			ASTNodeVisitor newVisitor = scope.getAstVisitor();
+			if (newVisitor != null) {
+				preserveASTForErrorFiles(newVisitor, previousVisitor, errorURIs, allAffectedURIs);
+			}
 		}
 
 		updateDependencyGraph(scope, allAffectedURIs);
@@ -614,7 +625,7 @@ public class CompilationService {
 				incrementalUnit, scope.getAstVisitor(), changedPlusContext);
 
 		// Preserve last-known-good AST for files with errors
-		preserveASTForErrorFiles(newVisitor, oldVisitor, errorURIs);
+		preserveASTForErrorFiles(newVisitor, oldVisitor, errorURIs, changedPlusContext);
 
 		Map<String, ClassSignature> newSignatures = captureClassSignatures(newVisitor, changedPlusContext);
 		if (!oldSignatures.equals(newSignatures)) {
@@ -633,7 +644,7 @@ public class CompilationService {
 			scope.setPrevDiagnosticsByFile(result.getDiagnosticsByFile());
 			LanguageClient client = languageClient;
 			if (client != null) {
-				result.getDiagnosticsToPublish().forEach(client::publishDiagnostics);
+				publishDiagnosticsBatch(client, result.getDiagnosticsToPublish());
 			}
 		}
 
@@ -803,12 +814,80 @@ public class CompilationService {
 						unit, collector, null, null);
 				LanguageClient client = languageClient;
 				if (client != null) {
-					result.getDiagnosticsToPublish().forEach(client::publishDiagnostics);
+					publishDiagnosticsBatch(client, result.getDiagnosticsToPublish());
 				}
 			}
 		} catch (Exception e) {
 			logger.debug("Syntax-only check failed for {}: {}", uri, e.getMessage());
 		}
+	}
+
+	private void publishDiagnosticsBatch(LanguageClient client, Set<PublishDiagnosticsParams> diagnosticsToPublish) {
+		if (diagnosticsToPublish == null || diagnosticsToPublish.isEmpty()) {
+			return;
+		}
+		diagnosticsToPublish.stream()
+				.sorted(Comparator.comparing(PublishDiagnosticsParams::getUri, Comparator.nullsFirst(String::compareTo)))
+				.map(this::normalizeDiagnosticsForPublishedDocument)
+				.forEach(client::publishDiagnostics);
+	}
+
+	private PublishDiagnosticsParams normalizeDiagnosticsForPublishedDocument(PublishDiagnosticsParams params) {
+		if (params == null || params.getDiagnostics() == null || params.getDiagnostics().isEmpty()) {
+			return params;
+		}
+		URI uri;
+		try {
+			uri = URI.create(params.getUri());
+		} catch (Exception e) {
+			return params;
+		}
+
+		String contents = fileContentsTracker.getContents(uri);
+		if (contents == null) {
+			return params;
+		}
+
+		String[] lines = contents.split("\\r?\\n", -1);
+		for (Diagnostic diagnostic : params.getDiagnostics()) {
+			Range range = diagnostic.getRange();
+			if (range == null) {
+				diagnostic.setRange(new Range(new Position(0, 0), new Position(0, 0)));
+				continue;
+			}
+
+			Position start = clampPosition(range.getStart(), lines);
+			Position end = clampPosition(range.getEnd(), lines);
+			if (isAfter(start, end)) {
+				end = new Position(start.getLine(), start.getCharacter());
+			}
+			range.setStart(start);
+			range.setEnd(end);
+		}
+
+		return params;
+	}
+
+	private Position clampPosition(Position position, String[] lines) {
+		if (lines == null || lines.length == 0) {
+			return new Position(0, 0);
+		}
+		if (position == null) {
+			return new Position(0, 0);
+		}
+
+		int maxLine = lines.length - 1;
+		int line = Math.max(0, Math.min(position.getLine(), maxLine));
+		int lineLength = lines[line].length();
+		int character = Math.max(0, Math.min(position.getCharacter(), lineLength));
+		return new Position(line, character);
+	}
+
+	private boolean isAfter(Position left, Position right) {
+		if (left.getLine() != right.getLine()) {
+			return left.getLine() > right.getLine();
+		}
+		return left.getCharacter() > right.getCharacter();
 	}
 
 	/**
@@ -933,15 +1012,6 @@ public class CompilationService {
 		long totalMB = rt.totalMemory() / (1024 * 1024);
 		long maxMB = rt.maxMemory() / (1024 * 1024);
 		logger.warn("JVM memory: used={}MB, total={}MB, max={}MB", usedMB, totalMB, maxMB);
-	}
-
-	/**
-	 * Logs current JVM memory statistics plus a detailed per-project memory
-	 * profile (when enabled via {@code -Dgroovyls.debug.memoryProfile=true}).
-	 */
-	private void logMemoryStats(List<ProjectScope> scopes) {
-		logMemoryStats();
-		MemoryProfiler.logProfile(scopes);
 	}
 
 	/**

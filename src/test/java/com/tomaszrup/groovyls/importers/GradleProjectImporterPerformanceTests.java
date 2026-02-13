@@ -285,7 +285,7 @@ class GradleProjectImporterPerformanceTests {
      */
     @Test
     void testProjectGroupingWithManyModules() throws IOException {
-        List<Path> moduleRoots = createMultiModuleWorkspace(MODULE_COUNT);
+        createMultiModuleWorkspace(MODULE_COUNT);
 
         // Use discoverProjects to verify all modules are found
         long start = System.nanoTime();
@@ -365,7 +365,7 @@ class GradleProjectImporterPerformanceTests {
 
         // 1. Create workspace
         long stepStart = System.nanoTime();
-        List<Path> moduleRoots = createMultiModuleWorkspace(MODULE_COUNT);
+        createMultiModuleWorkspace(MODULE_COUNT);
         long workspaceSetupMs = (System.nanoTime() - stepStart) / 1_000_000;
 
         // 2. Discover projects

@@ -222,9 +222,13 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
 
     @Override
     public CompletableFuture<InitializeResult> initialize(InitializeParams params) {
-        String rootUriString = params.getRootUri();
-        if (rootUriString != null) {
-            URI uri = URI.create(rootUriString);
+        String workspaceUriString = null;
+        List<WorkspaceFolder> workspaceFolders = params.getWorkspaceFolders();
+        if (workspaceFolders != null && !workspaceFolders.isEmpty()) {
+            workspaceUriString = workspaceFolders.get(0).getUri();
+        }
+        if (workspaceUriString != null) {
+            URI uri = URI.create(workspaceUriString);
             Path workspaceRoot = Paths.get(uri);
             groovyServices.setWorkspaceRoot(workspaceRoot);
         }
@@ -233,6 +237,14 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         Object initOptions = params.getInitializationOptions();
         if (initOptions instanceof JsonObject) {
             JsonObject opts = (JsonObject) initOptions;
+            if (opts.has("protocolVersion") && opts.get("protocolVersion").isJsonPrimitive()) {
+                String clientProtocolVersion = opts.get("protocolVersion").getAsString();
+                if (!Protocol.VERSION.equals(clientProtocolVersion)) {
+                    logger.warn("Protocol version mismatch: extension={}, server={}. "
+                                    + "Some custom features may not work as expected.",
+                            clientProtocolVersion, Protocol.VERSION);
+                }
+            }
             // Apply log level before any other processing so all subsequent
             // log messages respect the configured level.
             if (opts.has("logLevel") && opts.get("logLevel").isJsonPrimitive()) {
@@ -290,8 +302,8 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
 
         // Set workspace bound on importers so build-tool root searches
         // stop at the workspace root instead of walking to the filesystem root.
-        if (rootUriString != null) {
-            Path wsRoot = Paths.get(URI.create(rootUriString));
+        if (workspaceUriString != null) {
+            Path wsRoot = Paths.get(URI.create(workspaceUriString));
             for (ProjectImporter importer : importers) {
                 importer.setWorkspaceBound(wsRoot);
             }
@@ -689,6 +701,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         groovyServices.shutdown();
         executorPools.shutdownAll();
         SharedClassGraphCache.getInstance().clear();
+        com.tomaszrup.groovyls.compiler.SharedClasspathIndexCache.getInstance().clear();
         com.tomaszrup.groovyls.util.SharedSourceJarIndex.getInstance().clear();
         return CompletableFuture.completedFuture(new Object());
     }
@@ -706,7 +719,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
      * @param params a JSON object with a {@code uri} string field
      * @return the decompiled source text, or {@code null} if not found
      */
-    @org.eclipse.lsp4j.jsonrpc.services.JsonRequest("groovy/getDecompiledContent")
+    @org.eclipse.lsp4j.jsonrpc.services.JsonRequest(Protocol.REQUEST_GET_DECOMPILED_CONTENT)
     public CompletableFuture<String> getDecompiledContent(com.google.gson.JsonObject params) {
         return CompletableFuture.supplyAsync(() -> {
             String uri = params.has("uri") ? params.get("uri").getAsString() : null;
@@ -715,6 +728,15 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             }
             return groovyServices.getDecompiledContentByURI(uri);
         });
+    }
+
+    /**
+     * Custom LSP request: returns custom protocol contract version used by
+     * extension↔server Groovy-specific messages.
+     */
+    @org.eclipse.lsp4j.jsonrpc.services.JsonRequest(Protocol.REQUEST_GET_PROTOCOL_VERSION)
+    public CompletableFuture<String> getProtocolVersion() {
+        return CompletableFuture.completedFuture(Protocol.VERSION);
     }
 
     @Override

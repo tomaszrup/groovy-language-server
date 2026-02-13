@@ -19,8 +19,7 @@ import org.eclipse.lsp4j.TextEdit;
 import org.eclipse.lsp4j.WorkspaceEdit;
 import org.eclipse.lsp4j.jsonrpc.messages.Either;
 
-import io.github.classgraph.ClassInfo;
-import io.github.classgraph.ScanResult;
+import com.tomaszrup.groovyls.compiler.ClasspathSymbolIndex;
 import com.tomaszrup.groovyls.compiler.ast.ASTNodeVisitor;
 import com.tomaszrup.groovyls.providers.codeactions.AddOverrideAction;
 import com.tomaszrup.groovyls.providers.codeactions.GenerateConstructorAction;
@@ -36,25 +35,25 @@ public class CodeActionProvider {
 	private static final String UNUSED_IMPORT_MESSAGE = "Unused import";
 
 	private ASTNodeVisitor ast;
-	private ScanResult classGraphScanResult;
+	private ClasspathSymbolIndex classpathSymbolIndex;
 	/**
 	 * When non-null, the scan result is a shared superset and should be
 	 * filtered to only include classes from these classpath files.
 	 */
-	private java.util.Set<java.io.File> classGraphClasspathFiles;
+	private java.util.Set<String> classpathSymbolClasspathElements;
 	private FileContentsTracker fileContentsTracker;
 
-	public CodeActionProvider(ASTNodeVisitor ast, ScanResult classGraphScanResult,
+	public CodeActionProvider(ASTNodeVisitor ast, ClasspathSymbolIndex classpathSymbolIndex,
 			FileContentsTracker fileContentsTracker) {
-		this(ast, classGraphScanResult, null, fileContentsTracker);
+		this(ast, classpathSymbolIndex, null, fileContentsTracker);
 	}
 
-	public CodeActionProvider(ASTNodeVisitor ast, ScanResult classGraphScanResult,
-			java.util.Set<java.io.File> classGraphClasspathFiles,
+	public CodeActionProvider(ASTNodeVisitor ast, ClasspathSymbolIndex classpathSymbolIndex,
+			java.util.Set<String> classpathSymbolClasspathElements,
 			FileContentsTracker fileContentsTracker) {
 		this.ast = ast;
-		this.classGraphScanResult = classGraphScanResult;
-		this.classGraphClasspathFiles = classGraphClasspathFiles;
+		this.classpathSymbolIndex = classpathSymbolIndex;
+		this.classpathSymbolClasspathElements = classpathSymbolClasspathElements;
 		this.fileContentsTracker = fileContentsTracker;
 	}
 
@@ -62,32 +61,11 @@ public class CodeActionProvider {
 	 * Returns classes from the scan result, filtered by the scope's
 	 * classpath files if this is a shared superset scan.
 	 */
-	private List<ClassInfo> getFilteredClasses() {
-		if (classGraphScanResult == null) {
+	private List<ClasspathSymbolIndex.Symbol> getFilteredClasses() {
+		if (classpathSymbolIndex == null) {
 			return Collections.emptyList();
 		}
-		List<ClassInfo> all = classGraphScanResult.getAllClasses();
-		if (classGraphClasspathFiles == null) {
-			return all;
-		}
-		List<ClassInfo> filtered = new ArrayList<>(all.size());
-		for (ClassInfo ci : all) {
-			java.io.File cpElem = ci.getClasspathElementFile();
-			if (cpElem == null) {
-				filtered.add(ci); // JDK module class
-			} else {
-				try {
-					if (classGraphClasspathFiles.contains(cpElem.getCanonicalFile())) {
-						filtered.add(ci);
-					}
-				} catch (java.io.IOException e) {
-					if (classGraphClasspathFiles.contains(cpElem)) {
-						filtered.add(ci);
-					}
-				}
-			}
-		}
-		return filtered;
+		return classpathSymbolIndex.getSymbols(classpathSymbolClasspathElements);
 	}
 
 	public CompletableFuture<List<Either<Command, CodeAction>>> provideCodeActions(CodeActionParams params) {
@@ -176,11 +154,11 @@ public class CodeActionProvider {
 		List<CodeAction> actions = new ArrayList<>();
 
 		// Search in classpath via ClassGraph
-		if (classGraphScanResult != null) {
-			List<ClassInfo> allClasses = getFilteredClasses();
-			for (ClassInfo classInfo : allClasses) {
-				if (classInfo.getSimpleName().equals(unresolvedClassName)) {
-					String fullyQualifiedName = classInfo.getName();
+		if (classpathSymbolIndex != null) {
+			List<ClasspathSymbolIndex.Symbol> allClasses = getFilteredClasses();
+			for (ClasspathSymbolIndex.Symbol classSymbol : allClasses) {
+				if (classSymbol.getSimpleName().equals(unresolvedClassName)) {
+					String fullyQualifiedName = classSymbol.getName();
 					CodeAction action = createAddImportAction(uri, fullyQualifiedName, diagnostic);
 					if (action != null) {
 						actions.add(action);

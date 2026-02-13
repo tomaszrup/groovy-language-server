@@ -25,7 +25,6 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -44,7 +43,6 @@ import com.tomaszrup.groovyls.config.CompilationUnitFactory;
 import com.tomaszrup.groovyls.config.ICompilationUnitFactory;
 import com.tomaszrup.groovyls.util.FileContentsTracker;
 import com.tomaszrup.groovyls.util.MemoryProfiler;
-import com.tomaszrup.groovyls.JavadocResolver;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -55,6 +53,13 @@ import org.slf4j.LoggerFactory;
  */
 public class ProjectScopeManager {
 	private static final Logger logger = LoggerFactory.getLogger(ProjectScopeManager.class);
+
+	public enum ClasspathUpdateResult {
+		IGNORED_PROJECT_SCOPES,
+		DEFERRED_IMPORT_IN_PROGRESS,
+		UNCHANGED,
+		UPDATED
+	}
 
 	private volatile Path workspaceRoot;
 
@@ -476,7 +481,7 @@ public class ProjectScopeManager {
 	 * Parse classpath entries from the JSON settings object and delegate
 	 * to {@link #updateClasspath(List)}.
 	 */
-	public void updateClasspathFromSettings(JsonObject settings) {
+	public ClasspathUpdateResult updateClasspathFromSettings(JsonObject settings) {
 		List<String> classpathList = new ArrayList<>();
 
 		if (settings.has("groovy") && settings.get("groovy").isJsonObject()) {
@@ -489,32 +494,34 @@ public class ProjectScopeManager {
 			}
 		}
 
-		updateClasspath(classpathList);
+		return updateClasspath(classpathList);
 	}
 
 	/**
 	 * Update the default scope's classpath (used when no build-tool projects
 	 * are registered).
 	 */
-	public void updateClasspath(List<String> classpathList) {
+	public ClasspathUpdateResult updateClasspath(List<String> classpathList) {
 		if (!projectScopes.isEmpty()) {
 			logger.debug("updateClasspath() ignored — {} project scope(s) are active", projectScopes.size());
-			return;
+			return ClasspathUpdateResult.IGNORED_PROJECT_SCOPES;
 		}
 		if (importInProgress) {
 			logger.info("updateClasspath() deferred — project import in progress");
 			defaultScope.getCompilationUnitFactory().setAdditionalClasspathList(classpathList);
-			return;
+			return ClasspathUpdateResult.DEFERRED_IMPORT_IN_PROGRESS;
 		}
 		// Store the classpath but don't compile — the caller (CompilationService)
 		// handles compilation when needed.
 		ProjectScope ds = defaultScope;
-		if (!classpathList.equals(ds.getCompilationUnitFactory().getAdditionalClasspathList())) {
-			ds.getCompilationUnitFactory().setAdditionalClasspathList(classpathList);
-			// Mark as needing recompilation
-			ds.setCompiled(false);
-			ds.setFullyCompiled(false);
+		if (classpathList.equals(ds.getCompilationUnitFactory().getAdditionalClasspathList())) {
+			return ClasspathUpdateResult.UNCHANGED;
 		}
+		ds.getCompilationUnitFactory().setAdditionalClasspathList(classpathList);
+		// Mark as needing recompilation
+		ds.setCompiled(false);
+		ds.setFullyCompiled(false);
+		return ClasspathUpdateResult.UPDATED;
 	}
 
 	/**

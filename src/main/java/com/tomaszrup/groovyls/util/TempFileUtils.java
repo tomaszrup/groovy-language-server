@@ -62,7 +62,6 @@ public final class TempFileUtils {
         return Files.createTempFile(dir, prefix, suffix);
     }
 
-    @SuppressWarnings("unchecked")
     private static Path getPrivateTmpDir() throws IOException {
         Path dir = privateTmpDir;
         if (dir != null && Files.isDirectory(dir)) {

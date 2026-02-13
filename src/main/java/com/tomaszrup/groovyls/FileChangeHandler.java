@@ -212,7 +212,7 @@ public class FileChangeHandler {
 					// Otherwise, update the compilation unit and recompile.
 					boolean didFullCompile = compilationService.ensureScopeCompiled(scope);
 					if (!didFullCompile) {
-						boolean isSameUnit = compilationService.createOrUpdateCompilationUnit(scope);
+						boolean isSameUnit = compilationService.createOrUpdateCompilationUnit(scope, scopeUris);
 						compilationService.resetChangedFilesForScope(scope);
 						Set<URI> errorURIs = compilationService.compile(scope);
 						if (isSameUnit) {

@@ -48,6 +48,12 @@ const LABEL_RESTART_SERVER = "Restart Server";
 const LABEL_RELOAD_WINDOW = "Reload Window";
 const MAX_SERVER_RESTARTS = 5;
 
+const PROTOCOL_VERSION = "1";
+const REQUEST_GET_DECOMPILED_CONTENT = "groovy/getDecompiledContent";
+const REQUEST_GET_PROTOCOL_VERSION = "groovy/getProtocolVersion";
+const NOTIFICATION_STATUS_UPDATE = "groovy/statusUpdate";
+const NOTIFICATION_MEMORY_USAGE = "groovy/memoryUsage";
+
 // JVM argument prefixes that could allow arbitrary code execution when set
 // via workspace-level settings. If any of these are detected in
 // groovy.java.vmargs, the language server will refuse to start.
@@ -246,7 +252,8 @@ function onDidChangeConfiguration(event: vscode.ConfigurationChangeEvent) {
     event.affectsConfiguration("groovy.memory.scopeEvictionTTL") ||
     event.affectsConfiguration("groovy.memory.backfillSiblingProjects") ||
     event.affectsConfiguration("groovy.memory.pressureThreshold") ||
-    event.affectsConfiguration("groovy.memory.rejectedPackages")
+    event.affectsConfiguration("groovy.memory.rejectedPackages") ||
+    event.affectsConfiguration("groovy.classpath.cache.enabled")
   ) {
     javaPath = findJava();
     //we're going to try to kill the language server and then restart
@@ -296,7 +303,14 @@ function restartLanguageServer() {
  */
 export function buildInitializationOptions(): Record<string, unknown> {
   const config = vscode.workspace.getConfiguration("groovy");
-  const options: Record<string, unknown> = {};
+  const options: Record<string, unknown> = {
+    protocolVersion: PROTOCOL_VERSION,
+  };
+
+  const classpathCache = config.get<boolean>("classpath.cache.enabled");
+  if (classpathCache !== undefined) {
+    options.classpathCache = classpathCache;
+  }
 
   // Log level
   const logLevel = config.get<string>("logLevel");
@@ -338,7 +352,7 @@ function startLanguageServer() {
   vscode.window.withProgress(
     { location: vscode.ProgressLocation.Notification, title: INITIALIZING_MESSAGE, cancellable: false },
     (progress) => {
-      return new Promise<void>(async (resolve, reject) => {
+      return new Promise<void>(async (resolve) => {
         if (!extensionContext) {
           resolve();
           setStatusBar("error");
@@ -496,7 +510,6 @@ function startLanguageServer() {
           // Pass configuration to the server as initialization options
           initializationOptions: buildInitializationOptions(),
           synchronize: {
-            configurationSection: "groovy",
             fileEvents: [
               vscode.workspace.createFileSystemWatcher("**/*.java"),
               vscode.workspace.createFileSystemWatcher("**/build.gradle"),
@@ -531,6 +544,35 @@ function startLanguageServer() {
         try {
           await languageClient.start();
 
+          let serverProtocolVersion: string | undefined;
+          try {
+            const response = await languageClient.sendRequest<string>(
+              REQUEST_GET_PROTOCOL_VERSION
+            );
+            if (typeof response === "string" && response.trim().length > 0) {
+              serverProtocolVersion = response.trim();
+            }
+          } catch {
+            outputChannel?.appendLine(
+              "Protocol version endpoint unavailable on server; continuing in compatibility mode."
+            );
+          }
+
+          if (serverProtocolVersion && serverProtocolVersion !== PROTOCOL_VERSION) {
+            outputChannel?.appendLine(
+              `Protocol mismatch: extension=${PROTOCOL_VERSION}, server=${serverProtocolVersion ?? "unknown"}. Stopping language server.`
+            );
+            resolve();
+            setStatusBar("error");
+            isIntentionalStop = true;
+            await languageClient.stop();
+            isIntentionalStop = false;
+            vscode.window.showErrorMessage(
+              `Groovy extension/server protocol mismatch (extension ${PROTOCOL_VERSION}, server ${serverProtocolVersion ?? "unknown"}). Update both components to matching versions.`
+            );
+            return;
+          }
+
           // Register a content provider for the "decompiled:" URI scheme so
           // that "Go to Definition" on classes from external JARs opens a
           // read-only view of the decompiled skeleton source.
@@ -544,7 +586,7 @@ function startLanguageServer() {
                   return Promise.resolve("");
                 }
                 return languageClient.sendRequest<string>(
-                  "groovy/getDecompiledContent",
+                  REQUEST_GET_DECOMPILED_CONTENT,
                   { uri: uri.toString() }
                 ).then((content) => content ?? "// No decompiled content available");
               },
@@ -573,7 +615,7 @@ function startLanguageServer() {
                   // "jar:file:///path!/entry" from the parsed components.
                   const fullUri = uri.toString();
                   return languageClient.sendRequest<string>(
-                    "groovy/getDecompiledContent",
+                    REQUEST_GET_DECOMPILED_CONTENT,
                     { uri: fullUri }
                   ).then((content) => content ?? "// No decompiled content available");
                 },
@@ -616,7 +658,7 @@ function startLanguageServer() {
             }
           });
 
-          languageClient.onNotification("groovy/statusUpdate", (params: { state: string; message?: string }) => {
+          languageClient.onNotification(NOTIFICATION_STATUS_UPDATE, (params: { state: string; message?: string }) => {
             const state = params.state;
             if (state === "importing") {
               setStatusBar("importing", params.message);
@@ -631,7 +673,7 @@ function startLanguageServer() {
           });
 
           // Listen for periodic memory usage reports from the server
-          languageClient.onNotification("groovy/memoryUsage", (params: { usedMB: number; maxMB: number; activeScopes?: number; evictedScopes?: number; totalScopes?: number }) => {
+          languageClient.onNotification(NOTIFICATION_MEMORY_USAGE, (params: { usedMB: number; maxMB: number; activeScopes?: number; evictedScopes?: number; totalScopes?: number }) => {
             lastMemoryText = `${params.usedMB}/${params.maxMB} MB`;
             if (params.totalScopes !== undefined && params.totalScopes > 0) {
               lastScopeCounts = {
@@ -645,7 +687,7 @@ function startLanguageServer() {
               setStatusBar("ready");
             }
           });
-        } catch (e) {
+        } catch {
           setStatusBar("error");
           vscode.window.showErrorMessage(STARTUP_ERROR);
           resolve();

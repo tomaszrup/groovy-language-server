@@ -220,7 +220,7 @@ class GroovyServicesHoverTests {
 
 		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
 		Position position = new Position(1, 0); // on empty line
-		Hover hover = services.hover(new HoverParams(textDocument, position)).get();
+		services.hover(new HoverParams(textDocument, position)).get();
 
 		// Position inside a class body may resolve to the enclosing class node,
 		// so hover may not be null. Just verify no exception is thrown.
@@ -293,7 +293,7 @@ class GroovyServicesHoverTests {
 
 		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
 		Position position = new Position(2, 8); // on "String"
-		Hover hover = services.hover(new HoverParams(textDocument, position)).get();
+		services.hover(new HoverParams(textDocument, position)).get();
 
 		// Hovering over a type used in a declaration may or may not return hover
 		// depending on implementation, but it should not throw

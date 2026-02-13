@@ -74,7 +74,6 @@ public class SharedSourceJarIndex {
      * their dependency lookups to.
      */
     public static final class IndexEntry {
-        private final String classpathKey;
         private volatile Map<String, JavaSourceLocator.SourceJarEntry> classNameToSourceJar;
         private final Set<Path> indexedSourceJars;
         int refCount;
@@ -82,7 +81,6 @@ public class SharedSourceJarIndex {
         IndexEntry(String classpathKey,
                    Map<String, JavaSourceLocator.SourceJarEntry> classNameToSourceJar,
                    Set<Path> indexedSourceJars) {
-            this.classpathKey = classpathKey;
             this.classNameToSourceJar = Collections.unmodifiableMap(classNameToSourceJar);
             this.indexedSourceJars = indexedSourceJars;
             this.refCount = 1;

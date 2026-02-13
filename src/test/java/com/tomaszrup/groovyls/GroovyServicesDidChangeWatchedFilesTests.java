@@ -15,7 +15,6 @@
 ////////////////////////////////////////////////////////////////////////////////
 package com.tomaszrup.groovyls;
 
-import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -27,7 +26,6 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 import org.eclipse.lsp4j.*;
-import org.eclipse.lsp4j.jsonrpc.messages.Either;
 import org.eclipse.lsp4j.services.LanguageClient;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
@@ -326,6 +324,34 @@ class GroovyServicesDidChangeWatchedFilesTests {
 		boolean fired = latch.await(5, TimeUnit.SECONDS);
 		Assertions.assertTrue(fired,
 				"Java change listener should fire for source .java files");
+	}
+
+	@Test
+	void testMovedSourceJavaFilesTriggerRecompile() throws Exception {
+		Path projectRoot = workspaceRoot;
+		services.addProjects(Collections.singletonMap(projectRoot, Collections.emptyList()));
+
+		Path groovyFile = srcRoot.resolve("MoveJavaTrigger.groovy");
+		Files.writeString(groovyFile, "class MoveJavaTrigger {}\n");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(
+				groovyFile.toUri().toString(), LANGUAGE_GROOVY, 1, "class MoveJavaTrigger {}\n");
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+
+		CountDownLatch latch = new CountDownLatch(1);
+		services.setJavaChangeListener(root -> latch.countDown());
+
+		Path oldJava = projectRoot.resolve("src/main/java/com/example/SomeClass.java");
+		Path newJava = projectRoot.resolve("src/main/java/com/other/SomeClass.java");
+
+		List<FileEvent> events = Arrays.asList(
+				new FileEvent(oldJava.toUri().toString(), FileChangeType.Deleted),
+				new FileEvent(newJava.toUri().toString(), FileChangeType.Created));
+		DidChangeWatchedFilesParams params = new DidChangeWatchedFilesParams(events);
+		services.didChangeWatchedFiles(params);
+
+		boolean fired = latch.await(5, TimeUnit.SECONDS);
+		Assertions.assertTrue(fired,
+				"Java change listener should fire for moved source .java files under src/main/java");
 	}
 
 	// --- Stub ---

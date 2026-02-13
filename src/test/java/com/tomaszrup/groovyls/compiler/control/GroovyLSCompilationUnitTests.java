@@ -115,7 +115,7 @@ class GroovyLSCompilationUnitTests {
 		URI uri2 = URI.create("file:///test/Beta.groovy");
 
 		SourceUnit su1 = addSource(cu, uri1, "class Alpha {}");
-		SourceUnit su2 = addSource(cu, uri2, "class Beta {}");
+		addSource(cu, uri2, "class Beta {}");
 		compileToPhase(cu, Phases.SEMANTIC_ANALYSIS);
 
 		int moduleCountBefore = cu.getAST().getModules().size();
@@ -159,7 +159,7 @@ class GroovyLSCompilationUnitTests {
 		URI uri3 = URI.create("file:///test/Three.groovy");
 
 		SourceUnit su1 = addSource(cu, uri1, "class One {}");
-		SourceUnit su2 = addSource(cu, uri2, "class Two {}");
+		addSource(cu, uri2, "class Two {}");
 		SourceUnit su3 = addSource(cu, uri3, "class Three {}");
 		compileToPhase(cu, Phases.SEMANTIC_ANALYSIS);
 

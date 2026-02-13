@@ -25,9 +25,7 @@ import java.nio.file.Paths;
 import java.util.List;
 
 import org.eclipse.lsp4j.DidOpenTextDocumentParams;
-import org.eclipse.lsp4j.SymbolInformation;
 import org.eclipse.lsp4j.SymbolKind;
-import org.eclipse.lsp4j.TextDocumentIdentifier;
 import org.eclipse.lsp4j.TextDocumentItem;
 import org.eclipse.lsp4j.WorkspaceSymbol;
 import org.eclipse.lsp4j.WorkspaceSymbolParams;
@@ -83,11 +81,11 @@ class GroovyServicesWorkspaceSymbolTests {
 		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
 		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
 
-		Either<List<? extends SymbolInformation>, List<? extends WorkspaceSymbol>> result = services
+		Either<List<? extends org.eclipse.lsp4j.SymbolInformation>, List<? extends WorkspaceSymbol>> result = services
 				.symbol(new WorkspaceSymbolParams("WorkspaceSymbol")).get();
 
-		Assertions.assertTrue(result.isLeft(), "Result should be SymbolInformation list");
-		List<? extends SymbolInformation> symbols = result.getLeft();
+		Assertions.assertTrue(result.isRight(), "Result should be WorkspaceSymbol list");
+		List<? extends WorkspaceSymbol> symbols = result.getRight();
 		Assertions.assertFalse(symbols.isEmpty(),
 				"Should find at least one symbol matching 'WorkspaceSymbol'");
 
@@ -107,11 +105,11 @@ class GroovyServicesWorkspaceSymbolTests {
 		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
 		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
 
-		Either<List<? extends SymbolInformation>, List<? extends WorkspaceSymbol>> result = services
+		Either<List<? extends org.eclipse.lsp4j.SymbolInformation>, List<? extends WorkspaceSymbol>> result = services
 				.symbol(new WorkspaceSymbolParams("uniqueMethodName")).get();
 
-		Assertions.assertTrue(result.isLeft());
-		List<? extends SymbolInformation> symbols = result.getLeft();
+		Assertions.assertTrue(result.isRight());
+		List<? extends WorkspaceSymbol> symbols = result.getRight();
 		Assertions.assertFalse(symbols.isEmpty(),
 				"Should find at least one symbol matching 'uniqueMethodName'");
 
@@ -132,11 +130,11 @@ class GroovyServicesWorkspaceSymbolTests {
 		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
 		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
 
-		Either<List<? extends SymbolInformation>, List<? extends WorkspaceSymbol>> result = services
+		Either<List<? extends org.eclipse.lsp4j.SymbolInformation>, List<? extends WorkspaceSymbol>> result = services
 				.symbol(new WorkspaceSymbolParams("")).get();
 
-		Assertions.assertTrue(result.isLeft());
-		List<? extends SymbolInformation> symbols = result.getLeft();
+		Assertions.assertTrue(result.isRight());
+		List<? extends WorkspaceSymbol> symbols = result.getRight();
 		// Empty query should return all symbols
 		Assertions.assertTrue(symbols.size() >= 3,
 				"Empty query should return all symbols, found: " + symbols.size());
@@ -152,11 +150,11 @@ class GroovyServicesWorkspaceSymbolTests {
 		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
 		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
 
-		Either<List<? extends SymbolInformation>, List<? extends WorkspaceSymbol>> result = services
+		Either<List<? extends org.eclipse.lsp4j.SymbolInformation>, List<? extends WorkspaceSymbol>> result = services
 				.symbol(new WorkspaceSymbolParams("xyzNonExistent123")).get();
 
-		Assertions.assertTrue(result.isLeft());
-		List<? extends SymbolInformation> symbols = result.getLeft();
+		Assertions.assertTrue(result.isRight());
+		List<? extends WorkspaceSymbol> symbols = result.getRight();
 		Assertions.assertTrue(symbols.isEmpty(),
 				"Non-matching query should return empty list");
 	}
@@ -172,11 +170,11 @@ class GroovyServicesWorkspaceSymbolTests {
 		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
 		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
 
-		Either<List<? extends SymbolInformation>, List<? extends WorkspaceSymbol>> result = services
+		Either<List<? extends org.eclipse.lsp4j.SymbolInformation>, List<? extends WorkspaceSymbol>> result = services
 				.symbol(new WorkspaceSymbolParams("myspecialmethod")).get();
 
-		Assertions.assertTrue(result.isLeft());
-		List<? extends SymbolInformation> symbols = result.getLeft();
+		Assertions.assertTrue(result.isRight());
+		List<? extends WorkspaceSymbol> symbols = result.getRight();
 		Assertions.assertFalse(symbols.isEmpty(),
 				"Case-insensitive search should find symbols");
 	}
@@ -201,11 +199,11 @@ class GroovyServicesWorkspaceSymbolTests {
 		TextDocumentItem textDocItem2 = new TextDocumentItem(uri2, LANGUAGE_GROOVY, 1, contents2.toString());
 		services.didOpen(new DidOpenTextDocumentParams(textDocItem2));
 
-		Either<List<? extends SymbolInformation>, List<? extends WorkspaceSymbol>> result = services
+		Either<List<? extends org.eclipse.lsp4j.SymbolInformation>, List<? extends WorkspaceSymbol>> result = services
 				.symbol(new WorkspaceSymbolParams("WsSymbolFile")).get();
 
-		Assertions.assertTrue(result.isLeft());
-		List<? extends SymbolInformation> symbols = result.getLeft();
+		Assertions.assertTrue(result.isRight());
+		List<? extends WorkspaceSymbol> symbols = result.getRight();
 		Assertions.assertTrue(symbols.size() >= 2,
 				"Should find symbols from both files, found: " + symbols.size());
 	}
@@ -221,11 +219,11 @@ class GroovyServicesWorkspaceSymbolTests {
 		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
 		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
 
-		Either<List<? extends SymbolInformation>, List<? extends WorkspaceSymbol>> result = services
+		Either<List<? extends org.eclipse.lsp4j.SymbolInformation>, List<? extends WorkspaceSymbol>> result = services
 				.symbol(new WorkspaceSymbolParams("uniqueFieldName")).get();
 
-		Assertions.assertTrue(result.isLeft());
-		List<? extends SymbolInformation> symbols = result.getLeft();
+		Assertions.assertTrue(result.isRight());
+		List<? extends WorkspaceSymbol> symbols = result.getRight();
 		Assertions.assertFalse(symbols.isEmpty(),
 				"Should find at least one symbol matching 'uniqueFieldName'");
 	}

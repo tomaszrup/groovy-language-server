@@ -36,7 +36,6 @@ import groovy.lang.GroovyClassLoader;
 
 import java.net.URI;
 import java.util.*;
-import java.util.stream.Collectors;
 
 /**
  * Opt-in memory profiler that estimates per-project RAM usage and reports
