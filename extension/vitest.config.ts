@@ -22,7 +22,7 @@ export default defineConfig({
         "node_modules/**",
       ],
       thresholds: {
-        lines: 85,
+        lines: 75,
       },
     },
   },

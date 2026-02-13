@@ -27,3 +27,5 @@ target/
 node_modules/
 
 *.vsix
+
+extension/coverage

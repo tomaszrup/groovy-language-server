@@ -61,7 +61,7 @@ class GroovyServicesTraitTests {
 
 	@BeforeEach
 	void setup() {
-		workspaceRoot = Paths.get(System.getProperty("user.dir")).resolve(PATH_WORKSPACE);
+		workspaceRoot = Paths.get(System.getProperty("user.dir")).resolve(PATH_WORKSPACE).normalize();
 		srcRoot = workspaceRoot.resolve(PATH_SRC);
 		if (!Files.exists(srcRoot)) {
 			srcRoot.toFile().mkdirs();
