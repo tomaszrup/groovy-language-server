@@ -19,6 +19,7 @@
 ////////////////////////////////////////////////////////////////////////////////
 package com.tomaszrup.groovyls;
 
+import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -52,6 +53,26 @@ class GroovyServicesSemanticTokensTests {
 	private GroovyServices services;
 	private Path workspaceRoot;
 	private Path srcRoot;
+
+	private static class ThrowingGroovyServices extends GroovyServices {
+		private volatile boolean throwOnEnsure;
+
+		ThrowingGroovyServices() {
+			super(new CompilationUnitFactory());
+		}
+
+		void setThrowOnEnsure(boolean throwOnEnsure) {
+			this.throwOnEnsure = throwOnEnsure;
+		}
+
+		@Override
+		protected ProjectScope ensureCompiledForContext(URI uri) {
+			if (throwOnEnsure) {
+				throw new NoClassDefFoundError("simulated semantic token linkage failure");
+			}
+			return super.ensureCompiledForContext(uri);
+		}
+	}
 
 	@BeforeEach
 	void setup() {
@@ -167,6 +188,40 @@ class GroovyServicesSemanticTokensTests {
 		Assertions.assertNotNull(after);
 		Assertions.assertFalse(after.getData().isEmpty(),
 				"Semantic tokens should remain available after transient syntax errors");
+	}
+
+	@Test
+	void testSemanticTokensFallbackAfterLinkageErrorInEnsureCompiledForContext() throws Exception {
+		ThrowingGroovyServices throwingServices = new ThrowingGroovyServices();
+		throwingServices.setWorkspaceRoot(workspaceRoot);
+		throwingServices.connect(new TestLanguageClient());
+		services = throwingServices;
+
+		Path filePath = srcRoot.resolve("SemanticLinkageFallback.groovy");
+		String uri = filePath.toUri().toString();
+		String source = "class LinkageFallback {\n"
+				+ "  String name\n"
+				+ "  void run() {\n"
+				+ "    println name\n"
+				+ "  }\n"
+				+ "}";
+
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, source);
+		throwingServices.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+
+		SemanticTokens initial = throwingServices.semanticTokensFull(new SemanticTokensParams(textDocument)).get();
+		Assertions.assertNotNull(initial);
+		Assertions.assertFalse(initial.getData().isEmpty(),
+				"Precondition failed: expected initial semantic tokens before simulated linkage error");
+
+		throwingServices.setThrowOnEnsure(true);
+		SemanticTokens fallback = throwingServices.semanticTokensFull(new SemanticTokensParams(textDocument)).get();
+		Assertions.assertNotNull(fallback);
+		Assertions.assertFalse(fallback.getData().isEmpty(),
+				"Semantic tokens should remain available after linkage error in semantic token path");
+		Assertions.assertEquals(initial.getData(), fallback.getData(),
+				"Fallback tokens should reuse last known non-empty semantic tokens");
 	}
 
 	@Test

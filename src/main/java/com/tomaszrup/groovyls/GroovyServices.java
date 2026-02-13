@@ -202,6 +202,14 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		scopeManager.setImportInProgress(inProgress);
 	}
 
+	protected ProjectScope ensureCompiledForContext(URI uri) {
+		return compilationService.ensureCompiledForContext(uri, scopeManager, backgroundCompiler);
+	}
+
+	protected SemanticTokensProvider createSemanticTokensProvider(ASTNodeVisitor visitor) {
+		return new SemanticTokensProvider(visitor, fileContentsTracker);
+	}
+
 	/**
 	 * Look up decompiled content across all project scopes.
 	 * Returns the content for the first matching scope, or {@code null}
@@ -970,26 +978,52 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			return CompletableFuture.completedFuture(new SemanticTokens(Collections.emptyList()));
 		}
 		URI uri = URI.create(params.getTextDocument().getUri());
-		ProjectScope scope = compilationService.ensureCompiledForContext(uri, scopeManager, backgroundCompiler);
-		ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
-		if (visitor == null) {
-			SemanticTokens fallback = lastSemanticTokensByUri.get(uri);
-			if (fallback != null) {
-				return CompletableFuture.completedFuture(fallback);
+		try {
+			ProjectScope scope = ensureCompiledForContext(uri);
+			ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
+			if (visitor == null) {
+				logger.debug("semanticTokensFull uri={} projectRoot={} visitorUnavailable=true", uri,
+						scope != null ? scope.getProjectRoot() : null);
+				SemanticTokens fallback = lastSemanticTokensByUri.get(uri);
+				if (fallback != null) {
+					return CompletableFuture.completedFuture(fallback);
+				}
+				return CompletableFuture.completedFuture(new SemanticTokens(Collections.emptyList()));
 			}
-			return CompletableFuture.completedFuture(new SemanticTokens(Collections.emptyList()));
-		}
 
-		SemanticTokensProvider provider = new SemanticTokensProvider(visitor, fileContentsTracker);
-		return provider.provideSemanticTokensFull(params.getTextDocument())
-				.thenApply(tokens -> {
-					if (tokens != null && tokens.getData() != null && !tokens.getData().isEmpty()) {
-						lastSemanticTokensByUri.put(uri, tokens);
-						return tokens;
-					}
-					SemanticTokens fallback = lastSemanticTokensByUri.get(uri);
-					return fallback != null ? fallback : tokens;
-				});
+			SemanticTokensProvider provider = createSemanticTokensProvider(visitor);
+			Path projectRoot = scope.getProjectRoot();
+			return provider.provideSemanticTokensFull(params.getTextDocument())
+					.handle((tokens, throwable) -> {
+						if (throwable != null) {
+							logger.warn(
+									"semanticTokensFull failed uri={} projectRoot={} error={}",
+									uri, projectRoot, throwable.toString());
+							logger.debug("semanticTokensFull failure details", throwable);
+							SemanticTokens fallback = lastSemanticTokensByUri.get(uri);
+							return fallback != null ? fallback : new SemanticTokens(Collections.emptyList());
+						}
+						if (tokens != null && tokens.getData() != null && !tokens.getData().isEmpty()) {
+							lastSemanticTokensByUri.put(uri, tokens);
+							return tokens;
+						}
+						SemanticTokens fallback = lastSemanticTokensByUri.get(uri);
+						if (fallback != null) {
+							logger.debug("semanticTokensFull uri={} projectRoot={} usingFallback=true", uri,
+									projectRoot);
+							return fallback;
+						}
+						return tokens != null ? tokens : new SemanticTokens(Collections.emptyList());
+					});
+		} catch (LinkageError e) {
+			ProjectScope scope = scopeManager.findProjectScope(uri);
+			logger.warn("semanticTokensFull linkage error uri={} projectRoot={} error={}", uri,
+					scope != null ? scope.getProjectRoot() : null, e.toString());
+			logger.debug("semanticTokensFull linkage error details", e);
+			SemanticTokens fallback = lastSemanticTokensByUri.get(uri);
+			return CompletableFuture.completedFuture(
+					fallback != null ? fallback : new SemanticTokens(Collections.emptyList()));
+		}
 	}
 
 	@Override
@@ -998,14 +1032,35 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			return CompletableFuture.completedFuture(new SemanticTokens(Collections.emptyList()));
 		}
 		URI uri = URI.create(params.getTextDocument().getUri());
-		ProjectScope scope = compilationService.ensureCompiledForContext(uri, scopeManager, backgroundCompiler);
-		ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
-		if (visitor == null) {
+		try {
+			ProjectScope scope = ensureCompiledForContext(uri);
+			ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
+			if (visitor == null) {
+				logger.debug("semanticTokensRange uri={} projectRoot={} visitorUnavailable=true", uri,
+						scope != null ? scope.getProjectRoot() : null);
+				return CompletableFuture.completedFuture(new SemanticTokens(Collections.emptyList()));
+			}
+
+			SemanticTokensProvider provider = createSemanticTokensProvider(visitor);
+			Path projectRoot = scope.getProjectRoot();
+			return provider.provideSemanticTokensRange(params.getTextDocument(), params.getRange())
+					.handle((tokens, throwable) -> {
+						if (throwable != null) {
+							logger.warn(
+									"semanticTokensRange failed uri={} projectRoot={} error={}",
+									uri, projectRoot, throwable.toString());
+							logger.debug("semanticTokensRange failure details", throwable);
+							return new SemanticTokens(Collections.emptyList());
+						}
+						return tokens != null ? tokens : new SemanticTokens(Collections.emptyList());
+					});
+		} catch (LinkageError e) {
+			ProjectScope scope = scopeManager.findProjectScope(uri);
+			logger.warn("semanticTokensRange linkage error uri={} projectRoot={} error={}", uri,
+					scope != null ? scope.getProjectRoot() : null, e.toString());
+			logger.debug("semanticTokensRange linkage error details", e);
 			return CompletableFuture.completedFuture(new SemanticTokens(Collections.emptyList()));
 		}
-
-		SemanticTokensProvider provider = new SemanticTokensProvider(visitor, fileContentsTracker);
-		return provider.provideSemanticTokensRange(params.getTextDocument(), params.getRange());
 	}
 
 	@Override

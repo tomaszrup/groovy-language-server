@@ -207,6 +207,7 @@ public class ProjectScopeManager {
 			ProjectScope cached = scopeCache.get(uri);
 			if (cached != null) {
 				cached.touchAccess();
+				logger.debug("findProjectScope({}) cache-hit -> {}", uri, cached.getProjectRoot());
 				return cached;
 			}
 			Path filePath = Paths.get(uri);
@@ -218,7 +219,16 @@ public class ProjectScopeManager {
 					return scope;
 				}
 			}
-			logger.warn("findProjectScope({}) -> no matching project scope found", uri);
+			StringBuilder candidates = new StringBuilder();
+			int limit = Math.min(projectScopes.size(), 5);
+			for (int i = 0; i < limit; i++) {
+				if (i > 0) {
+					candidates.append(", ");
+				}
+				candidates.append(projectScopes.get(i).getProjectRoot());
+			}
+			logger.warn("findProjectScope({}) -> no matching project scope found. candidateRoots=[{}] totalRoots={}",
+					uri, candidates, projectScopes.size());
 			return null;
 		}
 		return defaultScope;

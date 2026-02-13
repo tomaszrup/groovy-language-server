@@ -482,8 +482,15 @@ public class CompilationService {
 			java.util.concurrent.ExecutorService backgroundCompiler) {
 		ProjectScope scope = scopeManager.findProjectScope(uri);
 		if (scope == null) {
+			logger.warn("ensureCompiledForContext uri={} projectRoot=null (no matching scope)", uri);
 			return null;
 		}
+		logger.debug("ensureCompiledForContext uri={} projectRoot={} compiled={} hasVisitor={} classpathResolved={}",
+				uri,
+				scope.getProjectRoot(),
+				scope.isCompiled(),
+				scope.getAstVisitor() != null,
+				scope.isClasspathResolved());
 
 		// Set MDC project context for all log messages during this request
 		MdcProjectContext.setProject(scope.getProjectRoot());

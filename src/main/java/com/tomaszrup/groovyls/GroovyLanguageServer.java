@@ -225,7 +225,14 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         String workspaceUriString = null;
         List<WorkspaceFolder> workspaceFolders = params.getWorkspaceFolders();
         if (workspaceFolders != null && !workspaceFolders.isEmpty()) {
+            logger.info("Initialize received workspace folders: {}",
+                    workspaceFolders.stream().map(WorkspaceFolder::getUri).collect(Collectors.toList()));
+        } else {
+            logger.info("Initialize received no workspace folders");
+        }
+        if (workspaceFolders != null && !workspaceFolders.isEmpty()) {
             workspaceUriString = workspaceFolders.get(0).getUri();
+            logger.info("Primary workspace root selected from first folder: {}", workspaceUriString);
         }
         if (workspaceUriString != null) {
             URI uri = URI.create(workspaceUriString);
@@ -390,6 +397,9 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     private void importProjectsAsync(List<WorkspaceFolder> folders) {
         long totalStart = System.currentTimeMillis();
         try {
+            logger.info("Starting async project import for {} workspace folder(s): {}",
+                    folders.size(),
+                    folders.stream().map(WorkspaceFolder::getUri).collect(Collectors.toList()));
             Map<Path, ProjectImporter> importerMapLocal = new ConcurrentHashMap<>();
             Set<Path> claimedRoots = Collections.synchronizedSet(new LinkedHashSet<>());
             // Tracks project roots discovered AFTER a cache hit — these are
