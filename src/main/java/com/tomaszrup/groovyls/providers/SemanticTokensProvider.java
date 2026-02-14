@@ -154,6 +154,9 @@ public class SemanticTokensProvider {
 			addTokensForNode(node, uri, tokens);
 		}
 
+		// Emit namespace tokens for package declaration segments
+		addPackageDeclarationNamespaceTokens(tokens, 1, sourceLines.length);
+
 		// Sort tokens by position (line, then column)
 		tokens.sort(Comparator.comparingInt((SemanticToken t) -> t.line)
 				.thenComparingInt(t -> t.column));
@@ -203,6 +206,9 @@ public class SemanticTokensProvider {
 
 			addTokensForNode(node, uri, tokens);
 		}
+
+		// Emit namespace tokens for package declaration segments in the requested range
+		addPackageDeclarationNamespaceTokens(tokens, rangeStartLine + 1, rangeEndLine + 1);
 
 		// Sort tokens by position (line, then column)
 		tokens.sort(Comparator.comparingInt((SemanticToken t) -> t.line)
@@ -1137,6 +1143,75 @@ public class SemanticTokensProvider {
 			// Emit namespace token (convert to 1-based column)
 			addToken(tokens, importLine, segIdx + 1, segment.length(), TYPE_NAMESPACE, 0);
 			currentCol = segIdx + segment.length() + 1; // skip segment + '.'
+		}
+	}
+
+	/**
+	 * Emits {@code namespace} tokens for the package declaration segments.
+	 * For example, in {@code package com.example}, this highlights
+	 * {@code com} and {@code example} as namespace.
+	 */
+	private void addPackageDeclarationNamespaceTokens(List<SemanticToken> tokens, int fromLine, int toLine) {
+		if (sourceLines == null || sourceLines.length == 0) {
+			return;
+		}
+
+		int startLine = Math.max(1, fromLine);
+		int endLine = Math.min(sourceLines.length, toLine);
+		for (int line = startLine; line <= endLine; line++) {
+			String sourceLine = sourceLines[line - 1];
+			if (sourceLine == null || sourceLine.isEmpty()) {
+				continue;
+			}
+
+			int idx = 0;
+			while (idx < sourceLine.length() && Character.isWhitespace(sourceLine.charAt(idx))) {
+				idx++;
+			}
+			if (!sourceLine.startsWith("package", idx)) {
+				continue;
+			}
+
+			int afterKeyword = idx + "package".length();
+			if (afterKeyword >= sourceLine.length() || !Character.isWhitespace(sourceLine.charAt(afterKeyword))) {
+				continue;
+			}
+
+			int nameStart = afterKeyword;
+			while (nameStart < sourceLine.length() && Character.isWhitespace(sourceLine.charAt(nameStart))) {
+				nameStart++;
+			}
+			if (nameStart >= sourceLine.length()) {
+				continue;
+			}
+
+			int nameEnd = nameStart;
+			while (nameEnd < sourceLine.length()) {
+				char c = sourceLine.charAt(nameEnd);
+				if (Character.isJavaIdentifierPart(c) || c == '.') {
+					nameEnd++;
+				} else {
+					break;
+				}
+			}
+			if (nameEnd <= nameStart) {
+				continue;
+			}
+
+			String packageName = sourceLine.substring(nameStart, nameEnd);
+			String[] segments = packageName.split("\\.");
+			int currentCol = nameStart;
+			for (String segment : segments) {
+				if (segment.isEmpty()) {
+					continue;
+				}
+				int segIdx = sourceLine.indexOf(segment, currentCol);
+				if (segIdx < 0) {
+					break;
+				}
+				addToken(tokens, line, segIdx + 1, segment.length(), TYPE_NAMESPACE, 0);
+				currentCol = segIdx + segment.length() + 1;
+			}
 		}
 	}
 

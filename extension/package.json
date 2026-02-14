@@ -2,7 +2,7 @@
   "name": "groovy-spock-support",
   "displayName": "Groovy & Spock Language Support",
   "description": "Language support for Groovy and Spock",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "publisher": "TomaszRup",
   "homepage": "https://github.com/tomaszrup/groovy-language-server",
   "repository": {
@@ -75,7 +75,7 @@
       {
         "language": "groovy",
         "scopes": {
-          "namespace": ["entity.name.type.module.groovy"],
+          "namespace": ["entity.name.type.class.groovy", "entity.name.type.module.groovy"],
           "type": ["entity.name.type.groovy"],
           "class": ["entity.name.type.class.groovy"],
           "interface": ["entity.name.type.interface.groovy"],
