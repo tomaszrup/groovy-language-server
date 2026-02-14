@@ -327,6 +327,30 @@ class GroovyLanguageServerUtilsTests {
 	}
 
 	// ------------------------------------------------------------------
+	// sourceLocatorToUri
+	// ------------------------------------------------------------------
+
+	@Test
+	void testSourceLocatorToUriRejectsInvalidColonOnlyLocator() {
+		URI uri = GroovyLanguageServerUtils.sourceLocatorToUri("::::");
+		Assertions.assertNull(uri, "Colon-only locator should be treated as invalid");
+	}
+
+	@Test
+	void testSourceLocatorToUriAcceptsFileUri() {
+		URI uri = GroovyLanguageServerUtils.sourceLocatorToUri("file:///tmp/Test.groovy");
+		Assertions.assertNotNull(uri);
+		Assertions.assertEquals("file", uri.getScheme());
+	}
+
+	@Test
+	void testSourceLocatorToUriAcceptsWindowsDrivePath() {
+		URI uri = GroovyLanguageServerUtils.sourceLocatorToUri("C:\\Users\\test\\Demo.groovy");
+		Assertions.assertNotNull(uri);
+		Assertions.assertEquals("file", uri.getScheme());
+	}
+
+	// ------------------------------------------------------------------
 	// Helper to get ClassNode for Object type
 	// ------------------------------------------------------------------
 

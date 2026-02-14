@@ -61,13 +61,22 @@ public class GroovyLanguageServerUtils {
 				return null;
 			}
 		}
-		int colonIndex = normalized.indexOf(':');
-		if (colonIndex > 1) {
+		if (normalized.matches("^[A-Za-z]:([\\\\/].*)?$")) {
+			try {
+				return Paths.get(normalized).normalize().toUri();
+			} catch (IllegalArgumentException e) {
+				return null;
+			}
+		}
+		if (normalized.matches("^[A-Za-z][A-Za-z0-9+.-]*:.*$")) {
 			try {
 				return URI.create(normalized);
 			} catch (IllegalArgumentException e) {
 				return null;
 			}
+		}
+		if (normalized.indexOf(':') >= 0) {
+			return null;
 		}
 		try {
 			return Paths.get(normalized).normalize().toUri();
