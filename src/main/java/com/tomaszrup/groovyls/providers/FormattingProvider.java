@@ -96,7 +96,7 @@ public class FormattingProvider {
 	/**
 	 * Compute minimal line-level TextEdits between the original and formatted text.
 	 */
-	private List<TextEdit> computeMinimalEdits(String original, String formatted) {
+	public static List<TextEdit> computeMinimalEdits(String original, String formatted) {
 		String[] origLines = original.split("\\n", -1);
 		String[] fmtLines = formatted.split("\\n", -1);
 		List<TextEdit> edits = new ArrayList<>();
@@ -172,10 +172,12 @@ public class FormattingProvider {
 		StringBuilder result = new StringBuilder();
 		int consecutiveBlankLines = 0;
 		int braceDepth = 0;
+		int groupingDepth = 0;
 		int charOffset = 0; // tracks position in the original text for state lookup
 
 		for (int i = 0; i < lines.length; i++) {
 			String line = lines[i];
+			String originalLine = line;
 			int lineStart = charOffset;
 			int lineEnd = lineStart + line.length();
 
@@ -197,7 +199,7 @@ public class FormattingProvider {
 				continue;
 			}
 
-			String trimmedLine = line.trim();
+			String trimmedLine = originalLine.trim();
 
 			if (lineInBlockComment) {
 				// Re-indent block comment lines at current depth
@@ -229,12 +231,15 @@ public class FormattingProvider {
 			consecutiveBlankLines = 0;
 
 			// Apply spacing fixes only on code portions of the line
-			trimmedLine = fixSpacing(trimmedLine, charStates, lineStart);
+			int firstNonWhitespaceOffset = findFirstNonWhitespace(originalLine, lineStart);
+			trimmedLine = fixSpacing(trimmedLine, charStates, firstNonWhitespaceOffset);
 
 			// Determine indent level for this line
-			int lineDepth = braceDepth;
-			if (trimmedLine.startsWith("}") || trimmedLine.startsWith(")")) {
-				lineDepth = Math.max(0, lineDepth - 1);
+			int lineDepth = braceDepth + groupingDepth;
+			int leadingClosers = countLeadingClosers(trimmedLine, charStates, firstNonWhitespaceOffset);
+			lineDepth = Math.max(0, lineDepth - leadingClosers);
+			if (isContinuationMemberAccessLine(trimmedLine)) {
+				lineDepth++;
 			}
 
 			line = buildIndent(singleIndent, lineDepth) + trimmedLine;
@@ -246,10 +251,13 @@ public class FormattingProvider {
 			// Update braceDepth based on code-only braces.
 			// Use trimmedLine (pre-indentation) with the original offset of the
 			// trimmed content so that character positions align with charStates.
-			int trimOffset = findFirstNonWhitespace(charStates, lineStart);
-			braceDepth += countNetBraces(trimmedLine, charStates, trimOffset);
+			braceDepth += countNetBraces(trimmedLine, charStates, firstNonWhitespaceOffset);
 			if (braceDepth < 0) {
 				braceDepth = 0;
+			}
+			groupingDepth += countNetGroupingDelimiters(trimmedLine, charStates, firstNonWhitespaceOffset);
+			if (groupingDepth < 0) {
+				groupingDepth = 0;
 			}
 
 			charOffset = lineEnd + 1;
@@ -482,20 +490,20 @@ public class FormattingProvider {
 	 * Apply spacing fixes (comma, keyword-paren, brace) only to CODE portions.
 	 * Uses the lexer state to avoid modifying string literals or comments.
 	 */
-	private String fixSpacing(String trimmedLine, LexState[] charStates, int lineStart) {
+	private String fixSpacing(String trimmedLine, LexState[] charStates, int firstNonWhitespaceOffset) {
 		// If the line starts with a comment indicator, skip formatting
 		if (trimmedLine.startsWith("//") || trimmedLine.startsWith("/*") || trimmedLine.startsWith("*")) {
 			return trimmedLine;
 		}
 
 		// Apply comma spacing (state-aware)
-		trimmedLine = fixCommaSpacingStateful(trimmedLine, charStates, lineStart);
+		trimmedLine = fixCommaSpacingStateful(trimmedLine, charStates, firstNonWhitespaceOffset);
 
 		// Apply keyword-paren spacing (state-aware)
-		trimmedLine = fixKeywordParenSpacingStateful(trimmedLine, charStates, lineStart);
+		trimmedLine = fixKeywordParenSpacingStateful(trimmedLine, charStates, firstNonWhitespaceOffset);
 
 		// Apply brace spacing (state-aware)
-		trimmedLine = fixBraceSpacingStateful(trimmedLine, charStates, lineStart);
+		trimmedLine = fixBraceSpacingStateful(trimmedLine, charStates, firstNonWhitespaceOffset);
 
 		return trimmedLine;
 	}
@@ -503,12 +511,9 @@ public class FormattingProvider {
 	/**
 	 * Ensure a space after commas, but only when the comma is in CODE state.
 	 */
-	private String fixCommaSpacingStateful(String line, LexState[] charStates, int lineStartOffset) {
+	private String fixCommaSpacingStateful(String line, LexState[] charStates, int firstNonWhitespaceOffset) {
 		StringBuilder sb = new StringBuilder();
-		// We need to map each character in the formatted line back to a state.
-		// Since we're working with the trimmed line, find the first non-ws position.
-		int origOffset = findFirstNonWhitespace(charStates, lineStartOffset);
-		int stateIdx = origOffset;
+		int stateIdx = firstNonWhitespaceOffset;
 		// Track how many characters we've inserted (e.g. spaces after commas)
 		// so that stateIdx stays aligned with the original charStates array.
 		int offsetDelta = 0;
@@ -537,9 +542,8 @@ public class FormattingProvider {
 	 * Ensure a space between control-flow keywords and opening parenthesis,
 	 * only when in CODE state.
 	 */
-	private String fixKeywordParenSpacingStateful(String line, LexState[] charStates, int lineStartOffset) {
+	private String fixKeywordParenSpacingStateful(String line, LexState[] charStates, int firstNonWhitespaceOffset) {
 		String[] keywords = {"if", "for", "while", "switch", "catch"};
-		int origOffset = findFirstNonWhitespace(charStates, lineStartOffset);
 
 		for (String keyword : keywords) {
 			String pattern = keyword + "(";
@@ -554,7 +558,7 @@ public class FormattingProvider {
 				// Check that the keyword is at a word boundary
 				boolean wordBoundary = (found == 0 || !Character.isLetterOrDigit(line.charAt(found - 1)));
 				// Check that this position is in CODE state
-				int statePos = origOffset + found;
+				int statePos = firstNonWhitespaceOffset + found;
 				boolean inCode = statePos < charStates.length && charStates[statePos] == LexState.CODE;
 
 				if (wordBoundary && inCode) {
@@ -574,13 +578,12 @@ public class FormattingProvider {
 	/**
 	 * Ensure a space before opening brace, only when in CODE state.
 	 */
-	private String fixBraceSpacingStateful(String line, LexState[] charStates, int lineStartOffset) {
+	private String fixBraceSpacingStateful(String line, LexState[] charStates, int firstNonWhitespaceOffset) {
 		StringBuilder sb = new StringBuilder();
-		int origOffset = findFirstNonWhitespace(charStates, lineStartOffset);
 
 		for (int i = 0; i < line.length(); i++) {
 			char c = line.charAt(i);
-			int statePos = origOffset + i;
+			int statePos = firstNonWhitespaceOffset + i;
 			LexState charState = (statePos < charStates.length) ? charStates[statePos] : LexState.CODE;
 
 			if (c == '{' && charState == LexState.CODE && sb.length() > 0) {
@@ -597,12 +600,13 @@ public class FormattingProvider {
 	/**
 	 * Find the position of the first non-whitespace character starting from offset.
 	 */
-	private int findFirstNonWhitespace(LexState[] charStates, int offset) {
-		// Walk forward from offset to find first non-whitespace
-		// Since we don't have the text here, just return the offset
-		// (the trimmedLine already stripped leading whitespace, so we need
-		// to account for that). This is approximate but sufficient.
-		return offset;
+	private int findFirstNonWhitespace(String originalLine, int lineStartOffset) {
+		for (int i = 0; i < originalLine.length(); i++) {
+			if (!Character.isWhitespace(originalLine.charAt(i))) {
+				return lineStartOffset + i;
+			}
+		}
+		return lineStartOffset + originalLine.length();
 	}
 
 	/**
@@ -626,6 +630,40 @@ public class FormattingProvider {
 		return net;
 	}
 
+	private int countNetGroupingDelimiters(String line, LexState[] charStates, int lineStartOffset) {
+		int net = 0;
+		for (int i = 0; i < line.length(); i++) {
+			int statePos = lineStartOffset + i;
+			LexState state = (statePos < charStates.length) ? charStates[statePos] : LexState.CODE;
+			if (state == LexState.CODE) {
+				char c = line.charAt(i);
+				if (c == '[') {
+					net++;
+				} else if (c == ']') {
+					net--;
+				}
+			}
+		}
+		return net;
+	}
+
+	private int countLeadingClosers(String trimmedLine, LexState[] charStates, int lineStartOffset) {
+		int closers = 0;
+		for (int i = 0; i < trimmedLine.length(); i++) {
+			char c = trimmedLine.charAt(i);
+			if (c != '}' && c != ']') {
+				break;
+			}
+			int statePos = lineStartOffset + i;
+			LexState state = (statePos < charStates.length) ? charStates[statePos] : LexState.CODE;
+			if (state != LexState.CODE) {
+				break;
+			}
+			closers++;
+		}
+		return closers;
+	}
+
 	private String buildIndent(String singleIndent, int depth) {
 		if (depth <= 0) {
 			return "";
@@ -643,5 +681,13 @@ public class FormattingProvider {
 			end--;
 		}
 		return text.substring(0, end);
+	}
+
+	private boolean isContinuationMemberAccessLine(String trimmedLine) {
+		return trimmedLine.startsWith(".")
+				|| trimmedLine.startsWith("?.")
+				|| trimmedLine.startsWith("*.")
+				|| trimmedLine.startsWith(".@")
+				|| trimmedLine.startsWith(".&");
 	}
 }

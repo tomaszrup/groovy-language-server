@@ -19,6 +19,7 @@
 ////////////////////////////////////////////////////////////////////////////////
 package com.tomaszrup.groovyls;
 
+import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -47,6 +48,26 @@ class GroovyServicesInlayHintTests {
 	private GroovyServices services;
 	private Path workspaceRoot;
 	private Path srcRoot;
+
+	private static class ThrowingGroovyServices extends GroovyServices {
+		private volatile boolean throwOnEnsure;
+
+		ThrowingGroovyServices() {
+			super(new CompilationUnitFactory());
+		}
+
+		void setThrowOnEnsure(boolean throwOnEnsure) {
+			this.throwOnEnsure = throwOnEnsure;
+		}
+
+		@Override
+		protected ProjectScope ensureCompiledForContext(URI uri) {
+			if (throwOnEnsure) {
+				throw new NoClassDefFoundError("simulated inlay linkage failure");
+			}
+			return super.ensureCompiledForContext(uri);
+		}
+	}
 
 	@BeforeEach
 	void setup() {
@@ -313,5 +334,34 @@ class GroovyServicesInlayHintTests {
 				.collect(java.util.stream.Collectors.toList());
 		Assertions.assertFalse(typeHints.isEmpty(),
 				"Expected type hint 'String' for def variable initialized from method call");
+	}
+
+	@Test
+	void testInlayHintsFailSoftAfterLinkageErrorInEnsureCompiledForContext() throws Exception {
+		ThrowingGroovyServices throwingServices = new ThrowingGroovyServices();
+		throwingServices.setWorkspaceRoot(workspaceRoot);
+		throwingServices.connect(new TestLanguageClient());
+		services = throwingServices;
+
+		Path filePath = srcRoot.resolve("InlayLinkageFallback.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("class InlayLinkageFallback {\n");
+		contents.append("  void greet(String name, int count) {}\n");
+		contents.append("  void caller() {\n");
+		contents.append("    greet(\"world\", 3)\n");
+		contents.append("  }\n");
+		contents.append("}");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		throwingServices.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+
+		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+		Range range = new Range(new Position(0, 0), new Position(5, 1));
+
+		throwingServices.setThrowOnEnsure(true);
+		List<InlayHint> fallbackHints = throwingServices.inlayHint(new InlayHintParams(textDocument, range)).get();
+		Assertions.assertNotNull(fallbackHints);
+		Assertions.assertTrue(fallbackHints.isEmpty(),
+				"Inlay hint request should fail soft and return an empty list after linkage error");
 	}
 }

@@ -924,8 +924,18 @@ public class CompilationService {
 	 * <p><b>Caller must hold the scope's write lock.</b></p>
 	 */
 	public void recompileAfterJavaChange(ProjectScope scope) {
+		if (scope.getProjectRoot() != null) {
+			com.tomaszrup.groovyls.compiler.SharedClasspathIndexCache.getInstance()
+					.invalidateEntriesUnderProject(scope.getProjectRoot());
+			com.tomaszrup.groovyls.compiler.SharedClassGraphCache.getInstance()
+					.invalidateEntriesUnderProject(scope.getProjectRoot());
+		}
+		scope.clearClasspathIndexes();
 		scope.getCompilationUnitFactory().invalidateFileCache();
-		scope.getCompilationUnitFactory().invalidateCompilationUnit();
+		// Use full invalidation (including classloader) so that stale .class
+		// files deleted from the build output are not served from the
+		// classloader's cache.
+		scope.getCompilationUnitFactory().invalidateCompilationUnitFull();
 		scope.getDependencyGraph().clear();
 		createOrUpdateCompilationUnit(scope);
 		resetChangedFilesForScope(scope);

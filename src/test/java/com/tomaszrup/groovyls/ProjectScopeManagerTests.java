@@ -16,6 +16,7 @@
 package com.tomaszrup.groovyls;
 
 import java.net.URI;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Arrays;
@@ -26,11 +27,14 @@ import java.util.Map;
 import java.util.Set;
 
 import com.google.gson.JsonObject;
+import groovy.lang.GroovyClassLoader;
+import org.codehaus.groovy.control.CompilerConfiguration;
 
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import com.tomaszrup.groovyls.compiler.SharedClasspathIndexCache;
 import com.tomaszrup.groovyls.config.CompilationUnitFactory;
 import com.tomaszrup.groovyls.util.FileContentsTracker;
 
@@ -112,6 +116,11 @@ class ProjectScopeManagerTests {
 	}
 
 	@Test
+	void testFormattingOrganizeImportsEnabledByDefault() {
+		Assertions.assertTrue(manager.isFormattingOrganizeImportsEnabled());
+	}
+
+	@Test
 	void testUpdateFeatureTogglesDisableSemanticHighlighting() {
 		JsonObject settings = new JsonObject();
 		JsonObject groovy = new JsonObject();
@@ -135,6 +144,19 @@ class ProjectScopeManagerTests {
 
 		manager.updateFeatureToggles(settings);
 		Assertions.assertFalse(manager.isFormattingEnabled());
+	}
+
+	@Test
+	void testUpdateFeatureTogglesDisableFormattingOrganizeImports() {
+		JsonObject settings = new JsonObject();
+		JsonObject groovy = new JsonObject();
+		JsonObject fmt = new JsonObject();
+		fmt.addProperty("organizeImports", false);
+		groovy.add("formatting", fmt);
+		settings.add("groovy", groovy);
+
+		manager.updateFeatureToggles(settings);
+		Assertions.assertFalse(manager.isFormattingOrganizeImportsEnabled());
 	}
 
 	@Test
@@ -211,6 +233,37 @@ class ProjectScopeManagerTests {
 
 		ProjectScope scope = manager.getProjectScopes().get(0);
 		Assertions.assertFalse(scope.isClasspathResolved());
+	}
+
+	@Test
+	void testRegisterDiscoveredProjectsInvalidatesWorkspaceLocalClasspathIndexCache() throws Exception {
+		SharedClasspathIndexCache cache = SharedClasspathIndexCache.getInstance();
+		cache.clear();
+
+		Path projectRoot = Files.createTempDirectory("gls-cache-invalidation-");
+		Path classesDir = projectRoot.resolve("build/classes");
+		Files.createDirectories(classesDir);
+
+		GroovyClassLoader classLoader = new GroovyClassLoader(
+				ClassLoader.getSystemClassLoader().getParent(),
+				new CompilerConfiguration(),
+				true);
+		classLoader.addClasspath(classesDir.toString());
+
+		SharedClasspathIndexCache.AcquireResult first = cache.acquireWithResult(classLoader);
+		Assertions.assertNotNull(first);
+		Assertions.assertNotNull(first.getIndex());
+
+		manager.registerDiscoveredProjects(Arrays.asList(projectRoot));
+
+		SharedClasspathIndexCache.AcquireResult second = cache.acquireWithResult(classLoader);
+		Assertions.assertNotNull(second);
+		Assertions.assertNotNull(second.getIndex());
+		Assertions.assertNotSame(first.getIndex(), second.getIndex(),
+				"Workspace project registration should evict stale shared classpath indexes");
+
+		classLoader.close();
+		cache.clear();
 	}
 
 	// --- findProjectScope (longest-prefix match) ---

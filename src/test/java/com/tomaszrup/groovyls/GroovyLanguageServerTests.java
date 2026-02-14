@@ -71,7 +71,7 @@ class GroovyLanguageServerTests {
 		Assertions.assertNotNull(caps);
 		Assertions.assertNotNull(caps.getCompletionProvider());
 		Assertions.assertTrue(caps.getCompletionProvider().getResolveProvider());
-		Assertions.assertEquals(TextDocumentSyncKind.Incremental, caps.getTextDocumentSync().getLeft());
+		Assertions.assertEquals(TextDocumentSyncKind.Full, caps.getTextDocumentSync().getLeft());
 		Assertions.assertTrue(caps.getDocumentSymbolProvider().getLeft());
 		Assertions.assertTrue(caps.getWorkspaceSymbolProvider().getLeft());
 		Assertions.assertTrue(caps.getReferencesProvider().getLeft());

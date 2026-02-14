@@ -23,6 +23,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 
 import org.eclipse.lsp4j.MessageActionItem;
+import org.eclipse.lsp4j.ApplyWorkspaceEditParams;
+import org.eclipse.lsp4j.ApplyWorkspaceEditResponse;
 import org.eclipse.lsp4j.MessageParams;
 import org.eclipse.lsp4j.PublishDiagnosticsParams;
 import org.eclipse.lsp4j.ShowMessageRequestParams;
@@ -89,5 +91,15 @@ public class TestLanguageClient implements LanguageClient {
 
     @Override
     public void logMessage(MessageParams message) {
+    }
+
+    @Override
+    public CompletableFuture<Void> refreshSemanticTokens() {
+        return CompletableFuture.completedFuture(null);
+    }
+
+    @Override
+    public CompletableFuture<ApplyWorkspaceEditResponse> applyEdit(ApplyWorkspaceEditParams params) {
+        return CompletableFuture.completedFuture(new ApplyWorkspaceEditResponse(true));
     }
 }

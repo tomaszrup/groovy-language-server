@@ -2,8 +2,13 @@ package com.tomaszrup.groovyls.providers;
 
 import java.net.URI;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Collections;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.HashMap;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -28,11 +33,16 @@ import com.tomaszrup.groovyls.providers.codeactions.GenerateMethodsAction;
 import com.tomaszrup.groovyls.providers.codeactions.ImplementInterfaceMethodsAction;
 import com.tomaszrup.groovyls.providers.codeactions.OrganizeImportsAction;
 import com.tomaszrup.groovyls.util.FileContentsTracker;
+import com.tomaszrup.groovyls.util.JavaSourceLocator;
 
 public class CodeActionProvider {
 	private static final Pattern PATTERN_UNABLE_TO_RESOLVE_CLASS = Pattern
 			.compile("unable to resolve class (\\w+)");
 	private static final String UNUSED_IMPORT_MESSAGE = "Unused import";
+	private static final int IMPORT_PRIORITY_LOCATOR_PROJECT = 0;
+	private static final int IMPORT_PRIORITY_AST = 1;
+	private static final int IMPORT_PRIORITY_LOCATOR_OTHER = 2;
+	private static final int IMPORT_PRIORITY_CLASSPATH = 3;
 
 	private ASTNodeVisitor ast;
 	private ClasspathSymbolIndex classpathSymbolIndex;
@@ -42,19 +52,28 @@ public class CodeActionProvider {
 	 */
 	private java.util.Set<String> classpathSymbolClasspathElements;
 	private FileContentsTracker fileContentsTracker;
+	private JavaSourceLocator javaSourceLocator;
 
 	public CodeActionProvider(ASTNodeVisitor ast, ClasspathSymbolIndex classpathSymbolIndex,
 			FileContentsTracker fileContentsTracker) {
-		this(ast, classpathSymbolIndex, null, fileContentsTracker);
+		this(ast, classpathSymbolIndex, null, fileContentsTracker, null);
 	}
 
 	public CodeActionProvider(ASTNodeVisitor ast, ClasspathSymbolIndex classpathSymbolIndex,
 			java.util.Set<String> classpathSymbolClasspathElements,
 			FileContentsTracker fileContentsTracker) {
+		this(ast, classpathSymbolIndex, classpathSymbolClasspathElements, fileContentsTracker, null);
+	}
+
+	public CodeActionProvider(ASTNodeVisitor ast, ClasspathSymbolIndex classpathSymbolIndex,
+			java.util.Set<String> classpathSymbolClasspathElements,
+			FileContentsTracker fileContentsTracker,
+			JavaSourceLocator javaSourceLocator) {
 		this.ast = ast;
 		this.classpathSymbolIndex = classpathSymbolIndex;
 		this.classpathSymbolClasspathElements = classpathSymbolClasspathElements;
 		this.fileContentsTracker = fileContentsTracker;
+		this.javaSourceLocator = javaSourceLocator;
 	}
 
 	/**
@@ -152,6 +171,23 @@ public class CodeActionProvider {
 
 	private List<CodeAction> createImportActions(URI uri, String unresolvedClassName, Diagnostic diagnostic) {
 		List<CodeAction> actions = new ArrayList<>();
+		Set<String> seenFqcns = new LinkedHashSet<>();
+		Map<String, Integer> candidatePriorities = new HashMap<>();
+		String currentPackage = extractCurrentPackage(uri);
+
+		// Prefer live source-locator results first; these reflect source moves
+		// even when classpath indexes are stale.
+		if (javaSourceLocator != null) {
+			for (String fullyQualifiedName : javaSourceLocator.findClassNamesBySimpleName(unresolvedClassName)) {
+				if (!shouldOfferImport(fullyQualifiedName, currentPackage) || !seenFqcns.add(fullyQualifiedName)) {
+					continue;
+				}
+				int priority = javaSourceLocator.hasProjectSource(fullyQualifiedName)
+						? IMPORT_PRIORITY_LOCATOR_PROJECT
+						: IMPORT_PRIORITY_LOCATOR_OTHER;
+				candidatePriorities.put(fullyQualifiedName, priority);
+			}
+		}
 
 		// Search in classpath via ClassGraph
 		if (classpathSymbolIndex != null) {
@@ -159,10 +195,11 @@ public class CodeActionProvider {
 			for (ClasspathSymbolIndex.Symbol classSymbol : allClasses) {
 				if (classSymbol.getSimpleName().equals(unresolvedClassName)) {
 					String fullyQualifiedName = classSymbol.getName();
-					CodeAction action = createAddImportAction(uri, fullyQualifiedName, diagnostic);
-					if (action != null) {
-						actions.add(action);
+					if (!shouldOfferImport(fullyQualifiedName, currentPackage)
+							|| !seenFqcns.add(fullyQualifiedName)) {
+						continue;
 					}
+					candidatePriorities.put(fullyQualifiedName, IMPORT_PRIORITY_CLASSPATH);
 				}
 			}
 		}
@@ -175,19 +212,65 @@ public class CodeActionProvider {
 							&& classNode.getPackageName().length() > 0)
 					.forEach(classNode -> {
 						String fullyQualifiedName = classNode.getName();
-						// Avoid duplicates from ClassGraph
-						boolean alreadyAdded = actions.stream()
-								.anyMatch(a -> a.getTitle().contains(fullyQualifiedName));
-						if (!alreadyAdded) {
-							CodeAction action = createAddImportAction(uri, fullyQualifiedName, diagnostic);
-							if (action != null) {
-								actions.add(action);
-							}
+						if (shouldOfferImport(fullyQualifiedName, currentPackage)
+								&& seenFqcns.add(fullyQualifiedName)) {
+							candidatePriorities.put(fullyQualifiedName, IMPORT_PRIORITY_AST);
 						}
 					});
 		}
 
+		candidatePriorities.entrySet().stream()
+				.sorted(Comparator
+						.comparingInt((Map.Entry<String, Integer> e) -> e.getValue())
+						.thenComparing(Map.Entry::getKey))
+				.forEach(entry -> {
+					CodeAction action = createAddImportAction(uri, entry.getKey(), diagnostic);
+					if (action != null) {
+						actions.add(action);
+					}
+				});
+
 		return actions;
+	}
+
+	private boolean shouldOfferImport(String fullyQualifiedName, String currentPackage) {
+		if (fullyQualifiedName == null || fullyQualifiedName.isEmpty()) {
+			return false;
+		}
+		if (currentPackage == null || currentPackage.isEmpty()) {
+			return true;
+		}
+		int lastDot = fullyQualifiedName.lastIndexOf('.');
+		if (lastDot < 0) {
+			return true;
+		}
+		String candidatePackage = fullyQualifiedName.substring(0, lastDot);
+		return !currentPackage.equals(candidatePackage);
+	}
+
+	private String extractCurrentPackage(URI uri) {
+		if (fileContentsTracker == null || uri == null) {
+			return null;
+		}
+		String content = fileContentsTracker.getContents(uri);
+		if (content == null || content.isEmpty()) {
+			return null;
+		}
+		for (String rawLine : content.split("\\R", -1)) {
+			String line = rawLine.trim();
+			if (line.isEmpty() || line.startsWith("//") || line.startsWith("/*") || line.startsWith("*")) {
+				continue;
+			}
+			if (line.startsWith("package ")) {
+				String pkg = line.substring("package ".length()).trim();
+				if (pkg.endsWith(";")) {
+					pkg = pkg.substring(0, pkg.length() - 1).trim();
+				}
+				return pkg;
+			}
+			break;
+		}
+		return null;
 	}
 
 	private CodeAction createAddImportAction(URI uri, String fullyQualifiedName, Diagnostic diagnostic) {

@@ -20,6 +20,7 @@
 package com.tomaszrup.groovyls.compiler;
 
 import java.net.URI;
+import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -31,6 +32,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.codehaus.groovy.control.ErrorCollector;
 import org.codehaus.groovy.control.messages.Message;
@@ -54,6 +57,8 @@ import org.slf4j.LoggerFactory;
  */
 public class DiagnosticHandler {
 	private static final Logger logger = LoggerFactory.getLogger(DiagnosticHandler.class);
+	private static final Pattern UNRESOLVED_CLASS_PATTERN =
+			Pattern.compile("unable to resolve class\\s+([^\\s\\r\\n]+)", Pattern.CASE_INSENSITIVE);
 
 	/**
 	 * Processes the error collector from a compilation and produces LSP
@@ -133,6 +138,7 @@ public class DiagnosticHandler {
 							return;
 						}
 						logger.debug("  Diagnostic [{}] in {}: {}", projectRoot, uri, cause.getMessage());
+						traceUnresolvedClassDiagnostic(projectRoot, cause, uri, range);
 						diagnosticsByFile.computeIfAbsent(uri, (key) -> new ArrayList<>()).add(diagnostic);
 					});
 		}
@@ -165,6 +171,118 @@ public class DiagnosticHandler {
 		}
 
 		return new DiagnosticResult(result, diagnosticsByFile);
+	}
+
+	private void traceUnresolvedClassDiagnostic(Path projectRoot, SyntaxException cause, URI uri, Range range) {
+		if (!logger.isDebugEnabled()) {
+			return;
+		}
+		String message = cause.getMessage();
+		if (message == null) {
+			return;
+		}
+		Matcher matcher = UNRESOLVED_CLASS_PATTERN.matcher(message);
+		if (!matcher.find()) {
+			return;
+		}
+		String unresolved = matcher.group(1);
+		String locator = cause.getSourceLocator();
+		String sourceLine = readLineFromLocator(locator, range != null ? range.getStart().getLine() + 1 : -1);
+		String importToken = extractImportToken(sourceLine);
+		logger.debug(
+				"unresolvedTrace projectRoot={} uri={} unresolved={} unresolvedCodepoints={} line={} col={} sourceLocator={} sourceLine={}",
+				projectRoot,
+				uri,
+				unresolved,
+				toCodepointHex(unresolved, 64),
+				range != null ? (range.getStart().getLine() + 1) : null,
+				range != null ? (range.getStart().getCharacter() + 1) : null,
+				locator,
+				sourceLine);
+		if (importToken != null && !importToken.equals(unresolved)) {
+			logger.warn(
+					"unresolvedTrace mismatch projectRoot={} uri={} importToken={} unresolved={} line={} col={} sourceLocator={}",
+					projectRoot,
+					uri,
+					importToken,
+					unresolved,
+					range != null ? (range.getStart().getLine() + 1) : null,
+					range != null ? (range.getStart().getCharacter() + 1) : null,
+					locator);
+		}
+	}
+
+	private String extractImportToken(String sourceLine) {
+		if (sourceLine == null || sourceLine.startsWith("<")) {
+			return null;
+		}
+		String trimmed = sourceLine.trim();
+		if (!trimmed.startsWith("import ")) {
+			return null;
+		}
+		String token = trimmed.substring("import ".length()).trim();
+		if (token.endsWith(";")) {
+			token = token.substring(0, token.length() - 1).trim();
+		}
+		if (token.isEmpty()) {
+			return null;
+		}
+		return token;
+	}
+
+	private String readLineFromLocator(String sourceLocator, int oneBasedLine) {
+		if (sourceLocator == null || sourceLocator.isEmpty() || oneBasedLine < 1) {
+			return "<unavailable>";
+		}
+		try {
+			Path p = Paths.get(sourceLocator);
+			if (!Files.isRegularFile(p)) {
+				return "<not-a-file>";
+			}
+			List<String> lines = Files.readAllLines(p);
+			if (oneBasedLine > lines.size()) {
+				return "<line-out-of-range>";
+			}
+			return preview(lines.get(oneBasedLine - 1), 220);
+		} catch (Exception e) {
+			return "<read-failed:" + e.getClass().getSimpleName() + ">";
+		}
+	}
+
+	private String toCodepointHex(String text, int maxCodepoints) {
+		if (text == null) {
+			return "<null>";
+		}
+		StringBuilder sb = new StringBuilder();
+		int idx = 0;
+		int count = 0;
+		while (idx < text.length() && count < maxCodepoints) {
+			int cp = text.codePointAt(idx);
+			if (count > 0) {
+				sb.append(' ');
+			}
+			sb.append(String.format("U+%04X", cp));
+			idx += Character.charCount(cp);
+			count++;
+		}
+		if (idx < text.length()) {
+			sb.append(" ...");
+		}
+		return sb.toString();
+	}
+
+	private String preview(String text, int maxLen) {
+		if (text == null) {
+			return "<null>";
+		}
+		String normalized = text
+				.replace("\r", "\\r")
+				.replace("\n", "\\n")
+				.replace("\t", "\\t");
+		if (normalized.length() <= maxLen) {
+			return normalized;
+		}
+		return normalized.substring(0, maxLen) + "...";
 	}
 
 	/**

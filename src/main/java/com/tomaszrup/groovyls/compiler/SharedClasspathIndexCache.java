@@ -22,6 +22,8 @@ package com.tomaszrup.groovyls.compiler;
 import java.io.File;
 import java.io.IOException;
 import java.net.URL;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -187,6 +189,76 @@ public class SharedClasspathIndexCache {
 
 	public synchronized void clear() {
 		cache.clear();
+	}
+
+	/**
+	 * Evict cached classpath indexes that include classpath elements under the
+	 * given project root. Used after Java source moves/renames so stale symbols
+	 * from old package locations are not reused.
+	 *
+	 * @param projectRoot project root path
+	 * @return number of removed cache entries
+	 */
+	public synchronized int invalidateEntriesUnderProject(Path projectRoot) {
+		if (projectRoot == null || cache.isEmpty()) {
+			return 0;
+		}
+		Path normalizedRoot = normalizePath(projectRoot);
+		int removed = 0;
+		java.util.Iterator<Map.Entry<String, CacheEntry>> iterator = cache.entrySet().iterator();
+		while (iterator.hasNext()) {
+			Map.Entry<String, CacheEntry> entry = iterator.next();
+			if (containsPathUnderRoot(entry.getValue().classpathUrls, normalizedRoot)) {
+				iterator.remove();
+				removed++;
+			}
+		}
+		if (removed > 0) {
+			logger.info("SharedClasspathIndexCache invalidated {} entries for project {}", removed, normalizedRoot);
+		}
+		return removed;
+	}
+
+	private static boolean containsPathUnderRoot(Set<String> urlStrings, Path projectRoot) {
+		if (urlStrings == null || urlStrings.isEmpty()) {
+			return false;
+		}
+		for (String url : urlStrings) {
+			Path candidate = toPath(url);
+			if (candidate != null && candidate.startsWith(projectRoot)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private static Path toPath(String url) {
+		if (url == null || url.isEmpty()) {
+			return null;
+		}
+		try {
+			java.net.URI uri = new java.net.URI(url);
+			if ("file".equalsIgnoreCase(uri.getScheme())) {
+				return normalizePath(Paths.get(uri));
+			}
+		} catch (Exception ignored) {
+		}
+		try {
+			return normalizePath(Paths.get(url));
+		} catch (Exception ignored) {
+			return null;
+		}
+	}
+
+	private static Path normalizePath(Path path) {
+		if (path == null) {
+			return null;
+		}
+		try {
+			return path.toRealPath();
+		} catch (IOException e) {
+			return path.toAbsolutePath().normalize();
+		}
 	}
 
 	private static Set<String> extractUrlSet(GroovyClassLoader classLoader) {

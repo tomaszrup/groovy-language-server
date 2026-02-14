@@ -22,6 +22,8 @@ package com.tomaszrup.groovyls;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Arrays;
+import java.util.Comparator;
 import java.util.List;
 
 import org.eclipse.lsp4j.DidOpenTextDocumentParams;
@@ -226,5 +228,56 @@ class GroovyServicesWorkspaceSymbolTests {
 		List<? extends WorkspaceSymbol> symbols = result.getRight();
 		Assertions.assertFalse(symbols.isEmpty(),
 				"Should find at least one symbol matching 'uniqueFieldName'");
+	}
+
+	@Test
+	void testWorkspaceSymbolWithMultipleScopesUsesOpenProjectScopesOnly() throws Exception {
+		Path projectA = workspaceRoot.resolve("ws-scope-a");
+		Path projectB = workspaceRoot.resolve("ws-scope-b");
+		Path projectASrc = projectA.resolve("src/main/groovy");
+		Path projectBSrc = projectB.resolve("src/main/groovy");
+		Files.createDirectories(projectASrc);
+		Files.createDirectories(projectBSrc);
+
+		services.registerDiscoveredProjects(Arrays.asList(projectA, projectB));
+
+		Path fileA = projectASrc.resolve("OnlyA.groovy");
+		String uriA = fileA.toUri().toString();
+		String contentA = "class OnlyA { void fromA() {} }";
+		services.didOpen(new DidOpenTextDocumentParams(new TextDocumentItem(uriA, LANGUAGE_GROOVY, 1, contentA)));
+
+		Path fileB = projectBSrc.resolve("OnlyB.groovy");
+		String uriB = fileB.toUri().toString();
+		String contentB = "class OnlyB { void fromB() {} }";
+		Files.writeString(fileB, contentB);
+
+		Either<List<? extends org.eclipse.lsp4j.SymbolInformation>, List<? extends WorkspaceSymbol>> resultA = services
+				.symbol(new WorkspaceSymbolParams("OnlyA")).get();
+		Assertions.assertTrue(resultA.isRight());
+		Assertions.assertFalse(resultA.getRight().isEmpty(),
+				"Should return symbols from project A when project A has open files");
+
+		Either<List<? extends org.eclipse.lsp4j.SymbolInformation>, List<? extends WorkspaceSymbol>> resultB = services
+				.symbol(new WorkspaceSymbolParams("OnlyB")).get();
+		Assertions.assertTrue(resultB.isRight());
+		Assertions.assertTrue(resultB.getRight().isEmpty(),
+				"Should not return symbols from sibling project B when no file from project B is open");
+
+		deleteDirectoryRecursively(projectA);
+		deleteDirectoryRecursively(projectB);
+	}
+
+	private void deleteDirectoryRecursively(Path root) throws Exception {
+		if (root == null || !Files.exists(root)) {
+			return;
+		}
+		try (java.util.stream.Stream<Path> walk = Files.walk(root)) {
+			walk.sorted(Comparator.reverseOrder()).forEach(path -> {
+				try {
+					Files.deleteIfExists(path);
+				} catch (Exception ignored) {
+				}
+			});
+		}
 	}
 }

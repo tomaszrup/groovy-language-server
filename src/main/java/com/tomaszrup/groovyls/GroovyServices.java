@@ -21,19 +21,24 @@
 package com.tomaszrup.groovyls;
 
 import java.net.URI;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 
 import com.google.gson.JsonObject;
 
@@ -67,6 +72,7 @@ import com.tomaszrup.groovyls.providers.SpockCodeActionProvider;
 import com.tomaszrup.groovyls.providers.SpockCompletionProvider;
 import com.tomaszrup.groovyls.providers.TypeDefinitionProvider;
 import com.tomaszrup.groovyls.providers.WorkspaceSymbolProvider;
+import com.tomaszrup.groovyls.providers.codeactions.OrganizeImportsAction;
 import com.tomaszrup.groovyls.util.FileContentsTracker;
 import com.tomaszrup.groovyls.util.MdcProjectContext;
 import org.slf4j.Logger;
@@ -150,6 +156,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		this.compilationService = new CompilationService(fileContentsTracker);
 		this.compilationService.setCompilationPermits(executorPools.getCompilationPermits());
 		this.fileChangeHandler = new FileChangeHandler(scopeManager, compilationService, schedulingPool);
+		this.fileChangeHandler.setJavaImportMoveListener(this::applyGroovyImportUpdatesForJavaMoves);
 		this.documentResolverService = new DocumentResolverService(scopeManager);
 	}
 
@@ -208,6 +215,68 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 
 	protected SemanticTokensProvider createSemanticTokensProvider(ASTNodeVisitor visitor) {
 		return new SemanticTokensProvider(visitor, fileContentsTracker);
+	}
+
+	private <T> CompletableFuture<T> failSoftRequest(String requestName, URI uri,
+			Supplier<CompletableFuture<T>> requestCall, T fallbackValue) {
+		try {
+			CompletableFuture<T> future = requestCall.get();
+			if (future == null) {
+				return CompletableFuture.completedFuture(fallbackValue);
+			}
+			return future.exceptionally(throwable -> {
+				Throwable root = unwrapRequestThrowable(throwable);
+				if (isFatalRequestThrowable(root)) {
+					throwAsUnchecked(root);
+				}
+				logRequestFailure(requestName, uri, root, true);
+				return fallbackValue;
+			});
+		} catch (Throwable throwable) {
+			Throwable root = unwrapRequestThrowable(throwable);
+			if (isFatalRequestThrowable(root)) {
+				throwAsUnchecked(root);
+			}
+			logRequestFailure(requestName, uri, root, false);
+			return CompletableFuture.completedFuture(fallbackValue);
+		}
+	}
+
+	private void logRequestFailure(String requestName, URI uri, Throwable throwable,
+			boolean fromAsyncStage) {
+		ProjectScope scope = uri != null ? scopeManager.findProjectScope(uri) : null;
+		Path projectRoot = scope != null ? scope.getProjectRoot() : null;
+		String phase = fromAsyncStage ? "async" : "sync";
+		logger.warn("{} request failed ({}), uri={}, projectRoot={}, error={}", requestName, phase, uri,
+				projectRoot, throwable.toString());
+		logger.debug("{} request failure details", requestName, throwable);
+	}
+
+	private static Throwable unwrapRequestThrowable(Throwable throwable) {
+		Throwable current = throwable;
+		while (current instanceof java.util.concurrent.CompletionException
+				|| current instanceof ExecutionException) {
+			Throwable cause = current.getCause();
+			if (cause == null) {
+				break;
+			}
+			current = cause;
+		}
+		return current;
+	}
+
+	private static boolean isFatalRequestThrowable(Throwable throwable) {
+		return throwable instanceof VirtualMachineError;
+	}
+
+	private static void throwAsUnchecked(Throwable throwable) {
+		if (throwable instanceof RuntimeException) {
+			throw (RuntimeException) throwable;
+		}
+		if (throwable instanceof Error) {
+			throw (Error) throwable;
+		}
+		throw new RuntimeException(throwable);
 	}
 
 	/**
@@ -498,6 +567,60 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	@Override
 	public void didChange(DidChangeTextDocumentParams params) {
 		fileContentsTracker.didChange(params);
+		try {
+			URI traceUri = URI.create(params.getTextDocument().getUri());
+			boolean importOrPackageEdit = false;
+			List<TextDocumentContentChangeEvent> changes = params.getContentChanges();
+			if (changes != null) {
+				for (TextDocumentContentChangeEvent ev : changes) {
+					String t = ev.getText();
+					if (t != null && (t.contains("import ") || t.contains("package ")
+							|| t.contains("com."))) {
+						importOrPackageEdit = true;
+						break;
+					}
+				}
+			}
+			if (importOrPackageEdit && logger.isInfoEnabled()) {
+				String trackedContents = fileContentsTracker.getContents(traceUri);
+				if (trackedContents != null) {
+					List<String> imports = collectImportLines(trackedContents, 8);
+					logger.info("didChangeImports uri={} imports={}", traceUri, imports);
+				}
+			}
+		} catch (Exception ignored) {
+			// trace-only path
+		}
+		if (logger.isDebugEnabled()) {
+			try {
+				URI traceUri = URI.create(params.getTextDocument().getUri());
+				VersionedTextDocumentIdentifier doc = params.getTextDocument();
+				List<TextDocumentContentChangeEvent> changes = params.getContentChanges();
+				logger.debug("didChangeTrace uri={} version={} changeCount={}",
+						traceUri, doc != null ? doc.getVersion() : null,
+						changes != null ? changes.size() : 0);
+				if (changes != null) {
+					for (int i = 0; i < changes.size(); i++) {
+						TextDocumentContentChangeEvent ev = changes.get(i);
+						logger.debug(
+								"didChangeTrace change[{}] range={} rangeLength={} textPreview={} textCodepoints={}",
+								i,
+								ev.getRange(),
+								ev.getRangeLength(),
+								preview(ev.getText(), 160),
+								codepointPreview(ev.getText(), 40));
+					}
+				}
+
+				String trackedContents = fileContentsTracker.getContents(traceUri);
+				if (trackedContents != null) {
+					List<String> interestingImports = collectImportLines(trackedContents, 12);
+					logger.debug("didChangeTrace trackedImports uri={} imports={}", traceUri, interestingImports);
+				}
+			} catch (Exception e) {
+				logger.debug("didChangeTrace logging failed: {}", e.toString());
+			}
+		}
 
 		// Set MDC for the current thread so that the MDC-propagating
 		// scheduled executor captures the project context.
@@ -575,6 +698,231 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		fileChangeHandler.handleDidChangeWatchedFiles(params);
 	}
 
+	private void applyGroovyImportUpdatesForJavaMoves(Path projectRoot, Map<String, String> movedImports) {
+		if (projectRoot == null || movedImports == null || movedImports.isEmpty()) {
+			return;
+		}
+		LanguageClient client = languageClient;
+		if (client == null) {
+			return;
+		}
+
+		Set<URI> candidateUris = collectGroovyUrisForProject(projectRoot);
+		if (candidateUris.isEmpty()) {
+			return;
+		}
+
+		Map<String, List<TextEdit>> changes = new LinkedHashMap<>();
+		for (URI uri : candidateUris) {
+			String source = fileContentsTracker.getContents(uri);
+			if (source == null || source.isEmpty()) {
+				continue;
+			}
+			String updated = rewriteGroovyImports(source, movedImports);
+			if (updated.equals(source)) {
+				continue;
+			}
+
+			int endLine = 0;
+			int endChar = 0;
+			if (!source.isEmpty()) {
+				String[] lines = source.split("\\n", -1);
+				endLine = lines.length - 1;
+				endChar = lines[endLine].length();
+			}
+			TextEdit fullReplacement = new TextEdit(
+					new Range(new Position(0, 0), new Position(endLine, endChar)),
+					updated);
+			changes.put(uri.toString(), Collections.singletonList(fullReplacement));
+
+			if (fileContentsTracker.isOpen(uri)) {
+				fileContentsTracker.setContents(uri, updated);
+				fileContentsTracker.forceChanged(uri);
+			}
+		}
+
+		if (changes.isEmpty()) {
+			return;
+		}
+
+		WorkspaceEdit edit = new WorkspaceEdit();
+		edit.setChanges(changes);
+		ApplyWorkspaceEditParams params = new ApplyWorkspaceEditParams(edit);
+		client.applyEdit(params).exceptionally(error -> {
+			logger.debug("Failed to apply Groovy import updates after Java move: {}", error.getMessage());
+			return null;
+		});
+	}
+
+	private Set<URI> collectGroovyUrisForProject(Path projectRoot) {
+		Set<URI> uris = new LinkedHashSet<>();
+		for (URI openUri : fileContentsTracker.getOpenURIs()) {
+			try {
+				Path openPath = Path.of(openUri);
+				if (openPath.startsWith(projectRoot)
+						&& openPath.toString().endsWith(".groovy")
+						&& !isBuildOutputFile(openPath, projectRoot)) {
+					uris.add(openUri);
+				}
+			} catch (Exception e) {
+				// ignore URI that cannot be converted to a path
+			}
+		}
+
+		try (var stream = Files.walk(projectRoot)) {
+			stream.filter(Files::isRegularFile)
+					.filter(path -> path.toString().endsWith(".groovy"))
+					.filter(path -> !isBuildOutputFile(path, projectRoot))
+					.forEach(path -> uris.add(path.toUri()));
+		} catch (Exception e) {
+			logger.debug("Failed to scan Groovy files for import updates under {}: {}",
+					projectRoot, e.getMessage());
+		}
+
+		return uris;
+	}
+
+	private String rewriteGroovyImports(String source, Map<String, String> movedImports) {
+		String updated = source;
+		for (Map.Entry<String, String> move : movedImports.entrySet()) {
+			String oldFqcn = move.getKey();
+			String newFqcn = move.getValue();
+			updated = updated.replaceAll(
+					"(?m)^([\\t ]*import[\\t ]+)" + java.util.regex.Pattern.quote(oldFqcn)
+							+ "((?:[\\t ]+as[\\t ]+[A-Za-z_$][\\w$]*)?[\\t ]*;?[\\t ]*)$",
+					"$1" + java.util.regex.Matcher.quoteReplacement(newFqcn) + "$2");
+			updated = updated.replaceAll(
+					"(?m)^([\\t ]*import[\\t ]+static[\\t ]+)" + java.util.regex.Pattern.quote(oldFqcn)
+							+ "(\\.[^\\r\\n;]+[\\t ]*;?[\\t ]*)$",
+					"$1" + java.util.regex.Matcher.quoteReplacement(newFqcn) + "$2");
+		}
+		updated = addImportsForSamePackageJavaMoves(updated, movedImports);
+		return updated;
+	}
+
+	private String addImportsForSamePackageJavaMoves(String source, Map<String, String> movedImports) {
+		String updated = source;
+		String filePackage = extractGroovyPackage(updated);
+		if (filePackage == null || filePackage.isEmpty()) {
+			return updated;
+		}
+
+		for (Map.Entry<String, String> move : movedImports.entrySet()) {
+			String oldFqcn = move.getKey();
+			String newFqcn = move.getValue();
+			String oldPackage = packageNameOf(oldFqcn);
+			String newPackage = packageNameOf(newFqcn);
+			String simpleName = simpleNameOf(newFqcn);
+
+			// Only add import when file was previously in the same package as
+			// the class and the new package is different.
+			if (!filePackage.equals(oldPackage) || filePackage.equals(newPackage)) {
+				continue;
+			}
+
+			if (hasImport(updated, oldFqcn) || hasImport(updated, newFqcn)) {
+				continue;
+			}
+
+			if (!containsUnqualifiedTypeReference(updated, simpleName)) {
+				continue;
+			}
+
+			updated = insertImport(updated, newFqcn);
+		}
+
+		return updated;
+	}
+
+	private String extractGroovyPackage(String source) {
+		for (String line : source.split("\\R", -1)) {
+			String trimmed = line.trim();
+			if (trimmed.isEmpty() || trimmed.startsWith("//") || trimmed.startsWith("/*") || trimmed.startsWith("*")) {
+				continue;
+			}
+			if (trimmed.startsWith("package ")) {
+				String pkg = trimmed.substring("package ".length()).trim();
+				if (pkg.endsWith(";")) {
+					pkg = pkg.substring(0, pkg.length() - 1).trim();
+				}
+				return pkg;
+			}
+			break;
+		}
+		return null;
+	}
+
+	private String packageNameOf(String fqcn) {
+		if (fqcn == null) {
+			return "";
+		}
+		int dot = fqcn.lastIndexOf('.');
+		return dot >= 0 ? fqcn.substring(0, dot) : "";
+	}
+
+	private String simpleNameOf(String fqcn) {
+		if (fqcn == null) {
+			return "";
+		}
+		int dot = fqcn.lastIndexOf('.');
+		return dot >= 0 ? fqcn.substring(dot + 1) : fqcn;
+	}
+
+	private boolean hasImport(String source, String fqcn) {
+		if (fqcn == null || fqcn.isEmpty()) {
+			return false;
+		}
+		return source.matches("(?s).*(?m)^[\\t ]*import[\\t ]+" + java.util.regex.Pattern.quote(fqcn)
+				+ "(?:[\\t ]+as[\\t ]+[A-Za-z_$][\\w$]*)?[\\t ]*;?[\\t ]*$.*");
+	}
+
+	private boolean containsUnqualifiedTypeReference(String source, String simpleName) {
+		if (simpleName == null || simpleName.isEmpty()) {
+			return false;
+		}
+		return source.matches("(?s).*\\b" + java.util.regex.Pattern.quote(simpleName) + "\\b.*");
+	}
+
+	private String insertImport(String source, String fqcn) {
+		String newline = source.contains("\r\n") ? "\r\n" : "\n";
+		String importLine = "import " + fqcn + newline;
+
+		String[] lines = source.split("\\R", -1);
+		int insertAt = 0;
+		for (int i = 0; i < lines.length; i++) {
+			String trimmed = lines[i].trim();
+			if (trimmed.startsWith("package ") || trimmed.startsWith("import ")) {
+				insertAt = i + 1;
+				continue;
+			}
+			if (trimmed.isEmpty()) {
+				if (insertAt == i) {
+					insertAt = i + 1;
+				}
+				continue;
+			}
+			break;
+		}
+
+		StringBuilder sb = new StringBuilder();
+		for (int i = 0; i < lines.length; i++) {
+			if (i == insertAt) {
+				sb.append(importLine);
+			}
+			sb.append(lines[i]);
+			if (i < lines.length - 1) {
+				sb.append(newline);
+			}
+		}
+		if (insertAt >= lines.length) {
+			if (!source.endsWith(newline) && !source.isEmpty()) {
+				sb.append(newline);
+			}
+			sb.append(importLine);
+		}
+		return sb.toString();
+	}
+
 	@Override
 	public void didChangeConfiguration(DidChangeConfigurationParams params) {
 		if (!(params.getSettings() instanceof JsonObject)) {
@@ -622,35 +970,19 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 
 	// --- TextDocumentService requests ---
 
-	/**
-	 * Collect JavaSourceLocators from all project scopes except the given one.
-	 * Used to enable cross-project "Go to Definition" in multi-module workspaces.
-	 */
-	private List<JavaSourceLocator> collectSiblingLocators(ProjectScope currentScope) {
-		List<ProjectScope> allScopes = scopeManager.getAllScopes();
-		if (allScopes.size() <= 1) {
-			return Collections.emptyList();
-		}
-		List<JavaSourceLocator> siblings = new ArrayList<>();
-		for (ProjectScope other : allScopes) {
-			if (other != currentScope && other.getJavaSourceLocator() != null) {
-				siblings.add(other.getJavaSourceLocator());
-			}
-		}
-		return siblings;
-	}
-
 	@Override
 	public CompletableFuture<Hover> hover(HoverParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
-		ProjectScope scope = compilationService.ensureCompiledForContext(uri, scopeManager, backgroundCompiler);
-		ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
-		if (visitor == null) {
-			return CompletableFuture.completedFuture(null);
-		}
+		return failSoftRequest("hover", uri, () -> {
+			ProjectScope scope = ensureCompiledForContext(uri);
+			ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
+			if (visitor == null) {
+				return CompletableFuture.completedFuture(null);
+			}
 
-		HoverProvider provider = new HoverProvider(visitor);
-		return provider.provideHover(params.getTextDocument(), params.getPosition());
+			HoverProvider provider = new HoverProvider(visitor);
+			return provider.provideHover(params.getTextDocument(), params.getPosition());
+		}, null);
 	}
 
 	@Override
@@ -659,90 +991,93 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		Position position = params.getPosition();
 		URI uri = URI.create(textDocument.getUri());
 
-		ProjectScope scope = scopeManager.findProjectScope(uri);
-		if (scope == null) {
-			return CompletableFuture.completedFuture(Either.forRight(new CompletionList()));
-		}
-
-		// Capture AST snapshot under write-lock, then run providers lock-free.
-		ASTNodeVisitor visitor;
-		ClasspathSymbolIndex classpathSymbolIndex;
-		java.util.Set<String> classpathSymbolClasspathElements;
-		scope.getLock().writeLock().lock();
-		try {
-			compilationService.ensureScopeCompiled(scope);
-			if (scope.getAstVisitor() == null) {
+		return failSoftRequest("completion", uri, () -> {
+			ProjectScope scope = scopeManager.findProjectScope(uri);
+			if (scope == null) {
 				return CompletableFuture.completedFuture(Either.forRight(new CompletionList()));
 			}
-			if (!fileContentsTracker.hasChangedURIsUnder(scope.getProjectRoot())) {
-				compilationService.recompileIfContextChanged(scope, uri);
-			} else {
-				compilationService.compileAndVisitAST(scope, uri);
+
+			// Capture AST snapshot under write-lock, then run providers lock-free.
+			ASTNodeVisitor visitor;
+			ClasspathSymbolIndex classpathSymbolIndex;
+			java.util.Set<String> classpathSymbolClasspathElements;
+			scope.getLock().writeLock().lock();
+			try {
+				compilationService.ensureScopeCompiled(scope);
+				if (scope.getAstVisitor() == null) {
+					return CompletableFuture.completedFuture(Either.forRight(new CompletionList()));
+				}
+				if (!fileContentsTracker.hasChangedURIsUnder(scope.getProjectRoot())) {
+					compilationService.recompileIfContextChanged(scope, uri);
+				} else {
+					compilationService.compileAndVisitAST(scope, uri);
+				}
+
+				String originalSource = null;
+				ASTNode offsetNode = scope.getAstVisitor().getNodeAtLineAndColumn(uri, position.getLine(),
+						position.getCharacter());
+				if (offsetNode == null) {
+					originalSource = compilationService.injectCompletionPlaceholder(scope, uri, position);
+				}
+
+				// Capture snapshot references before releasing the lock
+				visitor = scope.getAstVisitor();
+				classpathSymbolIndex = scope.ensureClasspathSymbolIndexUnsafe();
+				classpathSymbolClasspathElements = scope.getClasspathSymbolClasspathElements();
+
+				if (originalSource != null) {
+					compilationService.restoreDocumentSource(scope, uri, originalSource);
+				}
+			} finally {
+				scope.getLock().writeLock().unlock();
 			}
 
-			String originalSource = null;
-			ASTNode offsetNode = scope.getAstVisitor().getNodeAtLineAndColumn(uri, position.getLine(),
+			// Provider logic runs lock-free on the captured AST snapshot
+			CompletionProvider provider = new CompletionProvider(visitor, classpathSymbolIndex,
+					classpathSymbolClasspathElements);
+			CompletableFuture<Either<List<CompletionItem>, CompletionList>> result =
+					provider.provideCompletion(params.getTextDocument(), params.getPosition(),
+							params.getContext());
+
+			SpockCompletionProvider spockProvider = new SpockCompletionProvider(visitor);
+			ASTNode currentNode = visitor.getNodeAtLineAndColumn(uri, position.getLine(),
 					position.getCharacter());
-			if (offsetNode == null) {
-				originalSource = compilationService.injectCompletionPlaceholder(scope, uri, position);
+			if (currentNode != null) {
+				List<CompletionItem> spockItems = spockProvider.provideSpockCompletions(uri, position,
+						currentNode);
+				if (!spockItems.isEmpty()) {
+					result = result.thenApply(either -> {
+						if (either.isLeft()) {
+							List<CompletionItem> combined = new ArrayList<>(either.getLeft());
+							combined.addAll(spockItems);
+							return Either.forLeft(combined);
+						} else {
+							CompletionList list = either.getRight();
+							list.getItems().addAll(spockItems);
+							return Either.forRight(list);
+						}
+					});
+				}
 			}
 
-			// Capture snapshot references before releasing the lock
-			visitor = scope.getAstVisitor();
-			classpathSymbolIndex = scope.ensureClasspathSymbolIndexUnsafe();
-			classpathSymbolClasspathElements = scope.getClasspathSymbolClasspathElements();
-
-			if (originalSource != null) {
-				compilationService.restoreDocumentSource(scope, uri, originalSource);
-			}
-		} finally {
-			scope.getLock().writeLock().unlock();
-		}
-
-		// Provider logic runs lock-free on the captured AST snapshot
-		CompletionProvider provider = new CompletionProvider(visitor, classpathSymbolIndex,
-				classpathSymbolClasspathElements);
-		CompletableFuture<Either<List<CompletionItem>, CompletionList>> result =
-				provider.provideCompletion(params.getTextDocument(), params.getPosition(),
-						params.getContext());
-
-		SpockCompletionProvider spockProvider = new SpockCompletionProvider(visitor);
-		ASTNode currentNode = visitor.getNodeAtLineAndColumn(uri, position.getLine(),
-				position.getCharacter());
-		if (currentNode != null) {
-			List<CompletionItem> spockItems = spockProvider.provideSpockCompletions(uri, position,
-					currentNode);
-			if (!spockItems.isEmpty()) {
-				result = result.thenApply(either -> {
-					if (either.isLeft()) {
-						List<CompletionItem> combined = new ArrayList<>(either.getLeft());
-						combined.addAll(spockItems);
-						return Either.forLeft(combined);
-					} else {
-						CompletionList list = either.getRight();
-						list.getItems().addAll(spockItems);
-						return Either.forRight(list);
-					}
-				});
-			}
-		}
-
-		return result;
+			return result;
+		}, Either.forRight(new CompletionList()));
 	}
 
 	@Override
 	public CompletableFuture<Either<List<? extends Location>, List<? extends LocationLink>>> definition(
 			DefinitionParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
-		ProjectScope scope = compilationService.ensureCompiledForContext(uri, scopeManager, backgroundCompiler);
-		ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
-		if (visitor == null) {
-			return CompletableFuture.completedFuture(Either.forLeft(Collections.emptyList()));
-		}
+		return failSoftRequest("definition", uri, () -> {
+			ProjectScope scope = ensureCompiledForContext(uri);
+			ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
+			if (visitor == null) {
+				return CompletableFuture.completedFuture(Either.forLeft(Collections.emptyList()));
+			}
 
-		DefinitionProvider provider = new DefinitionProvider(visitor, scope.getJavaSourceLocator(),
-				collectSiblingLocators(scope));
-		return provider.provideDefinition(params.getTextDocument(), params.getPosition());
+			DefinitionProvider provider = new DefinitionProvider(visitor, scope.getJavaSourceLocator());
+			return provider.provideDefinition(params.getTextDocument(), params.getPosition());
+		}, Either.forLeft(Collections.emptyList()));
 	}
 
 	@Override
@@ -751,74 +1086,79 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		Position position = params.getPosition();
 		URI uri = URI.create(textDocument.getUri());
 
-		ProjectScope scope = scopeManager.findProjectScope(uri);
-		if (scope == null) {
-			return CompletableFuture.completedFuture(new SignatureHelp());
-		}
-
-		// Capture AST snapshot under write-lock, then run provider lock-free.
-		ASTNodeVisitor visitor;
-		scope.getLock().writeLock().lock();
-		try {
-			compilationService.ensureScopeCompiled(scope);
-			if (scope.getAstVisitor() == null) {
+		return failSoftRequest("signatureHelp", uri, () -> {
+			ProjectScope scope = scopeManager.findProjectScope(uri);
+			if (scope == null) {
 				return CompletableFuture.completedFuture(new SignatureHelp());
 			}
-			if (!fileContentsTracker.hasChangedURIsUnder(scope.getProjectRoot())) {
-				compilationService.recompileIfContextChanged(scope, uri);
-			} else {
-				compilationService.compileAndVisitAST(scope, uri);
+
+			// Capture AST snapshot under write-lock, then run provider lock-free.
+			ASTNodeVisitor visitor;
+			scope.getLock().writeLock().lock();
+			try {
+				compilationService.ensureScopeCompiled(scope);
+				if (scope.getAstVisitor() == null) {
+					return CompletableFuture.completedFuture(new SignatureHelp());
+				}
+				if (!fileContentsTracker.hasChangedURIsUnder(scope.getProjectRoot())) {
+					compilationService.recompileIfContextChanged(scope, uri);
+				} else {
+					compilationService.compileAndVisitAST(scope, uri);
+				}
+
+				String originalSource = null;
+				ASTNode offsetNode = scope.getAstVisitor().getNodeAtLineAndColumn(uri, position.getLine(),
+						position.getCharacter());
+				if (offsetNode == null) {
+					originalSource = compilationService.injectSignatureHelpPlaceholder(scope, uri, position);
+				}
+
+				// Capture snapshot reference before releasing the lock
+				visitor = scope.getAstVisitor();
+
+				if (originalSource != null) {
+					compilationService.restoreDocumentSource(scope, uri, originalSource);
+				}
+			} finally {
+				scope.getLock().writeLock().unlock();
 			}
 
-			String originalSource = null;
-			ASTNode offsetNode = scope.getAstVisitor().getNodeAtLineAndColumn(uri, position.getLine(),
-					position.getCharacter());
-			if (offsetNode == null) {
-				originalSource = compilationService.injectSignatureHelpPlaceholder(scope, uri, position);
-			}
-
-			// Capture snapshot reference before releasing the lock
-			visitor = scope.getAstVisitor();
-
-			if (originalSource != null) {
-				compilationService.restoreDocumentSource(scope, uri, originalSource);
-			}
-		} finally {
-			scope.getLock().writeLock().unlock();
-		}
-
-		// Provider logic runs lock-free on the captured AST snapshot
-		SignatureHelpProvider provider = new SignatureHelpProvider(visitor);
-		return provider.provideSignatureHelp(params.getTextDocument(), params.getPosition());
+			// Provider logic runs lock-free on the captured AST snapshot
+			SignatureHelpProvider provider = new SignatureHelpProvider(visitor);
+			return provider.provideSignatureHelp(params.getTextDocument(), params.getPosition());
+		}, new SignatureHelp());
 	}
 
 	@Override
 	public CompletableFuture<Either<List<? extends Location>, List<? extends LocationLink>>> typeDefinition(
 			TypeDefinitionParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
-		ProjectScope scope = compilationService.ensureCompiledForContext(uri, scopeManager, backgroundCompiler);
-		ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
-		if (visitor == null) {
-			return CompletableFuture.completedFuture(Either.forLeft(Collections.emptyList()));
-		}
+		return failSoftRequest("typeDefinition", uri, () -> {
+			ProjectScope scope = ensureCompiledForContext(uri);
+			ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
+			if (visitor == null) {
+				return CompletableFuture.completedFuture(Either.forLeft(Collections.emptyList()));
+			}
 
-		TypeDefinitionProvider provider = new TypeDefinitionProvider(visitor, scope.getJavaSourceLocator(),
-				collectSiblingLocators(scope));
-		return provider.provideTypeDefinition(params.getTextDocument(), params.getPosition());
+			TypeDefinitionProvider provider = new TypeDefinitionProvider(visitor, scope.getJavaSourceLocator());
+			return provider.provideTypeDefinition(params.getTextDocument(), params.getPosition());
+		}, Either.forLeft(Collections.emptyList()));
 	}
 
 	@Override
 	public CompletableFuture<Either<List<? extends Location>, List<? extends LocationLink>>> implementation(
 			ImplementationParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
-		ProjectScope scope = compilationService.ensureCompiledForContext(uri, scopeManager, backgroundCompiler);
-		ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
-		if (visitor == null) {
-			return CompletableFuture.completedFuture(Either.forLeft(Collections.emptyList()));
-		}
+		return failSoftRequest("implementation", uri, () -> {
+			ProjectScope scope = ensureCompiledForContext(uri);
+			ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
+			if (visitor == null) {
+				return CompletableFuture.completedFuture(Either.forLeft(Collections.emptyList()));
+			}
 
-		ImplementationProvider provider = new ImplementationProvider(visitor);
-		return provider.provideImplementation(params.getTextDocument(), params.getPosition());
+			ImplementationProvider provider = new ImplementationProvider(visitor);
+			return provider.provideImplementation(params.getTextDocument(), params.getPosition());
+		}, Either.forLeft(Collections.emptyList()));
 	}
 
 	@Override
@@ -837,36 +1177,56 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	@Override
 	public CompletableFuture<List<? extends Location>> references(ReferenceParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
-		ProjectScope scope = compilationService.ensureCompiledForContext(uri, scopeManager, backgroundCompiler);
-		ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
-		if (visitor == null) {
-			return CompletableFuture.completedFuture(Collections.emptyList());
-		}
+		return failSoftRequest("references", uri, () -> {
+			ProjectScope scope = ensureCompiledForContext(uri);
+			ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
+			if (visitor == null) {
+				return CompletableFuture.completedFuture(Collections.emptyList());
+			}
 
-		ReferenceProvider provider = new ReferenceProvider(visitor);
-		return provider.provideReferences(params.getTextDocument(), params.getPosition());
+			ReferenceProvider provider = new ReferenceProvider(visitor);
+			return provider.provideReferences(params.getTextDocument(), params.getPosition());
+		}, Collections.emptyList());
 	}
 
 	@Override
 	public CompletableFuture<List<Either<SymbolInformation, DocumentSymbol>>> documentSymbol(
 			DocumentSymbolParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
-		ProjectScope scope = compilationService.ensureCompiledForContext(uri, scopeManager, backgroundCompiler);
-		ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
-		if (visitor == null) {
-			return CompletableFuture.completedFuture(Collections.emptyList());
-		}
+		return failSoftRequest("documentSymbol", uri, () -> {
+			ProjectScope scope = ensureCompiledForContext(uri);
+			ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
+			if (visitor == null) {
+				return CompletableFuture.completedFuture(Collections.emptyList());
+			}
 
-		DocumentSymbolProvider provider = new DocumentSymbolProvider(visitor);
-		return provider.provideDocumentSymbols(params.getTextDocument());
+			DocumentSymbolProvider provider = new DocumentSymbolProvider(visitor);
+			return provider.provideDocumentSymbols(params.getTextDocument());
+		}, Collections.emptyList());
 	}
 
 	@Override
 	public CompletableFuture<Either<List<? extends SymbolInformation>, List<? extends WorkspaceSymbol>>> symbol(
 			WorkspaceSymbolParams params) {
-		// Ensure all scopes are compiled and up-to-date before querying —
-		// workspace symbol is a cross-scope request with no single context URI.
-		for (ProjectScope scope : scopeManager.getAllScopes()) {
+		List<ProjectScope> scopesToSearch;
+		List<ProjectScope> allScopes = scopeManager.getAllScopes();
+		if (allScopes.size() <= 1) {
+			scopesToSearch = allScopes;
+		} else {
+			Set<ProjectScope> openScopes = new LinkedHashSet<>();
+			for (URI openUri : fileContentsTracker.getOpenURIs()) {
+				ProjectScope openScope = scopeManager.findProjectScope(openUri);
+				if (openScope != null) {
+					openScopes.add(openScope);
+				}
+			}
+			if (openScopes.isEmpty()) {
+				return CompletableFuture.completedFuture(Either.forRight(Collections.emptyList()));
+			}
+			scopesToSearch = new ArrayList<>(openScopes);
+		}
+
+		for (ProjectScope scope : scopesToSearch) {
 			if (!scope.isCompiled() || fileContentsTracker.hasChangedURIsUnder(scope.getProjectRoot())) {
 				scope.getLock().writeLock().lock();
 				try {
@@ -885,7 +1245,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		}
 
 		List<CompletableFuture<List<? extends WorkspaceSymbol>>> futures = new ArrayList<>();
-		for (ProjectScope scope : scopeManager.getAllScopes()) {
+		for (ProjectScope scope : scopesToSearch) {
 			ASTNodeVisitor visitor = scope.getAstVisitor();
 			if (visitor != null) {
 				WorkspaceSymbolProvider provider = new WorkspaceSymbolProvider(visitor);
@@ -943,7 +1303,8 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		}
 
 		CodeActionProvider provider = new CodeActionProvider(visitor, classpathSymbolIndex,
-				classpathSymbolClasspathElements, fileContentsTracker);
+				classpathSymbolClasspathElements, fileContentsTracker,
+				scope != null ? scope.getJavaSourceLocator() : null);
 		CompletableFuture<List<Either<Command, CodeAction>>> result = provider.provideCodeActions(params);
 
 		SpockCodeActionProvider spockProvider = new SpockCodeActionProvider(visitor);
@@ -962,14 +1323,16 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	@Override
 	public CompletableFuture<List<InlayHint>> inlayHint(InlayHintParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
-		ProjectScope scope = compilationService.ensureCompiledForContext(uri, scopeManager, backgroundCompiler);
-		ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
-		if (visitor == null) {
-			return CompletableFuture.completedFuture(Collections.emptyList());
-		}
+		return failSoftRequest("inlayHint", uri, () -> {
+			ProjectScope scope = ensureCompiledForContext(uri);
+			ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
+			if (visitor == null) {
+				return CompletableFuture.completedFuture(Collections.emptyList());
+			}
 
-		InlayHintProvider provider = new InlayHintProvider(visitor);
-		return provider.provideInlayHints(params);
+			InlayHintProvider provider = new InlayHintProvider(visitor);
+			return provider.provideInlayHints(params);
+		}, Collections.emptyList());
 	}
 
 	@Override
@@ -1075,7 +1438,227 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		}
 		URI uri = URI.create(params.getTextDocument().getUri());
 		String sourceText = fileContentsTracker.getContents(uri);
+		if (sourceText == null || sourceText.isEmpty()) {
+			return CompletableFuture.completedFuture(Collections.emptyList());
+		}
+
+		String normalizedSource = normalizeLineEndings(sourceText);
+		String textToFormat = normalizedSource;
+
+		if (scopeManager.isFormattingOrganizeImportsEnabled()) {
+			try {
+				String organizedText = applyOrganizeImportsForFormatting(uri, textToFormat);
+				if (organizedText != null) {
+					textToFormat = organizedText;
+				}
+			} catch (Exception e) {
+				logger.debug("formatting organize imports skipped uri={} reason={}", uri, e.toString());
+			}
+		}
+
 		FormattingProvider provider = new FormattingProvider();
-		return provider.provideFormatting(params, sourceText);
+		final String textForFormatting = textToFormat;
+		return provider.provideFormatting(params, textForFormatting)
+				.thenApply(formattingEdits -> {
+					String formattedText = applyTextEdits(textForFormatting, formattingEdits);
+					formattedText = normalizeBlankLinesAfterLastImport(formattedText);
+					if (formattedText.equals(normalizedSource)) {
+						return Collections.<TextEdit>emptyList();
+					}
+					return Collections.singletonList(new TextEdit(
+							new Range(new Position(0, 0), documentEndPosition(normalizedSource)),
+							formattedText));
+				});
+	}
+
+	private static Position documentEndPosition(String text) {
+		String[] lines = text.split("\\n", -1);
+		return new Position(lines.length - 1, lines[lines.length - 1].length());
+	}
+
+	private static String normalizeBlankLinesAfterLastImport(String text) {
+		String[] lines = text.split("\\n", -1);
+		int lastImportLine = -1;
+		for (int i = 0; i < lines.length; i++) {
+			if (lines[i].trim().startsWith("import ")) {
+				lastImportLine = i;
+			}
+		}
+		if (lastImportLine < 0 || lastImportLine + 1 >= lines.length) {
+			return text;
+		}
+
+		int afterImportStart = lastImportLine + 1;
+		int firstNonBlank = afterImportStart;
+		while (firstNonBlank < lines.length && lines[firstNonBlank].trim().isEmpty()) {
+			firstNonBlank++;
+		}
+
+		int blankCount = firstNonBlank - afterImportStart;
+		if (blankCount <= 1) {
+			return text;
+		}
+
+		StringBuilder normalized = new StringBuilder();
+		for (int i = 0; i <= lastImportLine; i++) {
+			normalized.append(lines[i]).append("\n");
+		}
+		normalized.append("\n");
+		for (int i = firstNonBlank; i < lines.length; i++) {
+			normalized.append(lines[i]);
+			if (i < lines.length - 1) {
+				normalized.append("\n");
+			}
+		}
+		return normalized.toString();
+	}
+
+	private String applyOrganizeImportsForFormatting(URI uri, String sourceText) {
+		ProjectScope scope = ensureCompiledForContext(uri);
+		ASTNodeVisitor visitor = scope != null ? scope.getAstVisitor() : null;
+		if (visitor == null) {
+			return sourceText;
+		}
+
+		OrganizeImportsAction organizeImportsAction = new OrganizeImportsAction(visitor);
+		TextEdit importEdit = organizeImportsAction.createOrganizeImportsTextEdit(uri);
+		if (importEdit == null) {
+			return sourceText;
+		}
+		importEdit = normalizeImportEditForExistingBlankLine(sourceText, importEdit);
+
+		return applyTextEdits(sourceText, Collections.singletonList(importEdit));
+	}
+
+	private TextEdit normalizeImportEditForExistingBlankLine(String sourceText, TextEdit importEdit) {
+		String newText = importEdit.getNewText();
+		if (newText == null) {
+			return importEdit;
+		}
+
+		String normalizedNewText = newText;
+		if (!normalizedNewText.endsWith("\n\n")) {
+			normalizedNewText = normalizedNewText + "\n\n";
+		}
+
+		int startOffset = positionToOffset(sourceText, importEdit.getRange().getEnd());
+		int endOffset = startOffset;
+		while (endOffset < sourceText.length() && sourceText.charAt(endOffset) == '\n') {
+			endOffset++;
+		}
+
+		if (endOffset == startOffset && normalizedNewText.equals(importEdit.getNewText())) {
+			return importEdit;
+		}
+
+		Range normalizedRange = new Range(
+				importEdit.getRange().getStart(),
+				offsetToPosition(sourceText, endOffset));
+		return new TextEdit(normalizedRange, normalizedNewText);
+	}
+
+	private static Position offsetToPosition(String text, int offset) {
+		int clampedOffset = Math.max(0, Math.min(offset, text.length()));
+		int line = 0;
+		int lineStartOffset = 0;
+		for (int i = 0; i < clampedOffset; i++) {
+			if (text.charAt(i) == '\n') {
+				line++;
+				lineStartOffset = i + 1;
+			}
+		}
+		return new Position(line, clampedOffset - lineStartOffset);
+	}
+
+	private static String normalizeLineEndings(String text) {
+		return text.replace("\r\n", "\n").replace("\r", "\n");
+	}
+
+	private static String applyTextEdits(String original, List<? extends TextEdit> edits) {
+		if (edits == null || edits.isEmpty()) {
+			return original;
+		}
+
+		String text = original;
+		List<? extends TextEdit> sorted = new ArrayList<>(edits);
+		sorted.sort((a, b) -> {
+			int lineCmp = Integer.compare(b.getRange().getStart().getLine(), a.getRange().getStart().getLine());
+			if (lineCmp != 0) {
+				return lineCmp;
+			}
+			return Integer.compare(b.getRange().getStart().getCharacter(), a.getRange().getStart().getCharacter());
+		});
+
+		for (TextEdit edit : sorted) {
+			Range range = edit.getRange();
+			int startOffset = positionToOffset(text, range.getStart());
+			int endOffset = positionToOffset(text, range.getEnd());
+			text = text.substring(0, startOffset) + edit.getNewText() + text.substring(endOffset);
+		}
+
+		return text;
+	}
+
+	private static int positionToOffset(String text, Position pos) {
+		int line = 0;
+		int offset = 0;
+		while (line < pos.getLine() && offset < text.length()) {
+			if (text.charAt(offset) == '\n') {
+				line++;
+			}
+			offset++;
+		}
+		return offset + pos.getCharacter();
+	}
+
+	private static String preview(String text, int maxLen) {
+		if (text == null) {
+			return "<null>";
+		}
+		String normalized = text
+				.replace("\r", "\\r")
+				.replace("\n", "\\n")
+				.replace("\t", "\\t");
+		if (normalized.length() <= maxLen) {
+			return normalized;
+		}
+		return normalized.substring(0, maxLen) + "...";
+	}
+
+	private static String codepointPreview(String text, int maxCodepoints) {
+		if (text == null) {
+			return "<null>";
+		}
+		StringBuilder sb = new StringBuilder();
+		int idx = 0;
+		int count = 0;
+		while (idx < text.length() && count < maxCodepoints) {
+			int cp = text.codePointAt(idx);
+			if (count > 0) {
+				sb.append(' ');
+			}
+			sb.append(String.format("U+%04X", cp));
+			idx += Character.charCount(cp);
+			count++;
+		}
+		if (idx < text.length()) {
+			sb.append(" ...");
+		}
+		return sb.toString();
+	}
+
+	private static List<String> collectImportLines(String text, int maxLines) {
+		List<String> result = new ArrayList<>();
+		String[] lines = text.split("\\R", -1);
+		for (int i = 0; i < lines.length; i++) {
+			String line = lines[i];
+			if (line.contains("import ")) {
+				result.add((i + 1) + ":" + preview(line, 200));
+				if (result.size() >= maxLines) {
+					break;
+				}
+			}
+		}
+		return result;
 	}
 }

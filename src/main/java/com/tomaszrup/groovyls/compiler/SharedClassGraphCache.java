@@ -892,6 +892,104 @@ public class SharedClassGraphCache {
 		logger.info("SharedClassGraphCache cleared");
 	}
 
+	/**
+	 * Evict cached scan entries whose classpath contains files/directories under
+	 * the given project root. Used after Java source moves/renames so stale
+	 * classes from old package locations are not reused.
+	 *
+	 * @param projectRoot project root path
+	 * @return number of removed entries
+	 */
+	public synchronized int invalidateEntriesUnderProject(Path projectRoot) {
+		if (projectRoot == null || cache.isEmpty()) {
+			return 0;
+		}
+		Path normalizedRoot = normalizePath(projectRoot);
+		int removed = 0;
+		var iterator = cache.entrySet().iterator();
+		while (iterator.hasNext()) {
+			Map.Entry<String, CacheEntry> cacheEntry = iterator.next();
+			String cacheKey = cacheEntry.getKey();
+			CacheEntry entry = cacheEntry.getValue();
+			if (!containsPathUnderRoot(entry.classpathUrls, normalizedRoot)) {
+				continue;
+			}
+			ScanResult sr = entry.get();
+			if (sr != null) {
+				reverseIndex.remove(sr);
+				entry.scanResultRef.clear();
+				try {
+					sr.close();
+				} catch (Exception e) {
+					logger.debug("Error closing ScanResult during targeted invalidation", e);
+				}
+			}
+			iterator.remove();
+			deleteDiskCacheEntry(cacheKey);
+			removed++;
+		}
+		if (removed > 0) {
+			logger.info("SharedClassGraphCache invalidated {} entries for project {}", removed, normalizedRoot);
+		}
+		return removed;
+	}
+
+	private void deleteDiskCacheEntry(String classpathKey) {
+		if (classpathKey == null || classpathKey.isEmpty()) {
+			return;
+		}
+		Path cacheFile = getDiskCacheDir().resolve(classpathKey + ".json");
+		try {
+			Files.deleteIfExists(cacheFile);
+		} catch (IOException e) {
+			logger.debug("Failed to delete ClassGraph disk cache for key {}…: {}",
+					classpathKey.substring(0, Math.min(12, classpathKey.length())),
+					e.getMessage());
+		}
+	}
+
+	private static boolean containsPathUnderRoot(Set<String> urlStrings, Path projectRoot) {
+		if (urlStrings == null || urlStrings.isEmpty()) {
+			return false;
+		}
+		for (String url : urlStrings) {
+			Path candidate = toPath(url);
+			if (candidate != null && candidate.startsWith(projectRoot)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private static Path toPath(String url) {
+		if (url == null || url.isEmpty()) {
+			return null;
+		}
+		try {
+			java.net.URI uri = new java.net.URI(url);
+			if ("file".equalsIgnoreCase(uri.getScheme())) {
+				return normalizePath(Paths.get(uri));
+			}
+		} catch (Exception ignored) {
+		}
+		try {
+			return normalizePath(Paths.get(url));
+		} catch (Exception ignored) {
+			return null;
+		}
+	}
+
+	private static Path normalizePath(Path path) {
+		if (path == null) {
+			return null;
+		}
+		try {
+			return path.toRealPath();
+		} catch (IOException e) {
+			return path.toAbsolutePath().normalize();
+		}
+	}
+
 	// --- On-disk persistence ---
 
 	/**

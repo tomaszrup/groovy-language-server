@@ -3,11 +3,14 @@ package com.tomaszrup.groovyls;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.net.URI;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import javax.tools.JavaCompiler;
 import javax.tools.ToolProvider;
@@ -241,6 +244,13 @@ class GroovyServicesCodeActionTests {
 			public java.util.concurrent.CompletableFuture<Void> refreshSemanticTokens() {
 				return java.util.concurrent.CompletableFuture.completedFuture(null);
 			}
+
+			@Override
+			public java.util.concurrent.CompletableFuture<org.eclipse.lsp4j.ApplyWorkspaceEditResponse> applyEdit(
+					org.eclipse.lsp4j.ApplyWorkspaceEditParams params) {
+				return java.util.concurrent.CompletableFuture.completedFuture(
+						new org.eclipse.lsp4j.ApplyWorkspaceEditResponse(true));
+			}
 		});
 
 		Path classesDir = workspaceRoot.resolve("build/test-java-classes");
@@ -252,8 +262,9 @@ class GroovyServicesCodeActionTests {
 				"package com.example;\n\npublic class SomeClass {\n}\n");
 		compileJavaSource(oldJavaPath, classesDir);
 
-		services.addProjects(Collections.singletonMap(workspaceRoot,
-				Collections.singletonList(classesDir.toString())));
+		Map<Path, List<String>> projectClasspaths = new java.util.LinkedHashMap<>();
+		projectClasspaths.put(workspaceRoot, new ArrayList<>(Collections.singletonList(classesDir.toString())));
+		services.addProjects(projectClasspaths);
 
 		Path testFilePath = srcRoot.resolve("com/test/TestJavaImportMove.groovy");
 		Files.createDirectories(testFilePath.getParent());
@@ -288,7 +299,7 @@ class GroovyServicesCodeActionTests {
 		diagnostic.setSeverity(DiagnosticSeverity.Error);
 		diagnostic.setMessage("unable to resolve class SomeClass");
 
-		CodeActionContext context = new CodeActionContext(Collections.singletonList(diagnostic));
+		CodeActionContext context = new CodeActionContext(new ArrayList<>(Collections.singletonList(diagnostic)));
 		CodeActionParams params = new CodeActionParams(
 				new TextDocumentIdentifier(testUri),
 				new Range(new Position(3, 2), new Position(3, 11)),
@@ -310,6 +321,228 @@ class GroovyServicesCodeActionTests {
 				"Should suggest import from moved Java class package");
 		Assertions.assertFalse(hasOldPackageImport,
 				"Should not suggest stale import for old Java package after class move");
+	}
+
+	@Test
+	void testCodeActionAfterJavaClassMoveFromSamePackageSuggestsOnlyNewImport() throws Exception {
+		Path classesDir = workspaceRoot.resolve("build/test-java-classes");
+		Files.createDirectories(classesDir);
+
+		Path oldJavaPath = workspaceRoot.resolve("src/main/java/com/example/Frame.java");
+		Files.createDirectories(oldJavaPath.getParent());
+		Files.writeString(oldJavaPath,
+				"package com.example;\n\npublic class Frame {\n}\n");
+		compileJavaSource(oldJavaPath, classesDir);
+
+		Map<Path, List<String>> projectClasspaths = new java.util.LinkedHashMap<>();
+		projectClasspaths.put(workspaceRoot, new ArrayList<>(Collections.singletonList(classesDir.toString())));
+		services.addProjects(projectClasspaths);
+
+		// Same package as old Java class -> no import needed before move.
+		Path testFilePath = srcRoot.resolve("com/example/FrameSpec2.groovy");
+		Files.createDirectories(testFilePath.getParent());
+		String testContents = "package com.example\n\nclass FrameSpec2 {\n  Frame value\n}\n";
+		Files.writeString(testFilePath, testContents);
+		String testUri = testFilePath.toUri().toString();
+		services.didOpen(new DidOpenTextDocumentParams(
+				new TextDocumentItem(testUri, LANGUAGE_GROOVY, 1, testContents)));
+
+		// Move Java class to a different package.
+		Path newJavaPath = workspaceRoot.resolve("src/main/java/com/xddd/Frame.java");
+		Files.createDirectories(newJavaPath.getParent());
+		Files.writeString(newJavaPath,
+				"package com.xddd;\n\npublic class Frame {\n}\n");
+		compileJavaSource(newJavaPath, classesDir);
+		Files.deleteIfExists(oldJavaPath);
+		Files.deleteIfExists(classesDir.resolve("com/example/Frame.class"));
+
+		List<FileEvent> events = new ArrayList<>();
+		events.add(new FileEvent(oldJavaPath.toUri().toString(), FileChangeType.Deleted));
+		events.add(new FileEvent(newJavaPath.toUri().toString(), FileChangeType.Created));
+		services.didChangeWatchedFiles(new DidChangeWatchedFilesParams(events));
+
+		Thread.sleep(300);
+
+		Diagnostic diagnostic = new Diagnostic();
+		diagnostic.setRange(new Range(new Position(3, 2), new Position(3, 7)));
+		diagnostic.setSeverity(DiagnosticSeverity.Error);
+		diagnostic.setMessage("unable to resolve class Frame");
+
+		CodeActionContext context = new CodeActionContext(new ArrayList<>(Collections.singletonList(diagnostic)));
+		CodeActionParams params = new CodeActionParams(
+				new TextDocumentIdentifier(testUri),
+				new Range(new Position(3, 2), new Position(3, 7)),
+				context);
+
+		List<Either<Command, CodeAction>> result = services.codeAction(params).get();
+
+		boolean hasNewPackageImport = result.stream()
+				.filter(Either::isRight)
+				.map(Either::getRight)
+				.anyMatch(action -> "Add import: com.xddd.Frame".equals(action.getTitle()));
+
+		boolean hasOldSamePackageImport = result.stream()
+				.filter(Either::isRight)
+				.map(Either::getRight)
+				.anyMatch(action -> "Add import: com.example.Frame".equals(action.getTitle()));
+
+		Assertions.assertTrue(hasNewPackageImport,
+				"Should suggest import from moved Java class package when it changed");
+		Assertions.assertFalse(hasOldSamePackageImport,
+				"Should not suggest same-package stale import after move");
+
+		List<CodeAction> importActions = result.stream()
+				.filter(Either::isRight)
+				.map(Either::getRight)
+				.filter(a -> a.getTitle() != null && a.getTitle().startsWith("Add import:"))
+				.toList();
+		Assertions.assertFalse(importActions.isEmpty(), "Expected at least one add-import action");
+		Assertions.assertEquals("Add import: com.xddd.Frame", importActions.get(0).getTitle(),
+				"Live source move target should be ranked first in add-import actions");
+	}
+
+	@Test
+	void testJavaMoveFromSamePackageAutoAddsImportInGroovyFile() throws Exception {
+		AtomicReference<org.eclipse.lsp4j.ApplyWorkspaceEditParams> appliedEditRef = new AtomicReference<>();
+		CountDownLatch applyEditLatch = new CountDownLatch(1);
+		services.connect(new org.eclipse.lsp4j.services.LanguageClient() {
+			@Override
+			public void telemetryEvent(Object object) {
+			}
+
+			@Override
+			public java.util.concurrent.CompletableFuture<org.eclipse.lsp4j.MessageActionItem> showMessageRequest(
+					org.eclipse.lsp4j.ShowMessageRequestParams requestParams) {
+				return java.util.concurrent.CompletableFuture.completedFuture(null);
+			}
+
+			@Override
+			public void showMessage(org.eclipse.lsp4j.MessageParams messageParams) {
+			}
+
+			@Override
+			public void publishDiagnostics(org.eclipse.lsp4j.PublishDiagnosticsParams diagnostics) {
+			}
+
+			@Override
+			public void logMessage(org.eclipse.lsp4j.MessageParams message) {
+			}
+
+			@Override
+			public java.util.concurrent.CompletableFuture<Void> refreshSemanticTokens() {
+				return java.util.concurrent.CompletableFuture.completedFuture(null);
+			}
+
+			@Override
+			public java.util.concurrent.CompletableFuture<org.eclipse.lsp4j.ApplyWorkspaceEditResponse> applyEdit(
+					org.eclipse.lsp4j.ApplyWorkspaceEditParams params) {
+				appliedEditRef.set(params);
+				applyEditLatch.countDown();
+				return java.util.concurrent.CompletableFuture.completedFuture(
+						new org.eclipse.lsp4j.ApplyWorkspaceEditResponse(true));
+			}
+		});
+
+		Path oldJavaPath = workspaceRoot.resolve("src/main/java/com/example/Frame.java");
+		Files.createDirectories(oldJavaPath.getParent());
+		Files.writeString(oldJavaPath,
+				"package com.example;\n\npublic class Frame {\n}\n");
+
+		Map<Path, List<String>> projectClasspaths = new java.util.LinkedHashMap<>();
+		projectClasspaths.put(workspaceRoot, new ArrayList<>());
+		services.addProjects(projectClasspaths);
+
+		Path testFilePath = srcRoot.resolve("com/example/FrameSpec2.groovy");
+		Files.createDirectories(testFilePath.getParent());
+		String testContents = "package com.example\n\nclass FrameSpec2 {\n  Frame value\n}\n";
+		Files.writeString(testFilePath, testContents);
+		String testUri = testFilePath.toUri().toString();
+		services.didOpen(new DidOpenTextDocumentParams(
+				new TextDocumentItem(testUri, LANGUAGE_GROOVY, 1, testContents)));
+
+		Path newJavaPath = workspaceRoot.resolve("src/main/java/com/xddd/Frame.java");
+		Files.createDirectories(newJavaPath.getParent());
+		Files.writeString(newJavaPath,
+				"package com.xddd;\n\npublic class Frame {\n}\n");
+		Files.deleteIfExists(oldJavaPath);
+
+		List<FileEvent> events = new ArrayList<>();
+		events.add(new FileEvent(oldJavaPath.toUri().toString(), FileChangeType.Deleted));
+		events.add(new FileEvent(newJavaPath.toUri().toString(), FileChangeType.Created));
+		services.didChangeWatchedFiles(new DidChangeWatchedFilesParams(events));
+
+		Assertions.assertTrue(applyEditLatch.await(5, TimeUnit.SECONDS),
+				"Expected Java move to trigger applyEdit with import update");
+
+		org.eclipse.lsp4j.ApplyWorkspaceEditParams applied = appliedEditRef.get();
+		Assertions.assertNotNull(applied, "Expected workspace edit to be applied");
+		Assertions.assertNotNull(applied.getEdit());
+		Assertions.assertNotNull(applied.getEdit().getChanges());
+
+		List<TextEdit> edits = applied.getEdit().getChanges().get(testUri);
+		Assertions.assertNotNull(edits, "Expected edit for moved-class Groovy file");
+		Assertions.assertFalse(edits.isEmpty(), "Expected at least one text edit");
+		String updated = edits.get(0).getNewText();
+		Assertions.assertTrue(updated.contains("import com.xddd.Frame"),
+				"Expected automatic import insertion for moved class");
+	}
+
+	@Test
+	void testJavaMoveInvalidatesClasspathCachesBeforeDebounce() throws Exception {
+		Path classesDir = workspaceRoot.resolve("build/test-java-classes");
+		Files.createDirectories(classesDir);
+
+		Path oldJavaPath = workspaceRoot.resolve("src/main/java/com/example/SomeClass.java");
+		Files.createDirectories(oldJavaPath.getParent());
+		Files.writeString(oldJavaPath,
+				"package com.example;\n\npublic class SomeClass {\n}\n");
+		compileJavaSource(oldJavaPath, classesDir);
+
+		Map<Path, List<String>> projectClasspaths = new java.util.LinkedHashMap<>();
+		projectClasspaths.put(workspaceRoot, new ArrayList<>(Collections.singletonList(classesDir.toString())));
+		services.addProjects(projectClasspaths);
+
+		Path testFilePath = srcRoot.resolve("com/test/TestJavaImportMoveImmediate.groovy");
+		Files.createDirectories(testFilePath.getParent());
+		String testContents = "package com.test\n\nclass TestJavaImportMoveImmediate {\n  SomeClass value\n}\n";
+		Files.writeString(testFilePath, testContents);
+		String testUri = testFilePath.toUri().toString();
+		services.didOpen(new DidOpenTextDocumentParams(
+				new TextDocumentItem(testUri, LANGUAGE_GROOVY, 1, testContents)));
+
+		Diagnostic diagnostic = new Diagnostic();
+		diagnostic.setRange(new Range(new Position(3, 2), new Position(3, 11)));
+		diagnostic.setSeverity(DiagnosticSeverity.Error);
+		diagnostic.setMessage("unable to resolve class SomeClass");
+		CodeActionContext context = new CodeActionContext(new ArrayList<>(Collections.singletonList(diagnostic)));
+		CodeActionParams params = new CodeActionParams(
+				new TextDocumentIdentifier(testUri),
+				new Range(new Position(3, 2), new Position(3, 11)),
+				context);
+
+		services.codeAction(params).get();
+		ProjectScope scope = services.getScopeManager().findProjectScope(URI.create(testUri));
+		Assertions.assertNotNull(scope);
+		Assertions.assertNotNull(scope.getClasspathSymbolIndex(),
+				"Expected classpath symbol index to be initialized before Java move");
+
+		Path newJavaPath = workspaceRoot.resolve("src/main/java/com/other/SomeClass.java");
+		Files.createDirectories(newJavaPath.getParent());
+		Files.writeString(newJavaPath,
+				"package com.other;\n\npublic class SomeClass {\n}\n");
+		compileJavaSource(newJavaPath, classesDir);
+		Files.deleteIfExists(oldJavaPath);
+		Files.deleteIfExists(classesDir.resolve("com/example/SomeClass.class"));
+
+		List<FileEvent> events = new ArrayList<>();
+		events.add(new FileEvent(oldJavaPath.toUri().toString(), FileChangeType.Deleted));
+		events.add(new FileEvent(newJavaPath.toUri().toString(), FileChangeType.Created));
+		services.didChangeWatchedFiles(new DidChangeWatchedFilesParams(events));
+
+		Assertions.assertNull(scope.getClasspathSymbolIndex(),
+				"Java move should evict stale classpath symbol index before debounced recompile");
+		Assertions.assertNull(scope.getClassGraphScanResult(),
+				"Java move should evict stale ClassGraph scan before debounced recompile");
 	}
 
 	private static void compileJavaSource(Path sourceFile, Path outputDir) {

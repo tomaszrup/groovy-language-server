@@ -22,7 +22,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 import org.codehaus.groovy.control.Phases;
 import org.codehaus.groovy.control.SourceUnit;
@@ -351,5 +353,195 @@ class CompilationUnitFactoryTests {
 			}
 		}
 		Assertions.assertTrue(found, "Open file should be in the compilation unit");
+	}
+
+	// --- Java source stubs ---
+
+	@Test
+	void testJavaSourceStubsAddedWhenClassNotOnClasspath() throws Exception {
+		// Create a Java source file under src/main/java
+		Path javaSrcDir = tempDir.resolve("src/main/java/com/example");
+		Files.createDirectories(javaSrcDir);
+		Files.writeString(javaSrcDir.resolve("Frame.java"),
+				"package com.example;\npublic class Frame {}");
+
+		factory.setProjectRoot(tempDir);
+		FileContentsTracker tracker = new FileContentsTracker();
+		GroovyLSCompilationUnit cu = factory.create(tempDir, tracker);
+		Assertions.assertNotNull(cu);
+
+		// Compile to CONVERSION so source units are processed
+		try { cu.compile(Phases.CONVERSION); } catch (Exception e) { /* ignore */ }
+
+		// Look for a stub source unit
+		boolean foundStub = false;
+		var iter = cu.iterator();
+		while (iter.hasNext()) {
+			SourceUnit su = iter.next();
+			if (su.getName() != null && su.getName().startsWith("[java-stub] ")
+					&& su.getName().contains("com.example.Frame")) {
+				foundStub = true;
+				break;
+			}
+		}
+		Assertions.assertTrue(foundStub,
+				"Java source stub for com.example.Frame should be added when .class not on classpath");
+	}
+
+	@Test
+	void testJavaSourceStubsRefreshedOnRecreate() throws Exception {
+		// Create a Java source file in the "old" package
+		Path oldPkgDir = tempDir.resolve("src/main/java/com/oldpkg");
+		Files.createDirectories(oldPkgDir);
+		Files.writeString(oldPkgDir.resolve("Widget.java"),
+				"package com.oldpkg;\npublic class Widget {}");
+
+		factory.setProjectRoot(tempDir);
+		FileContentsTracker tracker = new FileContentsTracker();
+
+		// First create() — stub for com.oldpkg.Widget
+		GroovyLSCompilationUnit cu1 = factory.create(tempDir, tracker);
+		try { cu1.compile(Phases.CONVERSION); } catch (Exception e) { /* ignore */ }
+
+		Set<String> stubNames1 = collectStubNames(cu1);
+		Assertions.assertTrue(stubNames1.contains("[java-stub] com.oldpkg.Widget"),
+				"First create should have stub for old package");
+
+		// Simulate move: delete old file, create in new package
+		Files.delete(oldPkgDir.resolve("Widget.java"));
+		Path newPkgDir = tempDir.resolve("src/main/java/com/newpkg");
+		Files.createDirectories(newPkgDir);
+		Files.writeString(newPkgDir.resolve("Widget.java"),
+				"package com.newpkg;\npublic class Widget {}");
+
+		// Invalidate compilation unit to force fresh build
+		factory.invalidateCompilationUnit();
+
+		// Second create() — should have new stub, not old
+		GroovyLSCompilationUnit cu2 = factory.create(tempDir, tracker);
+		try { cu2.compile(Phases.CONVERSION); } catch (Exception e) { /* ignore */ }
+
+		Set<String> stubNames2 = collectStubNames(cu2);
+		Assertions.assertFalse(stubNames2.contains("[java-stub] com.oldpkg.Widget"),
+				"After move, old stub should be removed");
+		Assertions.assertTrue(stubNames2.contains("[java-stub] com.newpkg.Widget"),
+				"After move, new stub should be added");
+	}
+
+	@Test
+	void testJavaSourceStubsRefreshedOnReuseWithoutInvalidation() throws Exception {
+		// Even when the compilation unit is REUSED (not invalidated),
+		// stubs should still be refreshed from disk.
+		Path pkgDir = tempDir.resolve("src/main/java/com/reuse");
+		Files.createDirectories(pkgDir);
+		Files.writeString(pkgDir.resolve("Alpha.java"),
+				"package com.reuse;\npublic class Alpha {}");
+
+		factory.setProjectRoot(tempDir);
+		FileContentsTracker tracker = new FileContentsTracker();
+
+		// First create
+		GroovyLSCompilationUnit cu1 = factory.create(tempDir, tracker);
+		tracker.resetChangedFiles();
+
+		// Add a new Java file on disk (without invalidating compilation unit)
+		Files.writeString(pkgDir.resolve("Beta.java"),
+				"package com.reuse;\npublic class Beta {}");
+
+		// Second create — reuses compilation unit but should refresh stubs
+		GroovyLSCompilationUnit cu2 = factory.create(tempDir, tracker);
+		try { cu2.compile(Phases.CONVERSION); } catch (Exception e) { /* ignore */ }
+
+		Assertions.assertSame(cu1, cu2, "Compilation unit should be reused");
+		Set<String> stubNames = collectStubNames(cu2);
+		Assertions.assertTrue(stubNames.contains("[java-stub] com.reuse.Alpha"),
+				"Existing stub should still be present");
+		Assertions.assertTrue(stubNames.contains("[java-stub] com.reuse.Beta"),
+				"New Java file's stub should be added on reuse");
+	}
+
+	@Test
+	void testNoJavaStubsWhenNoJavaSrcDirectory() throws Exception {
+		// No src/main/java or src/test/java exists
+		factory.setProjectRoot(tempDir);
+		FileContentsTracker tracker = new FileContentsTracker();
+		GroovyLSCompilationUnit cu = factory.create(tempDir, tracker);
+		try { cu.compile(Phases.CONVERSION); } catch (Exception e) { /* ignore */ }
+
+		Set<String> stubNames = collectStubNames(cu);
+		Assertions.assertTrue(stubNames.isEmpty(),
+				"No stubs should be added when there are no Java source directories");
+	}
+
+	@Test
+	void testJavaStubsInTestSourceDirectory() throws Exception {
+		// Create a Java source in src/test/java
+		Path testJavaSrcDir = tempDir.resolve("src/test/java/com/test");
+		Files.createDirectories(testJavaSrcDir);
+		Files.writeString(testJavaSrcDir.resolve("TestHelper.java"),
+				"package com.test;\npublic class TestHelper {}");
+
+		factory.setProjectRoot(tempDir);
+		FileContentsTracker tracker = new FileContentsTracker();
+		GroovyLSCompilationUnit cu = factory.create(tempDir, tracker);
+		try { cu.compile(Phases.CONVERSION); } catch (Exception e) { /* ignore */ }
+
+		Set<String> stubNames = collectStubNames(cu);
+		Assertions.assertTrue(stubNames.contains("[java-stub] com.test.TestHelper"),
+				"Stubs should be generated for Java files in src/test/java too");
+	}
+
+	@Test
+	void testJavaStubForDefaultPackage() throws Exception {
+		// Java file in the root of src/main/java (no package)
+		Path javaSrcDir = tempDir.resolve("src/main/java");
+		Files.createDirectories(javaSrcDir);
+		Files.writeString(javaSrcDir.resolve("NoPackage.java"),
+				"public class NoPackage {}");
+
+		factory.setProjectRoot(tempDir);
+		FileContentsTracker tracker = new FileContentsTracker();
+		GroovyLSCompilationUnit cu = factory.create(tempDir, tracker);
+		try { cu.compile(Phases.CONVERSION); } catch (Exception e) { /* ignore */ }
+
+		Set<String> stubNames = collectStubNames(cu);
+		Assertions.assertTrue(stubNames.contains("[java-stub] NoPackage"),
+				"Stub should be generated for classes in the default package");
+	}
+
+	@Test
+	void testJavaStubsOnIncrementalUnit() throws Exception {
+		// Ensure stubs are also added to incremental compilation units
+		Path javaSrcDir = tempDir.resolve("src/main/java/com/incr");
+		Files.createDirectories(javaSrcDir);
+		Files.writeString(javaSrcDir.resolve("IncrClass.java"),
+				"package com.incr;\npublic class IncrClass {}");
+
+		// Create a groovy file to include in the incremental unit
+		Path groovySrc = srcRoot.resolve("IncrTest.groovy");
+		Files.writeString(groovySrc, "class IncrTest {}");
+
+		factory.setProjectRoot(tempDir);
+		FileContentsTracker tracker = new FileContentsTracker();
+		Set<URI> filesToInclude = new HashSet<>();
+		filesToInclude.add(groovySrc.toUri());
+
+		GroovyLSCompilationUnit incrUnit = factory.createIncremental(tempDir, tracker, filesToInclude);
+		Assertions.assertNotNull(incrUnit);
+		try { incrUnit.compile(Phases.CONVERSION); } catch (Exception e) { /* ignore */ }
+
+		Set<String> stubNames = collectStubNames(incrUnit);
+		Assertions.assertTrue(stubNames.contains("[java-stub] com.incr.IncrClass"),
+				"Stubs should also be added to incremental compilation units");
+	}
+
+	private Set<String> collectStubNames(GroovyLSCompilationUnit cu) {
+		Set<String> stubs = new HashSet<>();
+		cu.iterator().forEachRemaining(su -> {
+			if (su.getName() != null && su.getName().startsWith("[java-stub] ")) {
+				stubs.add(su.getName());
+			}
+		});
+		return stubs;
 	}
 }

@@ -322,7 +322,10 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         CompletionOptions completionOptions = new CompletionOptions(true, Arrays.asList("."));
         ServerCapabilities serverCapabilities = new ServerCapabilities();
         serverCapabilities.setCompletionProvider(completionOptions);
-        serverCapabilities.setTextDocumentSync(TextDocumentSyncKind.Incremental);
+        // Use full text sync to avoid rare range-application corruption
+        // during complex cross-file workspace edits (e.g. Java move/rename
+        // operations that rewrite Groovy imports).
+        serverCapabilities.setTextDocumentSync(TextDocumentSyncKind.Full);
         serverCapabilities.setDocumentSymbolProvider(true);
         serverCapabilities.setWorkspaceSymbolProvider(true);
         serverCapabilities.setReferencesProvider(true);
@@ -664,6 +667,31 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             if (unresolvedCount > 0) {
                 logProgress(unresolvedCount + " project(s) will resolve classpath on first file open");
                 sendStatusUpdate("importing", unresolvedCount + " project(s) will resolve classpath on first file open");
+            }
+
+            // ── Phase 2a: Compile Java sources ───────────────────────────
+            // When using cached classpaths, Java sources may not have been
+            // compiled since the last server run.  Run the build tool's
+            // compile tasks (e.g. Gradle 'classes testClasses') to ensure
+            // .class files are up to date before Groovy compilation starts.
+            // Gradle's incremental build is very fast when nothing changed.
+            if (!allDiscoveredRoots.isEmpty()) {
+                for (Map.Entry<ProjectImporter, List<Path>> de : discoveredByImporter.entrySet()) {
+                    ProjectImporter imp = de.getKey();
+                    List<Path> roots = de.getValue();
+                    if (!roots.isEmpty()) {
+                        String compileMsg = "Compiling " + imp.getName() + " sources ("
+                                + roots.size() + " project(s))...";
+                        logProgress(compileMsg);
+                        sendStatusUpdate("importing", compileMsg);
+                        try {
+                            imp.compileSources(roots);
+                        } catch (Exception e) {
+                            logger.warn("Source compilation failed for {}: {}",
+                                    imp.getName(), e.getMessage());
+                        }
+                    }
+                }
             }
 
             // ── Phase 3: Wire up the lazy resolution coordinator ──────────

@@ -39,6 +39,8 @@ import com.google.gson.JsonObject;
 import org.eclipse.lsp4j.PublishDiagnosticsParams;
 import org.eclipse.lsp4j.services.LanguageClient;
 
+import com.tomaszrup.groovyls.compiler.SharedClassGraphCache;
+import com.tomaszrup.groovyls.compiler.SharedClasspathIndexCache;
 import com.tomaszrup.groovyls.config.CompilationUnitFactory;
 import com.tomaszrup.groovyls.config.ICompilationUnitFactory;
 import com.tomaszrup.groovyls.util.FileContentsTracker;
@@ -76,6 +78,7 @@ public class ProjectScopeManager {
 
 	private volatile boolean semanticHighlightingEnabled = true;
 	private volatile boolean formattingEnabled = true;
+	private volatile boolean formattingOrganizeImportsEnabled = true;
 
 	/**
 	 * Tracks project roots whose classpath resolution is currently in-flight
@@ -152,6 +155,10 @@ public class ProjectScopeManager {
 
 	public boolean isFormattingEnabled() {
 		return formattingEnabled;
+	}
+
+	public boolean isFormattingOrganizeImportsEnabled() {
+		return formattingOrganizeImportsEnabled;
 	}
 
 	public boolean isImportInProgress() {
@@ -318,12 +325,15 @@ public class ProjectScopeManager {
 	 * {@code classpathResolved = false}.
 	 */
 	public void registerDiscoveredProjects(List<Path> projectRoots) {
+		invalidateWorkspaceLocalClasspathCaches(projectRoots);
+
 		synchronized (scopesMutationLock) {
 			logger.info("registerDiscoveredProjects called with {} projects", projectRoots.size());
 
 			List<ProjectScope> newScopes = new ArrayList<>();
 			for (Path projectRoot : projectRoots) {
 				CompilationUnitFactory factory = new CompilationUnitFactory();
+				factory.setProjectRoot(projectRoot);
 
 				List<Path> excludedRoots = new ArrayList<>();
 				for (Path other : projectRoots) {
@@ -357,6 +367,12 @@ public class ProjectScopeManager {
 		for (ProjectScope scope : scopes) {
 			List<String> classpath = projectClasspaths.get(scope.getProjectRoot());
 			if (classpath != null) {
+				// Clean stale .class files before applying the classpath so
+				// deleted source files don't remain visible to the compiler.
+				if (scope.getProjectRoot() != null) {
+					com.tomaszrup.groovyls.util.StaleClassFileCleaner
+							.cleanClasspathEntries(scope.getProjectRoot(), classpath);
+				}
 				scope.getLock().writeLock().lock();
 				try {
 					scope.getCompilationUnitFactory()
@@ -395,6 +411,11 @@ public class ProjectScopeManager {
 			logger.warn("updateProjectClasspath: no scope found for {}", projectRoot);
 			return null;
 		}
+		// Clean stale .class files before applying the classpath
+		if (projectRoot != null) {
+			com.tomaszrup.groovyls.util.StaleClassFileCleaner
+					.cleanClasspathEntries(projectRoot, classpath);
+		}
 		scope.getLock().writeLock().lock();
 		try {
 			scope.getCompilationUnitFactory().setAdditionalClasspathList(classpath);
@@ -427,6 +448,8 @@ public class ProjectScopeManager {
 	 * @return set of open URIs that need compilation
 	 */
 	public Set<URI> addProjects(Map<Path, List<String>> projectClasspaths) {
+		invalidateWorkspaceLocalClasspathCaches(new ArrayList<>(projectClasspaths.keySet()));
+
 		synchronized (scopesMutationLock) {
 			logger.info("addProjects called with {} projects", projectClasspaths.size());
 			List<Path> projectRoots = new ArrayList<>(projectClasspaths.keySet());
@@ -437,6 +460,7 @@ public class ProjectScopeManager {
 			List<ProjectScope> newScopes = new ArrayList<>();
 			for (Path projectRoot : projectRoots) {
 				CompilationUnitFactory factory = new CompilationUnitFactory();
+				factory.setProjectRoot(projectRoot);
 				List<String> classpath = projectClasspaths.get(projectRoot);
 				factory.setAdditionalClasspathList(classpath);
 
@@ -466,6 +490,25 @@ public class ProjectScopeManager {
 		return fileContentsTracker.getOpenURIs();
 	}
 
+	/**
+	 * Workspace-local classes (project build outputs) may be stale across server
+	 * restarts if shared caches are reused. Always evict cache entries rooted
+	 * under discovered project paths so those classes are re-scanned on project
+	 * open while still preserving cache hits for external dependency jars.
+	 */
+	private void invalidateWorkspaceLocalClasspathCaches(List<Path> projectRoots) {
+		if (projectRoots == null || projectRoots.isEmpty()) {
+			return;
+		}
+		for (Path projectRoot : projectRoots) {
+			if (projectRoot == null) {
+				continue;
+			}
+			SharedClasspathIndexCache.getInstance().invalidateEntriesUnderProject(projectRoot);
+			SharedClassGraphCache.getInstance().invalidateEntriesUnderProject(projectRoot);
+		}
+	}
+
 	// --- Configuration ---
 
 	public void updateFeatureToggles(JsonObject settings) {
@@ -483,6 +526,9 @@ public class ProjectScopeManager {
 			JsonObject fmt = groovy.get("formatting").getAsJsonObject();
 			if (fmt.has("enabled") && fmt.get("enabled").isJsonPrimitive()) {
 				this.formattingEnabled = fmt.get("enabled").getAsBoolean();
+			}
+			if (fmt.has("organizeImports") && fmt.get("organizeImports").isJsonPrimitive()) {
+				this.formattingOrganizeImportsEnabled = fmt.get("organizeImports").getAsBoolean();
 			}
 		}
 	}

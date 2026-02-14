@@ -37,6 +37,7 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import com.google.gson.JsonObject;
 import com.tomaszrup.groovyls.config.CompilationUnitFactory;
 
 class GroovyServicesFormattingTests {
@@ -465,6 +466,57 @@ class GroovyServicesFormattingTests {
 	}
 
 	@Test
+	void testFormatsSpockLabelsAtMethodBodyDepth() throws Exception {
+		Path filePath = srcRoot.resolve("SpockLabelsIndentationSpec.groovy");
+		String uri = filePath.toUri().toString();
+		StringBuilder contents = new StringBuilder();
+		contents.append("class SpockLabelsIndentationSpec {\n");
+		contents.append("    def \"formats labels\"(){\n");
+		contents.append("            given:\n");
+		contents.append("        def x=1\n");
+		contents.append("      when:\n");
+		contents.append("        def y = x + 1\n");
+		contents.append("   then:\n");
+		contents.append("        y == 2\n");
+		contents.append("     where:\n");
+		contents.append("        x || y\n");
+		contents.append("        1 || 2\n");
+		contents.append("    }\n");
+		contents.append("}\n");
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+
+		DocumentFormattingParams params = new DocumentFormattingParams(
+				new TextDocumentIdentifier(uri), new FormattingOptions(4, true));
+		List<? extends TextEdit> edits = services.formatting(params).get();
+
+		Assertions.assertFalse(edits.isEmpty(), "Should produce formatting edits");
+		String formatted = applyEdits(contents.toString(), edits);
+		String expected = "class SpockLabelsIndentationSpec {\n"
+				+ "    def \"formats labels\"() {\n"
+				+ "        given:\n"
+				+ "        def x=1\n"
+				+ "        when:\n"
+				+ "        def y = x + 1\n"
+				+ "        then:\n"
+				+ "        y == 2\n"
+				+ "        where:\n"
+				+ "        x || y\n"
+				+ "        1 || 2\n"
+				+ "    }\n"
+				+ "}\n";
+		Assertions.assertEquals(expected, formatted);
+		Assertions.assertTrue(formatted.contains("\n        given:\n"),
+				"'given:' label should be at method-body depth (8 spaces)");
+		Assertions.assertTrue(formatted.contains("\n        when:\n"),
+				"'when:' label should be at method-body depth (8 spaces)");
+		Assertions.assertTrue(formatted.contains("\n        then:\n"),
+				"'then:' label should be at method-body depth (8 spaces)");
+		Assertions.assertTrue(formatted.contains("\n        where:\n"),
+				"'where:' label should be at method-body depth (8 spaces)");
+	}
+
+	@Test
 	void testFixesWrongIndentation() throws Exception {
 		Path filePath = srcRoot.resolve("WrongIndent.groovy");
 		String uri = filePath.toUri().toString();
@@ -497,5 +549,185 @@ class GroovyServicesFormattingTests {
 				+ "    }\n"
 				+ "}\n";
 		Assertions.assertEquals(expected, formatted);
+	}
+
+	@Test
+	void testFormattingOrganizesImportsByDefault() throws Exception {
+		Path filePath = srcRoot.resolve("FormatOrganizeImports.groovy");
+		String uri = filePath.toUri().toString();
+		String contents = "import java.util.List\n"
+				+ "import java.util.ArrayList\n"
+				+ "class FormatOrganizeImports {\n"
+				+ "    ArrayList<String> list = new ArrayList<>()\n"
+				+ "}\n";
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents);
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+
+		DocumentFormattingParams params = new DocumentFormattingParams(
+				new TextDocumentIdentifier(uri), new FormattingOptions(4, true));
+		List<? extends TextEdit> edits = services.formatting(params).get();
+
+		Assertions.assertFalse(edits.isEmpty(), "Should produce edits for import organization");
+		String formatted = applyEdits(contents, edits);
+		String expected = "import java.util.ArrayList\n"
+				+ "\n"
+				+ "class FormatOrganizeImports {\n"
+				+ "    ArrayList<String> list = new ArrayList<>()\n"
+				+ "}\n";
+		Assertions.assertEquals(expected, formatted);
+	}
+
+	@Test
+	void testFormattingDoesNotOrganizeImportsWhenDisabled() throws Exception {
+		JsonObject settings = new JsonObject();
+		JsonObject groovy = new JsonObject();
+		JsonObject formatting = new JsonObject();
+		formatting.addProperty("organizeImports", false);
+		groovy.add("formatting", formatting);
+		settings.add("groovy", groovy);
+		services.didChangeConfiguration(new org.eclipse.lsp4j.DidChangeConfigurationParams(settings));
+
+		Path filePath = srcRoot.resolve("FormatOrganizeImportsDisabled.groovy");
+		String uri = filePath.toUri().toString();
+		String contents = "import java.util.List\n"
+				+ "import java.util.ArrayList\n"
+				+ "class FormatOrganizeImportsDisabled {\n"
+				+ "    ArrayList<String> list = new ArrayList<>()\n"
+				+ "}\n";
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents);
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+
+		DocumentFormattingParams params = new DocumentFormattingParams(
+				new TextDocumentIdentifier(uri), new FormattingOptions(4, true));
+		List<? extends TextEdit> edits = services.formatting(params).get();
+
+		Assertions.assertTrue(edits.isEmpty(), "Should not organize imports when disabled");
+	}
+
+	@Test
+	void testFormattingDoesNotAddExtraBlankLineAfterImportsWhenAlreadyPresent() throws Exception {
+		Path filePath = srcRoot.resolve("FormatNoExtraImportBlankLine.groovy");
+		String uri = filePath.toUri().toString();
+		String contents = "package com.example\n"
+				+ "\n"
+				+ "import spock.lang.Specification\n"
+				+ "\n"
+				+ "class CalculatorSpec extends Specification {\n"
+				+ "}\n";
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents);
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+
+		DocumentFormattingParams params = new DocumentFormattingParams(
+				new TextDocumentIdentifier(uri), new FormattingOptions(4, true));
+		List<? extends TextEdit> edits = services.formatting(params).get();
+
+		String formatted = applyEdits(contents, edits);
+		String expected = "package com.example\n"
+				+ "\n"
+				+ "import spock.lang.Specification\n"
+				+ "\n"
+				+ "class CalculatorSpec extends Specification {\n"
+				+ "}\n";
+		Assertions.assertEquals(expected, formatted);
+	}
+
+	@Test
+	void testFormattingCollapsesMultipleBlankLinesAfterImportsToOne() throws Exception {
+		Path filePath = srcRoot.resolve("FormatCollapseImportBlankLines.groovy");
+		String uri = filePath.toUri().toString();
+		String contents = "package com.example\n"
+				+ "\n"
+				+ "import spock.lang.Specification\n"
+				+ "\n"
+				+ "\n"
+				+ "\n"
+				+ "\n"
+				+ "class CalculatorSpec extends Specification {\n"
+				+ "}\n";
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents);
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+
+		DocumentFormattingParams params = new DocumentFormattingParams(
+				new TextDocumentIdentifier(uri), new FormattingOptions(4, true));
+		List<? extends TextEdit> edits = services.formatting(params).get();
+
+		String formatted = applyEdits(contents, edits);
+		String expected = "package com.example\n"
+				+ "\n"
+				+ "import spock.lang.Specification\n"
+				+ "\n"
+				+ "class CalculatorSpec extends Specification {\n"
+				+ "}\n";
+		Assertions.assertEquals(expected, formatted);
+	}
+
+	@Test
+	void testIndentsWrappedMethodChainLineInSpockWhenBlock() throws Exception {
+		Path filePath = srcRoot.resolve("WrappedMethodChainSpec.groovy");
+		String uri = filePath.toUri().toString();
+		String contents = "class WrappedMethodChainSpec extends Specification {\n"
+				+ "    def \"should divide two numbers correctly\"() {\n"
+				+ "        given:\n"
+				+ "        Calculator calculator = new Calculator()\n"
+				+ "\n"
+				+ "        when:\n"
+				+ "        double result = calculator\n"
+				+ "        .divide(a, b)\n"
+				+ "\n"
+				+ "        then:\n"
+				+ "        result == expected\n"
+				+ "\n"
+				+ "        where:\n"
+				+ "        a | b || expected\n"
+				+ "        10 | 2 || 5.0\n"
+				+ "    }\n"
+				+ "}\n";
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents);
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+
+		DocumentFormattingParams params = new DocumentFormattingParams(
+				new TextDocumentIdentifier(uri), new FormattingOptions(4, true));
+		List<? extends TextEdit> edits = services.formatting(params).get();
+
+		Assertions.assertFalse(edits.isEmpty(), "Should produce formatting edits for wrapped method chain");
+		String formatted = applyEdits(contents, edits);
+		Assertions.assertTrue(formatted.contains("\n            .divide(a, b)\n"),
+				"Wrapped method chain line should be indented one level deeper than assignment line");
+	}
+
+	@Test
+	void testIndentsMultilineWhereListBlock() throws Exception {
+		Path filePath = srcRoot.resolve("WhereListIndentSpec.groovy");
+		String uri = filePath.toUri().toString();
+		String contents = "class WhereListIndentSpec extends Specification {\n"
+				+ "    def \"should calculate area\"(String shape, int width, int height, int expectedArea) {\n"
+				+ "        expect:\n"
+				+ "        calculateArea(shape, width, height) == expectedArea\n"
+				+ "\n"
+				+ "        where:\n"
+				+ "        [shape, width, height, expectedArea] << [\n"
+				+ "        [\"rectangle\", 5, 3, 15],\n"
+				+ "        [\"square\", 4, 4, 16],\n"
+				+ "        [\"rectangle\", 10, 2, 20]\n"
+				+ "        ]\n"
+				+ "    }\n"
+				+ "}\n";
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents);
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+
+		DocumentFormattingParams params = new DocumentFormattingParams(
+				new TextDocumentIdentifier(uri), new FormattingOptions(4, true));
+		List<? extends TextEdit> edits = services.formatting(params).get();
+
+		Assertions.assertFalse(edits.isEmpty(), "Should produce formatting edits for multiline where list");
+		String formatted = applyEdits(contents, edits);
+		Assertions.assertTrue(formatted.contains("\n            [\"rectangle\", 5, 3, 15],\n"),
+				"First list row should be indented one level deeper than the opening '[' line");
+		Assertions.assertTrue(formatted.contains("\n            [\"square\", 4, 4, 16],\n"),
+				"Second list row should be indented one level deeper than the opening '[' line");
+		Assertions.assertTrue(formatted.contains("\n            [\"rectangle\", 10, 2, 20]\n"),
+				"Third list row should be indented one level deeper than the opening '[' line");
+		Assertions.assertTrue(formatted.contains("\n        ]\n"),
+				"Closing ']' should align with the opening '[' line indentation");
 	}
 }

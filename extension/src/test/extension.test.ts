@@ -381,6 +381,24 @@ describe("extension", () => {
     expect(findJava).toHaveBeenCalled();
   });
 
+  it("should call findJava again on formatting.organizeImports config change", () => {
+    activate(mockContext);
+
+    const configHandler = (
+      vscode.workspace.onDidChangeConfiguration as ReturnType<typeof vi.fn>
+    ).mock.calls[0][0];
+
+    const mockEvent = {
+      affectsConfiguration: (section: string) =>
+        section === "groovy.formatting.organizeImports",
+    };
+
+    vi.mocked(findJava).mockClear();
+    configHandler(mockEvent);
+
+    expect(findJava).toHaveBeenCalled();
+  });
+
 });
 
 // ====================================================================

@@ -36,11 +36,29 @@ public interface ICompilationUnitFactory {
 	public void invalidateCompilationUnit();
 
 	/**
+	 * Fully invalidates the compilation unit <em>and</em> the class loader,
+	 * forcing a fresh class loader on the next creation. Use this when the
+	 * contents of classpath directories have changed (e.g. stale {@code .class}
+	 * files deleted).
+	 */
+	default void invalidateCompilationUnitFull() {
+		invalidateCompilationUnit();
+	}
+
+	/**
 	 * Invalidate the cached file tree so that the next compilation will
 	 * re-walk the workspace directory. Call this when filesystem changes are
 	 * detected (e.g. files created, deleted, or renamed).
 	 */
 	default void invalidateFileCache() {
+		// no-op by default for test implementations
+	}
+
+	/**
+	 * Invalidate the Java source index so that stub classes for newly
+	 * created/deleted/moved {@code .java} files are refreshed.
+	 */
+	default void invalidateJavaSourceIndex() {
 		// no-op by default for test implementations
 	}
 

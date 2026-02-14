@@ -384,6 +384,30 @@ public class GradleProjectImporter implements ProjectImporter {
                 && (filePath.endsWith("build.gradle") || filePath.endsWith("build.gradle.kts"));
     }
 
+    /**
+     * Compile Java/Kotlin sources for all given projects, grouped by Gradle
+     * root so that a single {@code classes testClasses} invocation covers all
+     * subprojects under the same root build.
+     */
+    @Override
+    public void compileSources(List<Path> projectRoots) {
+        Map<Path, List<Path>> grouped = groupByGradleRoot(projectRoots);
+        for (Map.Entry<Path, List<Path>> entry : grouped.entrySet()) {
+            Path gradleRoot = entry.getKey();
+            logger.info("Compiling sources for Gradle root {} ({} subproject(s))",
+                    gradleRoot, entry.getValue().size());
+            validateGradleWrapper(gradleRoot);
+            GradleConnector connector = GradleConnector.newConnector()
+                    .forProjectDirectory(gradleRoot.toFile());
+            try (ProjectConnection connection = connector.connect()) {
+                runCompileTasks(connection, gradleRoot);
+            } catch (Exception e) {
+                logger.warn("Failed to compile sources for Gradle root {}: {}",
+                        gradleRoot, e.getMessage());
+            }
+        }
+    }
+
     // ---- private helpers ----
 
     /**
@@ -877,6 +901,12 @@ public class GradleProjectImporter implements ProjectImporter {
                     classDirs.add(dir.toString());
                 }
             }
+
+            // Remove stale .class files whose source files no longer exist.
+            // This prevents the Groovy compiler from resolving deleted Java/Groovy
+            // classes via leftover build output, which would hide missing-class
+            // diagnostics.
+            com.tomaszrup.groovyls.util.StaleClassFileCleaner.cleanProject(projectDir);
         }
         return classDirs;
     }

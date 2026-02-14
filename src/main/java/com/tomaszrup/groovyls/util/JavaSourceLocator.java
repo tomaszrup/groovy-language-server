@@ -38,6 +38,7 @@ import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
@@ -1041,6 +1042,60 @@ public class JavaSourceLocator {
                     || classNameToSourceJar.containsKey(outerClassName);
         }
         return false;
+    }
+
+    /**
+     * Check whether the given class resolves specifically to a project source
+     * file (not only a source JAR/decompiled fallback).
+     */
+    public boolean hasProjectSource(String className) {
+        if (classNameToSource.containsKey(className)) {
+            return true;
+        }
+        String outerClassName = toOuterClassName(className);
+        if (outerClassName != null) {
+            return classNameToSource.containsKey(outerClassName);
+        }
+        return false;
+    }
+
+    /**
+     * Find fully-qualified class names whose simple name matches the given
+     * unresolved class token.
+     *
+     * <p>Results include project sources and source JAR entries. The returned
+     * list is deduplicated and sorted in insertion order (project sources first,
+     * then source JARs).</p>
+     */
+    public List<String> findClassNamesBySimpleName(String simpleName) {
+        if (simpleName == null || simpleName.isEmpty()) {
+            return Collections.emptyList();
+        }
+        Set<String> out = new LinkedHashSet<>();
+        for (String fqcn : classNameToSource.keySet()) {
+            if (simpleNameOf(fqcn).equals(simpleName)) {
+                out.add(fqcn);
+            }
+        }
+        for (String fqcn : classNameToSourceJar.keySet()) {
+            if (simpleNameOf(fqcn).equals(simpleName)) {
+                out.add(fqcn);
+            }
+        }
+        return new ArrayList<>(out);
+    }
+
+    private static String simpleNameOf(String fqcn) {
+        if (fqcn == null || fqcn.isEmpty()) {
+            return "";
+        }
+        int dot = fqcn.lastIndexOf('.');
+        String base = dot >= 0 ? fqcn.substring(dot + 1) : fqcn;
+        int dollar = base.indexOf('$');
+        if (dollar >= 0) {
+            return base.substring(0, dollar);
+        }
+        return base;
     }
 
     /**

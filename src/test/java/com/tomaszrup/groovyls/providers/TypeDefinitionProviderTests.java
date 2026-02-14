@@ -60,6 +60,20 @@ class TypeDefinitionProviderTests {
         Assertions.assertTrue(location.getUri().contains("JavaStub"));
     }
 
+    @Test
+    void testResolveJavaSourceDoesNotUseSiblingLocatorFallback() throws Exception {
+        NonDecompilingLocator sibling = new NonDecompilingLocator(true);
+        TypeDefinitionProvider provider = new TypeDefinitionProvider(null, null, Collections.singletonList(sibling));
+
+        Method resolve = TypeDefinitionProvider.class.getDeclaredMethod("resolveJavaSource", org.codehaus.groovy.ast.ASTNode.class);
+        resolve.setAccessible(true);
+
+        ClassNode classNode = new ClassNode("pkg.SiblingOnly", 0, ClassHelper.OBJECT_TYPE);
+        Location location = (Location) resolve.invoke(provider, classNode);
+        Assertions.assertNull(location,
+                "Type definition resolution should stay within active scope locator and ignore sibling locators");
+    }
+
     private static final class StubLocator extends JavaSourceLocator {
         private final Location fixed = new Location("file:///tmp/JavaStub.java",
                 new Range(new Position(0, 0), new Position(0, 1)));
@@ -68,6 +82,23 @@ class TypeDefinitionProviderTests {
         public Location findLocationForClass(String className) {
             if (className != null && className.endsWith("FoundType")) {
                 return fixed;
+            }
+            return null;
+        }
+    }
+
+    private static final class NonDecompilingLocator extends JavaSourceLocator {
+        private final boolean shouldResolveClass;
+
+        private NonDecompilingLocator(boolean shouldResolveClass) {
+            this.shouldResolveClass = shouldResolveClass;
+        }
+
+        @Override
+        public Location findLocationForClass(String className) {
+            if (shouldResolveClass && className != null && className.endsWith("SiblingOnly")) {
+                return new Location("file:///tmp/SiblingOnly.java",
+                        new Range(new Position(0, 0), new Position(0, 1)));
             }
             return null;
         }

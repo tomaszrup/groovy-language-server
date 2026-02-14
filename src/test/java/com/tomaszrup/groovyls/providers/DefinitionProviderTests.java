@@ -69,6 +69,24 @@ class DefinitionProviderTests {
         Assertions.assertNotNull(varLoc);
     }
 
+    @Test
+    void testResolveJavaSourceDoesNotUseSiblingLocatorFallback() throws Exception {
+        NonDecompilingLocator sibling = new NonDecompilingLocator(true);
+        DefinitionProvider provider = new DefinitionProvider(null, null, Collections.singletonList(sibling));
+
+        Method resolve = DefinitionProvider.class.getDeclaredMethod("resolveJavaSource",
+                org.codehaus.groovy.ast.ASTNode.class,
+                org.codehaus.groovy.ast.ASTNode.class);
+        resolve.setAccessible(true);
+
+        VariableExpression offset = new VariableExpression("x");
+        ClassNode classNode = new ClassNode("pkg.SiblingOnly", 0, ClassHelper.OBJECT_TYPE);
+
+        Location location = (Location) resolve.invoke(provider, offset, classNode);
+        Assertions.assertNull(location,
+                "Definition resolution should stay within active scope locator and ignore sibling locators");
+    }
+
     private static final class StubLocator extends JavaSourceLocator {
         private final Location fixed = new Location("file:///tmp/JavaStub.java",
                 new Range(new Position(0, 0), new Position(0, 1)));
@@ -93,6 +111,23 @@ class DefinitionProviderTests {
         public Location findLocationForField(String className, String fieldName) {
             if (className != null && className.endsWith("FieldOwner") && "value".equals(fieldName)) {
                 return fixed;
+            }
+            return null;
+        }
+    }
+
+    private static final class NonDecompilingLocator extends JavaSourceLocator {
+        private final boolean shouldResolveClass;
+
+        private NonDecompilingLocator(boolean shouldResolveClass) {
+            this.shouldResolveClass = shouldResolveClass;
+        }
+
+        @Override
+        public Location findLocationForClass(String className) {
+            if (shouldResolveClass && className != null && className.endsWith("SiblingOnly")) {
+                return new Location("file:///tmp/SiblingOnly.java",
+                        new Range(new Position(0, 0), new Position(0, 1)));
             }
             return null;
         }

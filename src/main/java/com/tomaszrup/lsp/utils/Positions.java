@@ -20,9 +20,6 @@
 ////////////////////////////////////////////////////////////////////////////////
 package com.tomaszrup.lsp.utils;
 
-import java.io.BufferedReader;
-import java.io.IOException;
-import java.io.StringReader;
 import java.util.Comparator;
 
 import org.eclipse.lsp4j.Position;
@@ -40,29 +37,46 @@ public class Positions {
 	}
 
 	public static int getOffset(String string, Position position) {
+		if (string == null || position == null || !valid(position)) {
+			return -1;
+		}
 		int line = position.getLine();
 		int character = position.getCharacter();
-		int currentIndex = 0;
+
+		int currentLine = 0;
+		int lineStartOffset = 0;
+
+		// Find requested line start offset.
 		if (line > 0) {
-			try (BufferedReader reader = new BufferedReader(new StringReader(string))) {
-				int readLines = 0;
-				while (true) {
-					int readChar = reader.read();
-					if (readChar == -1) {
-						return -1;
-					}
-					currentIndex++;
-					if ((char) readChar == '\n') {
-						readLines++;
-						if (readLines == line) {
-							break;
-						}
+			for (int i = 0; i < string.length(); i++) {
+				if (string.charAt(i) == '\n') {
+					currentLine++;
+					lineStartOffset = i + 1;
+					if (currentLine == line) {
+						break;
 					}
 				}
-			} catch (IOException e) {
+			}
+			if (currentLine != line) {
 				return -1;
 			}
 		}
-		return currentIndex + character;
+
+		// Find line end (exclusive of line break chars).
+		int lineEndOffset = string.length();
+		for (int i = lineStartOffset; i < string.length(); i++) {
+			char c = string.charAt(i);
+			if (c == '\n' || c == '\r') {
+				lineEndOffset = i;
+				break;
+			}
+		}
+
+		int lineLength = lineEndOffset - lineStartOffset;
+		if (character < 0 || character > lineLength) {
+			return -1;
+		}
+
+		return lineStartOffset + character;
 	}
 }

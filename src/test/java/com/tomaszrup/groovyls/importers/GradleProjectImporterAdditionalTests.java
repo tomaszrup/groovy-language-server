@@ -215,6 +215,107 @@ class GradleProjectImporterAdditionalTests {
         Assertions.assertNotNull(classpath);
     }
 
+    // --- stale .class file cleanup ---
+
+    @Test
+    void testDiscoverClassDirsDeletesStaleJavaClassFiles() throws Exception {
+        // Setup: project with Frame.class in build output but no Frame.java source
+        Path project = tempDir.resolve("stale-java");
+        Path srcDir = project.resolve("src/main/java/com/example");
+        Path classDir = project.resolve("build/classes/java/main/com/example");
+        Files.createDirectories(srcDir);
+        Files.createDirectories(classDir);
+
+        // Create a Java source that still exists
+        Files.writeString(srcDir.resolve("Keeper.java"), "package com.example;\npublic class Keeper {}");
+        Files.writeString(classDir.resolve("Keeper.class"), "fake-class-bytes");
+
+        // Create a stale .class file with NO corresponding source
+        Files.writeString(classDir.resolve("Deleted.class"), "fake-class-bytes");
+        // Also create an inner class of the deleted source
+        Files.writeString(classDir.resolve("Deleted$Inner.class"), "fake-class-bytes");
+
+        Method discoverClassDirs = GradleProjectImporter.class
+                .getDeclaredMethod("discoverClassDirs", Path.class);
+        discoverClassDirs.setAccessible(true);
+
+        @SuppressWarnings("unchecked")
+        List<String> dirs = (List<String>) discoverClassDirs.invoke(importer, project);
+        Assertions.assertFalse(dirs.isEmpty(), "Should still discover the class directory");
+
+        // Stale files should have been deleted
+        Assertions.assertFalse(Files.exists(classDir.resolve("Deleted.class")),
+                "Stale Deleted.class should be removed");
+        Assertions.assertFalse(Files.exists(classDir.resolve("Deleted$Inner.class")),
+                "Stale Deleted$Inner.class should be removed");
+
+        // Keeper.class should remain (source exists)
+        Assertions.assertTrue(Files.exists(classDir.resolve("Keeper.class")),
+                "Keeper.class should remain because Keeper.java exists");
+    }
+
+    @Test
+    void testDiscoverClassDirsDeletesStaleGroovyClassFiles() throws Exception {
+        // Setup: project with FrameSpec.class in build output but no FrameSpec.groovy source
+        Path project = tempDir.resolve("stale-groovy");
+        Path srcDir = project.resolve("src/test/groovy/com/example");
+        Path classDir = project.resolve("build/classes/groovy/test/com/example");
+        Files.createDirectories(srcDir);
+        Files.createDirectories(classDir);
+
+        // Create a source that still exists
+        Files.writeString(srcDir.resolve("ValidSpec.groovy"), "package com.example");
+        Files.writeString(classDir.resolve("ValidSpec.class"), "fake");
+
+        // Create a stale .class file
+        Files.writeString(classDir.resolve("Removed.class"), "fake");
+
+        Method discoverClassDirs = GradleProjectImporter.class
+                .getDeclaredMethod("discoverClassDirs", Path.class);
+        discoverClassDirs.setAccessible(true);
+        discoverClassDirs.invoke(importer, project);
+
+        Assertions.assertFalse(Files.exists(classDir.resolve("Removed.class")),
+                "Stale Removed.class should be removed");
+        Assertions.assertTrue(Files.exists(classDir.resolve("ValidSpec.class")),
+                "ValidSpec.class should remain because ValidSpec.groovy exists");
+    }
+
+    @Test
+    void testDiscoverClassDirsSkipsWhenNoSourceDir() throws Exception {
+        // Class dir exists but no corresponding source dir — do NOT delete blindly
+        Path project = tempDir.resolve("no-src");
+        Path classDir = project.resolve("build/classes/java/main/com/example");
+        Files.createDirectories(classDir);
+        Files.writeString(classDir.resolve("NoSource.class"), "fake");
+
+        // No src/main/java directory exists at all
+
+        Method discoverClassDirs = GradleProjectImporter.class
+                .getDeclaredMethod("discoverClassDirs", Path.class);
+        discoverClassDirs.setAccessible(true);
+        discoverClassDirs.invoke(importer, project);
+
+        // File should NOT be deleted since we can't determine if it's stale
+        Assertions.assertTrue(Files.exists(classDir.resolve("NoSource.class")),
+                "Should not delete when source directory doesn't exist");
+    }
+
+    @Test
+    void testDiscoverClassDirsNoBuildDir() throws Exception {
+        // No build dir at all — should not throw
+        Path project = tempDir.resolve("missing-build");
+        Files.createDirectories(project);
+
+        Method discoverClassDirs = GradleProjectImporter.class
+                .getDeclaredMethod("discoverClassDirs", Path.class);
+        discoverClassDirs.setAccessible(true);
+
+        @SuppressWarnings("unchecked")
+        List<String> dirs = (List<String>) discoverClassDirs.invoke(importer, project);
+        Assertions.assertTrue(dirs.isEmpty());
+    }
+
     // --- groupByGradleRoot: batch grouping ---
 
     @Test

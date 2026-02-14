@@ -249,6 +249,7 @@ function onDidChangeConfiguration(event: vscode.ConfigurationChangeEvent) {
     event.affectsConfiguration("groovy.logLevel") ||
     event.affectsConfiguration("groovy.semanticHighlighting.enabled") ||
     event.affectsConfiguration("groovy.formatting.enabled") ||
+    event.affectsConfiguration("groovy.formatting.organizeImports") ||
     event.affectsConfiguration("groovy.memory.scopeEvictionTTL") ||
     event.affectsConfiguration("groovy.memory.backfillSiblingProjects") ||
     event.affectsConfiguration("groovy.memory.pressureThreshold") ||

@@ -123,6 +123,47 @@ public class OrganizeImportsAction {
         return actions;
     }
 
+    /**
+     * Creates a single TextEdit for organize-imports (remove unused + sort),
+     * or null if there is nothing to change.
+     */
+    public TextEdit createOrganizeImportsTextEdit(URI uri) {
+        if (ast == null) {
+            return null;
+        }
+
+        ModuleNode moduleNode = findModuleNode(uri);
+        if (moduleNode == null) {
+            return null;
+        }
+
+        List<ImportNode> imports = moduleNode.getImports();
+        if (imports == null || imports.isEmpty()) {
+            return null;
+        }
+
+        Set<String> referencedTypes = collectReferencedTypes(uri, moduleNode);
+
+        List<ImportNode> usedImports = new ArrayList<>();
+        for (ImportNode importNode : imports) {
+            String className = importNode.getClassName();
+            String simpleName = className;
+            int lastDot = className.lastIndexOf('.');
+            if (lastDot >= 0) {
+                simpleName = className.substring(lastDot + 1);
+            }
+            String alias = importNode.getAlias();
+            String nameToCheck = (alias != null && !alias.equals(simpleName)) ? alias : simpleName;
+
+            if (referencedTypes.contains(nameToCheck) || referencedTypes.contains(className)) {
+                usedImports.add(importNode);
+            }
+        }
+
+        String sortedBlock = buildImportBlock(usedImports, true);
+        return createImportBlockEdit(moduleNode, imports, sortedBlock);
+    }
+
     private ModuleNode findModuleNode(URI uri) {
         List<ASTNode> nodes = ast.getNodes(uri);
         for (ASTNode node : nodes) {
@@ -314,12 +355,14 @@ public class OrganizeImportsAction {
             for (String line : otherImports) {
                 sb.append(line).append("\n");
             }
+            sb.append("\n");
             return sb.toString();
         } else {
             StringBuilder sb = new StringBuilder();
             for (String line : importLines) {
                 sb.append(line).append("\n");
             }
+            sb.append("\n");
             return sb.toString();
         }
     }

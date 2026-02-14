@@ -21,11 +21,16 @@
 package com.tomaszrup.groovyls;
 
 import java.net.URI;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
@@ -39,6 +44,9 @@ import org.eclipse.lsp4j.DidChangeWatchedFilesParams;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.github.classgraph.ScanResult;
+import com.tomaszrup.groovyls.compiler.SharedClassGraphCache;
+import com.tomaszrup.groovyls.compiler.SharedClasspathIndexCache;
 import com.tomaszrup.groovyls.util.MdcProjectContext;
 
 /**
@@ -75,7 +83,16 @@ public class FileChangeHandler {
 		void onJavaFilesChanged(Path projectRoot);
 	}
 
+	/**
+	 * Callback interface for Java class move detection used to rewrite
+	 * Groovy imports (old FQCN -> new FQCN).
+	 */
+	public interface JavaImportMoveListener {
+		void onJavaImportsMoved(Path projectRoot, Map<String, String> movedImports);
+	}
+
 	private JavaChangeListener javaChangeListener;
+	private JavaImportMoveListener javaImportMoveListener;
 
 	public FileChangeHandler(ProjectScopeManager scopeManager, CompilationService compilationService,
 			ScheduledExecutorService javaRecompileExecutor) {
@@ -88,12 +105,22 @@ public class FileChangeHandler {
 		this.javaChangeListener = listener;
 	}
 
+	public void setJavaImportMoveListener(JavaImportMoveListener listener) {
+		this.javaImportMoveListener = listener;
+	}
+
 	/**
 	 * Handles didChangeWatchedFiles notifications: detects Java/build-file
 	 * changes, schedules recompiles, refreshes Java source indices, and
 	 * processes Groovy file changes per-scope.
 	 */
 	public void handleDidChangeWatchedFiles(DidChangeWatchedFilesParams params) {
+		if (logger.isDebugEnabled()) {
+			for (org.eclipse.lsp4j.FileEvent event : params.getChanges()) {
+				logger.debug("watcherTrace eventType={} uri={}", event.getType(), event.getUri());
+			}
+		}
+
 		Set<URI> allChangedUris = params.getChanges().stream()
 				.map(fileEvent -> URI.create(fileEvent.getUri()))
 				.collect(Collectors.toSet());
@@ -105,6 +132,13 @@ public class FileChangeHandler {
 		// Detect Java/build-tool file changes that require recompilation.
 		Set<Path> projectsNeedingRecompile = new LinkedHashSet<>();
 		List<ProjectScope> scopes = scopeManager.getProjectScopes(); // volatile read once
+		Map<Path, Map<String, String>> javaImportMovesByProject =
+				detectJavaImportMoves(params.getChanges(), scopes);
+		if (logger.isDebugEnabled() && !javaImportMovesByProject.isEmpty()) {
+			for (Map.Entry<Path, Map<String, String>> e : javaImportMovesByProject.entrySet()) {
+				logger.debug("watcherTrace javaMoves projectRoot={} moves={}", e.getKey(), e.getValue());
+			}
+		}
 		for (URI changedUri : allChangedUris) {
 			String path = changedUri.getPath();
 			if (path != null && (path.endsWith(".java")
@@ -126,7 +160,28 @@ public class FileChangeHandler {
 
 		// Schedule debounced async recompile for affected projects.
 		if (!projectsNeedingRecompile.isEmpty()) {
+			if (javaImportMoveListener != null) {
+				for (Map.Entry<Path, Map<String, String>> entry : javaImportMovesByProject.entrySet()) {
+					if (!entry.getValue().isEmpty()) {
+						javaImportMoveListener.onJavaImportsMoved(entry.getKey(), entry.getValue());
+					}
+				}
+			}
 			for (Path projectRoot : projectsNeedingRecompile) {
+				invalidateProjectClasspathCaches(projectRoot);
+
+				// Immediately invalidate classloader + compilation unit to ensure
+				// any stale compiled classes are dropped before the next compile.
+				ProjectScope scope = scopeManager.findProjectScopeByRoot(projectRoot);
+				if (scope != null) {
+					scope.getLock().writeLock().lock();
+					try {
+						scope.getCompilationUnitFactory().invalidateCompilationUnitFull();
+					} finally {
+						scope.getLock().writeLock().unlock();
+					}
+				}
+
 				scheduleJavaRecompile(projectRoot);
 			}
 		}
@@ -230,6 +285,144 @@ public class FileChangeHandler {
 	}
 
 	/**
+	 * Immediately evict per-scope and shared classpath indexes for a project
+	 * when Java/build files change. This prevents stale import suggestions from
+	 * old package locations while debounced recompilation is pending.
+	 */
+	private void invalidateProjectClasspathCaches(Path projectRoot) {
+		ProjectScope scope = scopeManager.findProjectScopeByRoot(projectRoot);
+		if (scope != null) {
+			scope.getLock().writeLock().lock();
+			try {
+				ScanResult oldScan = scope.getClassGraphScanResult();
+				if (oldScan != null) {
+					SharedClassGraphCache.getInstance().release(oldScan);
+				}
+				scope.setClassGraphScanResult(null);
+				scope.clearClasspathIndexes();
+			} finally {
+				scope.getLock().writeLock().unlock();
+			}
+		}
+
+		SharedClasspathIndexCache.getInstance().invalidateEntriesUnderProject(projectRoot);
+		SharedClassGraphCache.getInstance().invalidateEntriesUnderProject(projectRoot);
+	}
+
+	private Map<Path, Map<String, String>> detectJavaImportMoves(List<org.eclipse.lsp4j.FileEvent> events,
+			List<ProjectScope> scopes) {
+		Map<Path, List<Path>> deletedByProject = new HashMap<>();
+		Map<Path, List<Path>> createdByProject = new HashMap<>();
+
+		for (org.eclipse.lsp4j.FileEvent event : events) {
+			URI uri = URI.create(event.getUri());
+			String uriPath = uri.getPath();
+			if (uriPath == null || !uriPath.endsWith(".java")) {
+				continue;
+			}
+			Path filePath;
+			try {
+				filePath = Paths.get(uri);
+			} catch (Exception e) {
+				continue;
+			}
+			Path projectRoot = findProjectRootForJavaFile(filePath, scopes);
+			if (projectRoot == null || isBuildOutputFile(filePath, projectRoot)) {
+				continue;
+			}
+
+			if (event.getType() == org.eclipse.lsp4j.FileChangeType.Deleted) {
+				deletedByProject.computeIfAbsent(projectRoot, pr -> new ArrayList<>()).add(filePath);
+			} else if (event.getType() == org.eclipse.lsp4j.FileChangeType.Created) {
+				createdByProject.computeIfAbsent(projectRoot, pr -> new ArrayList<>()).add(filePath);
+			}
+		}
+
+		Map<Path, Map<String, String>> movesByProject = new HashMap<>();
+		for (Path projectRoot : deletedByProject.keySet()) {
+			List<Path> deleted = deletedByProject.getOrDefault(projectRoot, java.util.Collections.emptyList());
+			List<Path> created = createdByProject.getOrDefault(projectRoot, java.util.Collections.emptyList());
+			Map<String, String> moved = pairMovedClasses(projectRoot, deleted, created);
+			if (!moved.isEmpty()) {
+				movesByProject.put(projectRoot, moved);
+			}
+		}
+		return movesByProject;
+	}
+
+	private Path findProjectRootForJavaFile(Path filePath, List<ProjectScope> scopes) {
+		for (ProjectScope scope : scopes) {
+			Path projectRoot = scope.getProjectRoot();
+			if (projectRoot != null && filePath.startsWith(projectRoot)) {
+				return projectRoot;
+			}
+		}
+		return null;
+	}
+
+	private Map<String, String> pairMovedClasses(Path projectRoot, List<Path> deletedJavaFiles,
+			List<Path> createdJavaFiles) {
+		Map<String, Deque<Path>> createdBySimpleName = new HashMap<>();
+		for (Path created : createdJavaFiles) {
+			createdBySimpleName
+					.computeIfAbsent(created.getFileName().toString(), key -> new ArrayDeque<>())
+					.add(created);
+		}
+
+		Map<String, String> moved = new HashMap<>();
+		for (Path deleted : deletedJavaFiles) {
+			String simpleName = deleted.getFileName().toString();
+			Deque<Path> createdCandidates = createdBySimpleName.get(simpleName);
+			if (createdCandidates == null || createdCandidates.isEmpty()) {
+				continue;
+			}
+			Path created = createdCandidates.removeFirst();
+			String oldFqcn = javaPathToFqcn(projectRoot, deleted);
+			String newFqcn = javaPathToFqcn(projectRoot, created);
+			if (oldFqcn != null && newFqcn != null && !oldFqcn.equals(newFqcn)) {
+				moved.put(oldFqcn, newFqcn);
+			}
+		}
+		return moved;
+	}
+
+	private String javaPathToFqcn(Path projectRoot, Path javaFilePath) {
+		try {
+			Path relative = projectRoot.relativize(javaFilePath);
+			int startIndex = -1;
+			for (int i = 0; i < relative.getNameCount(); i++) {
+				if ("java".equals(relative.getName(i).toString())) {
+					startIndex = i + 1;
+					break;
+				}
+			}
+			if (startIndex < 0 || startIndex >= relative.getNameCount()) {
+				return null;
+			}
+			StringBuilder fqcn = new StringBuilder();
+			for (int i = startIndex; i < relative.getNameCount(); i++) {
+				String segment = relative.getName(i).toString();
+				if (i == relative.getNameCount() - 1) {
+					if (!segment.endsWith(".java")) {
+						return null;
+					}
+					segment = segment.substring(0, segment.length() - ".java".length());
+				}
+				if (segment.isEmpty()) {
+					return null;
+				}
+				if (fqcn.length() > 0) {
+					fqcn.append('.');
+				}
+				fqcn.append(segment);
+			}
+			return fqcn.toString();
+		} catch (Exception e) {
+			return null;
+		}
+	}
+
+	/**
 	 * Returns {@code true} if the given file path is inside a build output
 	 * directory relative to the project root.
 	 */
@@ -272,6 +465,12 @@ public class FileChangeHandler {
 	private void executeJavaRecompile(Path projectRoot) {
 		MdcProjectContext.setProject(projectRoot);
 		logger.info("Java/build files changed in {}, triggering recompile", projectRoot);
+
+		// Clean stale .class files whose source has been deleted, BEFORE
+		// notifying listeners or recompiling, so the Groovy classloader
+		// won't resolve deleted classes from leftover build output.
+		com.tomaszrup.groovyls.util.StaleClassFileCleaner.cleanProject(projectRoot);
+
 		if (javaChangeListener != null) {
 			javaChangeListener.onJavaFilesChanged(projectRoot);
 		}
@@ -289,4 +488,6 @@ public class FileChangeHandler {
 			scope.getLock().writeLock().unlock();
 		}
 	}
+
+
 }

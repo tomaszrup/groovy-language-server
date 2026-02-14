@@ -18,6 +18,7 @@ package com.tomaszrup.groovyls;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -46,6 +47,7 @@ class GroovyServicesDidChangeWatchedFilesTests {
 	private GroovyServices services;
 	private Path workspaceRoot;
 	private Path srcRoot;
+	private StubLanguageClient stubLanguageClient;
 
 	@BeforeEach
 	void setup() {
@@ -57,7 +59,8 @@ class GroovyServicesDidChangeWatchedFilesTests {
 
 		services = new GroovyServices(new CompilationUnitFactory());
 		services.setWorkspaceRoot(workspaceRoot);
-		services.connect(new StubLanguageClient());
+		stubLanguageClient = new StubLanguageClient();
+		services.connect(stubLanguageClient);
 	}
 
 	@AfterEach
@@ -354,9 +357,45 @@ class GroovyServicesDidChangeWatchedFilesTests {
 				"Java change listener should fire for moved source .java files under src/main/java");
 	}
 
+	@Test
+	void testMovedJavaFileAutomaticallyUpdatesGroovyImport() throws Exception {
+		Path projectRoot = workspaceRoot;
+		java.util.Map<Path, List<String>> projectClasspaths = new java.util.LinkedHashMap<>();
+		projectClasspaths.put(projectRoot, new ArrayList<>());
+		services.addProjects(projectClasspaths);
+
+		Path groovyFile = srcRoot.resolve("com/test/AutoImportUpdate.groovy");
+		Files.createDirectories(groovyFile.getParent());
+		String source = "package com.test\n\nimport com.example.SomeClass\n\nclass AutoImportUpdate {\n  SomeClass value\n}\n";
+		Files.writeString(groovyFile, source);
+		services.didOpen(new DidOpenTextDocumentParams(
+				new TextDocumentItem(groovyFile.toUri().toString(), LANGUAGE_GROOVY, 1, source)));
+
+		Path oldJava = projectRoot.resolve("src/main/java/com/example/SomeClass.java");
+		Path newJava = projectRoot.resolve("src/main/java/com/other/SomeClass.java");
+		List<FileEvent> events = Arrays.asList(
+				new FileEvent(oldJava.toUri().toString(), FileChangeType.Deleted),
+				new FileEvent(newJava.toUri().toString(), FileChangeType.Created));
+		services.didChangeWatchedFiles(new DidChangeWatchedFilesParams(events));
+
+		Assertions.assertNotNull(stubLanguageClient.lastApplyEditParams,
+				"Expected automatic workspace/applyEdit request for moved Java import");
+		List<TextEdit> edits = stubLanguageClient.lastApplyEditParams.getEdit().getChanges().get(groovyFile.toUri().toString());
+		Assertions.assertNotNull(edits,
+				"Expected edit for Groovy file containing moved Java import");
+		Assertions.assertFalse(edits.isEmpty(), "Expected non-empty import update edit");
+		String updated = edits.get(0).getNewText();
+		Assertions.assertTrue(updated.contains("import com.other.SomeClass"),
+				"Updated source should contain new import package");
+		Assertions.assertFalse(updated.contains("import com.example.SomeClass"),
+				"Updated source should not contain stale import package");
+	}
+
 	// --- Stub ---
 
 	private static class StubLanguageClient implements LanguageClient {
+		private ApplyWorkspaceEditParams lastApplyEditParams;
+
 		@Override
 		public void telemetryEvent(Object object) {
 		}
@@ -381,6 +420,12 @@ class GroovyServicesDidChangeWatchedFilesTests {
 		@Override
 		public CompletableFuture<Void> refreshSemanticTokens() {
 			return CompletableFuture.completedFuture(null);
+		}
+
+		@Override
+		public CompletableFuture<ApplyWorkspaceEditResponse> applyEdit(ApplyWorkspaceEditParams params) {
+			this.lastApplyEditParams = params;
+			return CompletableFuture.completedFuture(new ApplyWorkspaceEditResponse(true));
 		}
 	}
 }

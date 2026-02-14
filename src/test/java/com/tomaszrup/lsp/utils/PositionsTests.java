@@ -134,6 +134,20 @@ class PositionsTests {
 	}
 
 	@Test
+	void testGetOffsetCharacterBeyondLineLength() {
+		Assertions.assertEquals(-1, Positions.getOffset("hello", new Position(0, 99)));
+		Assertions.assertEquals(-1, Positions.getOffset("hello\nworld", new Position(1, 6)));
+	}
+
+	@Test
+	void testGetOffsetCRLFLineBreaks() {
+		String text = "a\r\nb\r\nc";
+		Assertions.assertEquals(0, Positions.getOffset(text, new Position(0, 0)));
+		Assertions.assertEquals(3, Positions.getOffset(text, new Position(1, 0)));
+		Assertions.assertEquals(6, Positions.getOffset(text, new Position(2, 0)));
+	}
+
+	@Test
 	void testGetOffsetSingleCharLines() {
 		String text = "a\nb\nc\n";
 		Assertions.assertEquals(0, Positions.getOffset(text, new Position(0, 0)));

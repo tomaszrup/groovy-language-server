@@ -186,6 +186,33 @@ class GroovyServicesDidChangeConfigurationTests {
 	}
 
 	@Test
+	void testDidChangeConfigurationTogglesFormattingOrganizeImports() throws Exception {
+		Path filePath = srcRoot.resolve("FmtOrganizeImportsToggle.groovy");
+		String uri = filePath.toUri().toString();
+		String contents = "import java.util.List\n"
+				+ "import java.util.ArrayList\n"
+				+ "class FmtOrganizeImportsToggle {\n"
+				+ "    ArrayList<String> list = new ArrayList<>()\n"
+				+ "}\n";
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents);
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+
+		JsonObject settings = new JsonObject();
+		JsonObject groovy = new JsonObject();
+		JsonObject fmt = new JsonObject();
+		fmt.addProperty("organizeImports", false);
+		groovy.add("formatting", fmt);
+		settings.add("groovy", groovy);
+		services.didChangeConfiguration(new DidChangeConfigurationParams(settings));
+
+		DocumentFormattingParams fmtParams = new DocumentFormattingParams(
+				new TextDocumentIdentifier(uri), new FormattingOptions(4, true));
+		List<? extends TextEdit> edits = services.formatting(fmtParams).get();
+		Assertions.assertNotNull(edits);
+		Assertions.assertTrue(edits.isEmpty(), "Import organization should be disabled");
+	}
+
+	@Test
 	void testDirectClasspathUpdate() throws Exception {
 		Path filePath = srcRoot.resolve("CpTest.groovy");
 		String uri = filePath.toUri().toString();

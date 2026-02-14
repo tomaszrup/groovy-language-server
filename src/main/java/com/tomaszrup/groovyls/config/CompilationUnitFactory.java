@@ -111,7 +111,39 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 	 */
 	private Set<Path> cachedGroovyFiles = null;
 
+	/**
+	 * Prefix used to identify synthetic Java source stub SourceUnits in the
+	 * compilation unit. These stubs allow Groovy imports to resolve Java
+	 * source classes that have not been compiled yet.
+	 */
+	private static final String JAVA_STUB_NAME_PREFIX = "[java-stub] ";
+
+	/**
+	 * Standard Gradle/Maven Java source directory names relative to a project
+	 * root. These are scanned to discover {@code .java} files for stub
+	 * generation.
+	 */
+	private static final String[][] JAVA_SOURCE_DIR_PATTERNS = {
+			{"src", "main", "java"},
+			{"src", "test", "java"},
+	};
+
+	/**
+	 * Project root used to discover Java source files and generate
+	 * synthetic stub classes so that imports resolve without waiting
+	 * for Gradle/Maven compilation.
+	 */
+	private Path projectRoot;
+
 	public CompilationUnitFactory() {
+	}
+
+	/**
+	 * Set the project root for Java source-aware class resolution.
+	 * Must be called before the first {@link #create} call.
+	 */
+	public void setProjectRoot(Path projectRoot) {
+		this.projectRoot = projectRoot;
 	}
 
 	public void setExcludedSubRoots(List<Path> excludedSubRoots) {
@@ -203,12 +235,42 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 	}
 
 	/**
+	 * Fully invalidates the compilation unit <em>and</em> the class loader,
+	 * so that the next {@link #create} call builds a fresh
+	 * {@link GroovyClassLoader} from scratch.  Use this when the
+	 * <em>contents</em> of classpath directories change in a way that the
+	 * classloader cache cannot reflect (e.g. source files deleted whose
+	 * compiled {@code .class} artefacts have been cleaned from disk).
+	 */
+	public void invalidateCompilationUnitFull() {
+		compilationUnit = null;
+		config = null;
+		if (classLoader != null) {
+			try {
+				classLoader.close();
+			} catch (IOException e) {
+				logger.debug("Failed to close old GroovyClassLoader during full invalidation", e);
+			}
+		}
+		classLoader = null;
+	}
+
+	/**
 	 * Invalidate the cached file tree so that the next compilation will
 	 * re-walk the workspace directory. Call this when filesystem changes are
 	 * detected (e.g. files created, deleted, or renamed).
 	 */
 	public void invalidateFileCache() {
 		cachedGroovyFiles = null;
+	}
+
+	/**
+	 * No-op — Java source stubs are now added as synthetic Groovy sources
+	 * directly to the compilation unit (fresh on every {@link #create} call),
+	 * so there is no separate index to invalidate.
+	 */
+	public void invalidateJavaSourceIndex() {
+		// no-op: stubs are rebuilt from disk on each create() call
 	}
 
 	/**
@@ -240,7 +302,8 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 		}
 
 		if (classLoader == null) {
-			classLoader = new GroovyClassLoader(ClassLoader.getSystemClassLoader().getParent(), config, true);
+			ClassLoader parentLoader = ClassLoader.getSystemClassLoader().getParent();
+			classLoader = new GroovyClassLoader(parentLoader, config, true);
 		}
 
 		Set<URI> changedUris = fileContentsTracker.getChangedURIs();
@@ -287,6 +350,12 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 			});
 		}
 
+		// Add synthetic Groovy stubs for Java source files that haven't been
+		// compiled yet. This is done fresh on every create() call — scanning
+		// the disk each time — so stubs always reflect the current state of
+		// Java source files, even if they were just moved/renamed.
+		addJavaSourceStubs(workspaceRoot, compilationUnit);
+
 		return compilationUnit;
 	}
 
@@ -297,7 +366,8 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 			config = getConfiguration();
 		}
 		if (classLoader == null) {
-			classLoader = new GroovyClassLoader(ClassLoader.getSystemClassLoader().getParent(), config, true);
+			ClassLoader parentLoader = ClassLoader.getSystemClassLoader().getParent();
+			classLoader = new GroovyClassLoader(parentLoader, config, true);
 		}
 
 		// Create a separate, temporary compilation unit — NOT stored in the
@@ -317,6 +387,10 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 				}
 			}
 		}
+
+		// Add Java source stubs to the incremental unit as well, so that
+		// Java class imports resolve even in single-file compilation.
+		addJavaSourceStubs(workspaceRoot, incrementalUnit);
 
 		return incrementalUnit;
 	}
@@ -673,5 +747,284 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 				compilationUnit.getConfiguration(), compilationUnit.getClassLoader(),
 				compilationUnit.getErrorCollector());
 		compilationUnit.addSource(sourceUnit);
+	}
+
+	// ---- Java source stub generation ----
+
+	/**
+	 * Adds synthetic Groovy source stubs for Java source files whose compiled
+	 * {@code .class} files are not yet on the classpath. This allows Groovy
+	 * imports to resolve immediately, without waiting for Gradle/Maven to
+	 * compile the Java sources.
+	 *
+	 * <p>The stubs are <b>rebuilt from disk on every call</b>: previous stubs
+	 * are removed from the compilation unit and fresh ones are added based on
+	 * the current state of the Java source directories. This eliminates stale
+	 * state problems that arise with classloader-based stub approaches
+	 * (where {@code defineClass()} is permanent in the JVM and cannot handle
+	 * move/rename scenarios).</p>
+	 *
+	 * <p>Each stub is a minimal Groovy source like
+	 * {@code package com.example; class Frame {}} &mdash; just enough for the
+	 * Groovy compiler to recognise the class name during
+	 * {@code Phases.CANONICALIZATION}.</p>
+	 */
+	private void addJavaSourceStubs(Path workspaceRoot, GroovyLSCompilationUnit compilationUnit) {
+		Path effectiveRoot = projectRoot != null ? projectRoot : workspaceRoot;
+		if (effectiveRoot == null) {
+			return;
+		}
+
+		// 1. Remove any existing Java stubs from a previous create() call.
+		//    Source-based ClassNodes from the new stubs take precedence over
+		//    any stale classes in the GroovyClassLoader's internal cache during
+		//    Groovy compilation, so explicit cache clearing is not needed.
+		List<SourceUnit> stubsToRemove = new ArrayList<>();
+		compilationUnit.iterator().forEachRemaining(su -> {
+			if (su.getName() != null && su.getName().startsWith(JAVA_STUB_NAME_PREFIX)) {
+				stubsToRemove.add(su);
+			}
+		});
+		if (!stubsToRemove.isEmpty()) {
+			compilationUnit.removeSources(stubsToRemove);
+		}
+		logger.debug("javaStubTrace projectRoot={} removedPreviousStubs={}", effectiveRoot, stubsToRemove.size());
+
+		// 2. Scan Java source directories for .java files
+		Map<String, Path> javaIndex = scanJavaSources(effectiveRoot);
+		if (javaIndex.isEmpty()) {
+			logger.debug("javaStubTrace projectRoot={} javaSourceCount=0", effectiveRoot);
+			return;
+		}
+		logger.debug("javaStubTrace projectRoot={} javaSourceCount={}", effectiveRoot, javaIndex.size());
+		if (logger.isInfoEnabled()) {
+			List<String> discovered = new ArrayList<>();
+			for (String fqcn : javaIndex.keySet()) {
+				discovered.add(fqcn);
+			}
+			Collections.sort(discovered);
+			int limit = Math.min(discovered.size(), 12);
+			List<String> sample = discovered.subList(0, limit);
+			logger.info("javaStubSummary projectRoot={} javaSourceCount={} sample={}",
+					effectiveRoot, discovered.size(), sample);
+		}
+
+		// 3. Add stubs for classes not already on the classpath
+		int added = 0;
+		for (Map.Entry<String, Path> entry : javaIndex.entrySet()) {
+			String fqcn = entry.getKey();
+			Path javaSourcePath = entry.getValue();
+
+			// Skip if the class is already resolvable from the classpath
+			// (e.g. the .class file exists in build/classes/)
+			File classFileOnClasspath = findClassFileOnClasspath(fqcn);
+			if (classFileOnClasspath != null) {
+				logger.debug("javaStubTrace skip fqcn={} source={} reason=classOnClasspath classFile={}",
+						fqcn, javaSourcePath, classFileOnClasspath);
+				logger.info("javaStubDecision fqcn={} source={} action=skip classFile={}",
+						fqcn, javaSourcePath, classFileOnClasspath);
+				continue;
+			}
+
+			// Build a minimal synthetic Groovy source
+			String pkg = "";
+			String simpleName = fqcn;
+			int lastDot = fqcn.lastIndexOf('.');
+			if (lastDot >= 0) {
+				pkg = fqcn.substring(0, lastDot);
+				simpleName = fqcn.substring(lastDot + 1);
+			}
+			StringBuilder source = new StringBuilder();
+			if (!pkg.isEmpty()) {
+				source.append("package ").append(pkg).append("\n");
+			}
+			source.append("class ").append(simpleName).append(" {}\n");
+
+			// Use the REAL .java file URI so that "Go to Definition" on
+			// imports resolved through this stub navigates to the actual
+			// Java source file (not a synthetic URI).
+			URI stubUri = javaSourcePath.toUri();
+			SourceUnit su = new SourceUnit(
+					JAVA_STUB_NAME_PREFIX + fqcn,
+					new StringReaderSourceWithURI(source.toString(), stubUri,
+							compilationUnit.getConfiguration()),
+					compilationUnit.getConfiguration(),
+					compilationUnit.getClassLoader(),
+					compilationUnit.getErrorCollector());
+			compilationUnit.addSource(su);
+			logger.debug("javaStubTrace add fqcn={} source={} stubUri={}", fqcn, javaSourcePath, stubUri);
+			logger.info("javaStubDecision fqcn={} source={} action=add stubUri={}", fqcn, javaSourcePath, stubUri);
+			added++;
+		}
+
+		if (added > 0) {
+			logger.info("Added {} Java source stub(s) to compilation unit", added);
+		}
+	}
+
+	/**
+	 * Checks whether a compiled {@code .class} file for the given
+	 * fully-qualified class name exists on any <em>directory</em> classpath
+	 * entry.  If so, no synthetic stub is needed because the Groovy compiler
+	 * will resolve the class from the classpath directly.
+	 *
+	 * <p><b>Important:</b> we deliberately do <em>not</em> use
+	 * {@code classLoader.loadClass(fqcn)} because the
+	 * {@link GroovyClassLoader} caches classes that were compiled from
+	 * previous stub source units.  Those cached classes would cause this
+	 * method to falsely return {@code true}, preventing fresh stubs from
+	 * being created after a Java file is moved/renamed.</p>
+	 */
+	private boolean isClassOnClasspath(String fqcn) {
+		return findClassFileOnClasspath(fqcn) != null;
+	}
+
+	private File findClassFileOnClasspath(String fqcn) {
+		List<String> entries = resolvedClasspathCache;
+		if (entries == null || entries.isEmpty()) {
+			logger.debug("javaStubTrace classpathCheck fqcn={} entries=0", fqcn);
+			return null;
+		}
+		String classFileRelative = fqcn.replace('.', File.separatorChar) + ".class";
+		for (String entry : entries) {
+			File entryFile = new File(entry);
+			if (entryFile.isDirectory()) {
+				File classFile = new File(entryFile, classFileRelative);
+				if (classFile.isFile()) {
+					return classFile;
+				}
+			}
+			// JAR entries are skipped — project Java sources won't be in JARs.
+			// Third-party JARs may contain classes with the same FQCN but
+			// that's extremely rare for project-level classes like Frame.
+		}
+		return null;
+	}
+
+	/**
+	 * Scans standard Java source directories ({@code src/main/java},
+	 * {@code src/test/java}) under the given project root and returns a
+	 * mapping from fully-qualified class name to source file path.
+	 */
+	private Map<String, Path> scanJavaSources(Path root) {
+		Map<String, Path> index = new HashMap<>();
+		for (String[] pattern : JAVA_SOURCE_DIR_PATTERNS) {
+			Path sourceDir = root;
+			for (String segment : pattern) {
+				sourceDir = sourceDir.resolve(segment);
+			}
+			if (!Files.isDirectory(sourceDir)) {
+				continue;
+			}
+			final Path finalSourceDir = sourceDir;
+			try {
+				Files.walkFileTree(sourceDir, new SimpleFileVisitor<Path>() {
+					@Override
+					public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+						if (file.getFileName().toString().endsWith(".java")) {
+							Path relative = finalSourceDir.relativize(file);
+							String pathFqcn = javaPathToFqcn(relative);
+							String declaredFqcn = javaFileToDeclaredFqcn(file);
+							if (pathFqcn != null && declaredFqcn != null && !pathFqcn.equals(declaredFqcn)) {
+								logger.info(
+										"javaStubPathPackageMismatch file={} pathFqcn={} declaredFqcn={}",
+										file, pathFqcn, declaredFqcn);
+								putJavaIndexEntry(index, pathFqcn, file);
+								putJavaIndexEntry(index, declaredFqcn, file);
+								logger.info("javaStubTransitionAliases file={} aliases=[{}, {}]",
+										file, pathFqcn, declaredFqcn);
+							} else {
+								String fqcn = declaredFqcn != null ? declaredFqcn : pathFqcn;
+								putJavaIndexEntry(index, fqcn, file);
+							}
+						}
+						return FileVisitResult.CONTINUE;
+					}
+
+					@Override
+					public FileVisitResult visitFileFailed(Path file, IOException exc) {
+						return FileVisitResult.CONTINUE;
+					}
+				});
+			} catch (IOException e) {
+				logger.debug("Could not scan Java source dir {}: {}", sourceDir, e.getMessage());
+			}
+		}
+		return index;
+	}
+
+	private void putJavaIndexEntry(Map<String, Path> index, String fqcn, Path file) {
+		if (fqcn == null || fqcn.isEmpty()) {
+			return;
+		}
+		Path previous = index.put(fqcn, file);
+		if (previous != null && !previous.equals(file)) {
+			logger.warn("javaStubDuplicateFqcn fqcn={} first={} second={}", fqcn, previous, file);
+		}
+	}
+
+	private String javaFileToDeclaredFqcn(Path javaFile) {
+		String fileName = javaFile.getFileName().toString();
+		if (!fileName.endsWith(".java")) {
+			return null;
+		}
+		String simpleName = fileName.substring(0, fileName.length() - ".java".length());
+		String pkg = extractJavaPackage(javaFile);
+		if (pkg == null || pkg.isEmpty()) {
+			return simpleName;
+		}
+		return pkg + "." + simpleName;
+	}
+
+	private String extractJavaPackage(Path javaFile) {
+		try {
+			for (String line : Files.readAllLines(javaFile)) {
+				String trimmed = line.trim();
+				if (trimmed.isEmpty() || trimmed.startsWith("//") || trimmed.startsWith("/*")
+						|| trimmed.startsWith("*")) {
+					continue;
+				}
+				if (trimmed.startsWith("package ")) {
+					String tail = trimmed.substring("package ".length()).trim();
+					if (tail.endsWith(";")) {
+						tail = tail.substring(0, tail.length() - 1).trim();
+					}
+					return tail;
+				}
+				// Once we hit a non-comment, non-package top-level line,
+				// there is no package declaration.
+				break;
+			}
+		} catch (IOException e) {
+			logger.debug("Could not read Java source file for package extraction {}: {}",
+					javaFile, e.getMessage());
+		}
+		return "";
+	}
+
+	/**
+	 * Converts a path relative to a Java source root to a fully-qualified
+	 * class name. E.g. {@code com/example/Frame.java} &rarr;
+	 * {@code com.example.Frame}.
+	 */
+	private static String javaPathToFqcn(Path relativePath) {
+		StringBuilder sb = new StringBuilder();
+		for (int i = 0; i < relativePath.getNameCount(); i++) {
+			String segment = relativePath.getName(i).toString();
+			if (i == relativePath.getNameCount() - 1) {
+				if (!segment.endsWith(".java")) {
+					return null;
+				}
+				segment = segment.substring(0, segment.length() - ".java".length());
+			}
+			if (segment.isEmpty()) {
+				return null;
+			}
+			if (sb.length() > 0) {
+				sb.append('.');
+			}
+			sb.append(segment);
+		}
+		return sb.toString();
 	}
 }

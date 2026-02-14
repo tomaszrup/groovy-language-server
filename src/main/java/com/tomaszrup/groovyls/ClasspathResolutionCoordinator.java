@@ -187,6 +187,18 @@ public class ClasspathResolutionCoordinator {
         ProjectScope updatedScope = scopeManager.updateProjectClasspath(projectRoot, classpath);
         transitionState(projectRoot, ResolutionState.RESOLVED);
 
+        // Compile Java/Kotlin sources so that .class files are up to date
+        // before Groovy compilation.  The lazy resolve only resolves
+        // dependency JARs — it does NOT compile source code.
+        try {
+            logProgress("Compiling " + importer.getName() + " sources for "
+                    + projectRoot.getFileName() + "...");
+            importer.recompile(projectRoot);
+        } catch (Exception e) {
+            logger.warn("Post-resolve source compilation failed for {}: {}",
+                    projectRoot, e.getMessage());
+        }
+
         // Save to cache
         if (classpathCacheEnabled && workspaceRoot != null) {
             ClasspathCache.mergeProject(workspaceRoot, projectRoot, classpath, allDiscoveredRoots);

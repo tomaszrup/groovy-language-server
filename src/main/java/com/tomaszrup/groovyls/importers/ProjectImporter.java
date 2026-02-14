@@ -209,4 +209,27 @@ public interface ProjectImporter {
     default boolean supportsSiblingBatching() {
         return false;
     }
+
+    /**
+     * Compile Java/Kotlin sources for the given projects so that {@code .class}
+     * files are up to date before Groovy compilation starts.  This is called
+     * during startup (after cached classpaths are applied) and during lazy
+     * classpath resolution to ensure the Groovy compiler can resolve Java
+     * classes from build output directories.
+     *
+     * <p>The default implementation calls {@link #recompile(Path)} for each
+     * project.  Build tools that support multi-project builds (e.g. Gradle)
+     * should override this to batch compilation under a single connection.</p>
+     *
+     * @param projectRoots the project roots to compile
+     */
+    default void compileSources(List<Path> projectRoots) {
+        for (Path root : projectRoots) {
+            try {
+                recompile(root);
+            } catch (Exception e) {
+                // best effort — compilation failure should not block startup
+            }
+        }
+    }
 }

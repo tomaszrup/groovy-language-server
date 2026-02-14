@@ -2,7 +2,7 @@
   "name": "groovy-spock-support",
   "displayName": "Groovy & Spock Language Support",
   "description": "Language support for Groovy and Spock",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "publisher": "TomaszRup",
   "homepage": "https://github.com/tomaszrup/groovy-language-server",
   "repository": {
@@ -157,6 +157,11 @@
           "type": "boolean",
           "default": true,
           "description": "Enable or disable document formatting for Groovy files."
+        },
+        "groovy.formatting.organizeImports": {
+          "type": "boolean",
+          "default": true,
+          "description": "When formatting a document, also organize imports (remove unused imports, sort/group imports, and normalize import-block spacing)."
         },
         "groovy.maven.home": {
           "type": [
