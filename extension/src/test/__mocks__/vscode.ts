@@ -53,6 +53,10 @@ const commands = {
   executeCommand: vi.fn(),
 };
 
+const extensions = {
+  getExtension: vi.fn().mockReturnValue(undefined),
+};
+
 const Uri = {
   parse: vi.fn((s: string) => ({ toString: () => s })),
   file: vi.fn((p: string) => ({ toString: () => `file://${p}` })),
@@ -72,6 +76,7 @@ export {
   workspace,
   window,
   commands,
+  extensions,
   Uri,
   ProgressLocation,
   StatusBarAlignment,

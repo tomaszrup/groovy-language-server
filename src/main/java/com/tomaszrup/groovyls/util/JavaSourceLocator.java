@@ -1250,6 +1250,65 @@ public class JavaSourceLocator {
         return null;
     }
 
+    public String getJavaNavigationURI(String uri) {
+        if (uri == null || uri.isBlank()) {
+            return null;
+        }
+
+        String className = uriToClassName.get(uri);
+        if (className == null && uri.startsWith("jar:/") && uri.endsWith(".java")) {
+            className = classNameFromVirtualJarURI(uri);
+        }
+
+        if (className == null) {
+            return null;
+        }
+
+        Path sourcePath = classNameToSource.get(className);
+        if (sourcePath != null) {
+            return sourcePath.toUri().toString();
+        }
+
+        SourceJarEntry sourceJarEntry = classNameToSourceJar.get(className);
+        if (sourceJarEntry == null) {
+            String outerClassName = toOuterClassName(className);
+            sourceJarEntry = classNameToSourceJar.get(outerClassName);
+        }
+
+        if (sourceJarEntry == null) {
+            return null;
+        }
+
+        return String.format("jar:%s!/%s", sourceJarEntry.sourceJarPath.toUri(), sourceJarEntry.entryName);
+    }
+
+    private String classNameFromVirtualJarURI(String uri) {
+        String withoutPrefix = uri.substring("jar:/".length());
+        int firstSlash = withoutPrefix.indexOf('/');
+        if (firstSlash < 0 || firstSlash + 1 >= withoutPrefix.length()) {
+            return null;
+        }
+
+        String packageAndFile = withoutPrefix.substring(firstSlash + 1);
+        if (!packageAndFile.endsWith(".java")) {
+            return null;
+        }
+
+        String javaPath = packageAndFile.substring(0, packageAndFile.length() - ".java".length());
+        int lastSlash = javaPath.lastIndexOf('/');
+        if (lastSlash <= 0 || lastSlash + 1 >= javaPath.length()) {
+            return null;
+        }
+
+        String packageName = javaPath.substring(0, lastSlash);
+        String className = javaPath.substring(lastSlash + 1);
+        if (packageName.isBlank() || className.isBlank()) {
+            return null;
+        }
+
+        return packageName + "." + className;
+    }
+
     /**
      * Read source content from a {@code jar:} URI pointing to a {@code .java}
      * or {@code .groovy} file inside a source JAR (e.g.

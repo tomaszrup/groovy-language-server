@@ -381,9 +381,13 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 					addOpenFileToCompilationUnit(uri, contents, incrementalUnit);
 				}
 			} else {
-				Path filePath = Paths.get(uri);
-				if (Files.isRegularFile(filePath)) {
-					incrementalUnit.addSource(filePath.toFile());
+				try {
+					Path filePath = Paths.get(uri);
+					if (Files.isRegularFile(filePath)) {
+						incrementalUnit.addSource(filePath.toFile());
+					}
+				} catch (Exception ignored) {
+					// Non-file URI (e.g. jar:/, jrt:/) cannot be added as a local source file.
 				}
 			}
 		}
@@ -585,6 +589,9 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 					dirPath, groovyFiles.size(), MAX_FULL_COMPILATION_FILES);
 			fileContentsTracker.getOpenURIs().forEach(uri -> {
 				try {
+					if (uri == null || uri.getScheme() == null || !"file".equalsIgnoreCase(uri.getScheme())) {
+						return;
+					}
 					Path openPath = Paths.get(uri);
 					if (openPath.getParent() != null) {
 						openPackageDirs.add(openPath.getParent().normalize().toString());
@@ -644,7 +651,15 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 		}
 		Path normalizedDir = dirPath.normalize();
 		fileContentsTracker.getOpenURIs().forEach(uri -> {
-			Path openPath = Paths.get(uri);
+			if (uri == null || uri.getScheme() == null || !"file".equalsIgnoreCase(uri.getScheme())) {
+				return;
+			}
+			Path openPath;
+			try {
+				openPath = Paths.get(uri);
+			} catch (Exception ignored) {
+				return;
+			}
 			if (!openPath.normalize().startsWith(normalizedDir)) {
 				return;
 			}
@@ -741,8 +756,14 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 	}
 
 	protected void addOpenFileToCompilationUnit(URI uri, String contents, GroovyLSCompilationUnit compilationUnit) {
-		Path filePath = Paths.get(uri);
-		SourceUnit sourceUnit = new SourceUnit(filePath.toString(),
+		if (uri == null || contents == null) {
+			return;
+		}
+		if (uri.getScheme() != null && !"file".equalsIgnoreCase(uri.getScheme())
+				&& !"untitled".equalsIgnoreCase(uri.getScheme())) {
+			return;
+		}
+		SourceUnit sourceUnit = new SourceUnit(uri.toString(),
 				new StringReaderSourceWithURI(contents, uri, compilationUnit.getConfiguration()),
 				compilationUnit.getConfiguration(), compilationUnit.getClassLoader(),
 				compilationUnit.getErrorCollector());

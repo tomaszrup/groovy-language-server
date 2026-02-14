@@ -355,6 +355,40 @@ class CompilationUnitFactoryTests {
 		Assertions.assertTrue(found, "Open file should be in the compilation unit");
 	}
 
+	@Test
+	void testCreateIgnoresVirtualJarOpenFileUris() throws Exception {
+		Path groovyFile = srcRoot.resolve("RealFile.groovy");
+		Files.writeString(groovyFile, "class RealFile { void run() {} }");
+
+		FileContentsTracker tracker = new FileContentsTracker();
+
+		URI virtualJarUri = URI.create("jar:/spock-core-2.4-M1-groovy-4.0-sources.jar/spock/lang/Specification.java");
+		org.eclipse.lsp4j.DidOpenTextDocumentParams openJarParams =
+				new org.eclipse.lsp4j.DidOpenTextDocumentParams(
+						new org.eclipse.lsp4j.TextDocumentItem(
+								virtualJarUri.toString(), "java", 1,
+								"package spock.lang; public class Specification {}"));
+		tracker.didOpen(openJarParams);
+
+		Assertions.assertDoesNotThrow(() -> factory.create(tempDir, tracker),
+				"create() should ignore non-file open URIs like jar:/ and not throw");
+
+		GroovyLSCompilationUnit cu = factory.create(tempDir, tracker);
+		try { cu.compile(Phases.CONVERSION); } catch (Exception e) { /* ignore */ }
+
+		boolean foundRealFile = false;
+		var iter = cu.iterator();
+		while (iter.hasNext()) {
+			SourceUnit su = iter.next();
+			if (su.getName().contains("RealFile")) {
+				foundRealFile = true;
+				break;
+			}
+		}
+		Assertions.assertTrue(foundRealFile,
+				"Real workspace Groovy files should still be compiled when a jar: tab is open");
+	}
+
 	// --- Java source stubs ---
 
 	@Test
@@ -533,6 +567,36 @@ class CompilationUnitFactoryTests {
 		Set<String> stubNames = collectStubNames(incrUnit);
 		Assertions.assertTrue(stubNames.contains("[java-stub] com.incr.IncrClass"),
 				"Stubs should also be added to incremental compilation units");
+	}
+
+	@Test
+	void testCreateIncrementalSkipsNonFileUris() throws Exception {
+		Path groovySrc = srcRoot.resolve("IncrementalOnly.groovy");
+		Files.writeString(groovySrc, "class IncrementalOnly {}");
+
+		FileContentsTracker tracker = new FileContentsTracker();
+		Set<URI> filesToInclude = new HashSet<>();
+		filesToInclude.add(groovySrc.toUri());
+		filesToInclude.add(URI.create("jar:/spock-core-2.4-M1-groovy-4.0-sources.jar/spock/lang/Specification.java"));
+
+		GroovyLSCompilationUnit incrUnit = Assertions.assertDoesNotThrow(
+				() -> factory.createIncremental(tempDir, tracker, filesToInclude),
+				"createIncremental() should ignore non-file URIs in filesToInclude");
+		Assertions.assertNotNull(incrUnit);
+
+		try { incrUnit.compile(Phases.CONVERSION); } catch (Exception e) { /* ignore */ }
+
+		boolean foundIncrementalFile = false;
+		var iter = incrUnit.iterator();
+		while (iter.hasNext()) {
+			SourceUnit su = iter.next();
+			if (su.getName().contains("IncrementalOnly")) {
+				foundIncrementalFile = true;
+				break;
+			}
+		}
+		Assertions.assertTrue(foundIncrementalFile,
+				"Regular file URIs should still be included in incremental compilation");
 	}
 
 	private Set<String> collectStubNames(GroovyLSCompilationUnit cu) {

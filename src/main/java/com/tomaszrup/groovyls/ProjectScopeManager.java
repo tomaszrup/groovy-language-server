@@ -25,6 +25,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -218,15 +219,36 @@ public class ProjectScopeManager {
 				logger.debug("findProjectScope({}) cache-hit -> {}", uri, cached.getProjectRoot());
 				return cached;
 			}
-			Path filePath = Paths.get(uri);
-			for (ProjectScope scope : projectScopes) {
-				if (scope.getProjectRoot() != null && filePath.startsWith(scope.getProjectRoot())) {
-					scopeCache.put(uri, scope);
-					scope.touchAccess();
-					logger.debug("findProjectScope({}) -> {}", uri, scope.getProjectRoot());
-					return scope;
+
+			Path filePath = toFilePath(uri);
+			if (filePath != null) {
+				ProjectScope matched = findScopeByFilePath(filePath);
+				if (matched != null) {
+					scopeCache.put(uri, matched);
+					matched.touchAccess();
+					logger.debug("findProjectScope({}) -> {}", uri, matched.getProjectRoot());
+					return matched;
 				}
 			}
+
+			if (filePath == null) {
+				ProjectScope virtualMatched = findScopeForVirtualUri(uri);
+				if (virtualMatched != null) {
+					scopeCache.put(uri, virtualMatched);
+					virtualMatched.touchAccess();
+					logger.debug("findProjectScope({}) virtual-uri match -> {}", uri, virtualMatched.getProjectRoot());
+					return virtualMatched;
+				}
+			}
+
+			if (filePath == null && projectScopes.size() == 1) {
+				ProjectScope onlyScope = projectScopes.get(0);
+				scopeCache.put(uri, onlyScope);
+				onlyScope.touchAccess();
+				logger.debug("findProjectScope({}) non-file fallback -> {}", uri, onlyScope.getProjectRoot());
+				return onlyScope;
+			}
+
 			StringBuilder candidates = new StringBuilder();
 			int limit = Math.min(projectScopes.size(), 5);
 			for (int i = 0; i < limit; i++) {
@@ -240,6 +262,122 @@ public class ProjectScopeManager {
 			return null;
 		}
 		return defaultScope;
+	}
+
+	private ProjectScope findScopeByFilePath(Path filePath) {
+		for (ProjectScope scope : projectScopes) {
+			if (scope.getProjectRoot() != null && filePath.startsWith(scope.getProjectRoot())) {
+				return scope;
+			}
+		}
+		return null;
+	}
+
+	private ProjectScope findScopeForVirtualUri(URI uri) {
+		if (uri == null) {
+			return null;
+		}
+		if (!"jar".equalsIgnoreCase(uri.getScheme())) {
+			return null;
+		}
+
+		String sourceJarName = extractSourceJarName(uri);
+		if (sourceJarName == null || sourceJarName.isEmpty()) {
+			return null;
+		}
+		String binaryJarName = sourceJarName.endsWith("-sources.jar")
+				? sourceJarName.substring(0, sourceJarName.length() - "-sources.jar".length()) + ".jar"
+				: sourceJarName;
+
+		List<ProjectScope> candidates = new ArrayList<>();
+		for (ProjectScope scope : projectScopes) {
+			List<String> classpath = scope.getCompilationUnitFactory().getAdditionalClasspathList();
+			if (classpath == null || classpath.isEmpty()) {
+				continue;
+			}
+			for (String entry : classpath) {
+				String fileName = fileNameOfClasspathEntry(entry);
+				if (fileName == null) {
+					continue;
+				}
+				if (binaryJarName.equalsIgnoreCase(fileName) || sourceJarName.equalsIgnoreCase(fileName)) {
+					candidates.add(scope);
+					break;
+				}
+			}
+		}
+
+		if (candidates.isEmpty()) {
+			return null;
+		}
+		return candidates.stream()
+				.max(Comparator.comparingLong(ProjectScope::getLastAccessedAt))
+				.orElse(null);
+	}
+
+	private String extractSourceJarName(URI uri) {
+		String ssp = uri.getSchemeSpecificPart();
+		if (ssp == null || ssp.isEmpty()) {
+			return null;
+		}
+		String normalized = ssp;
+		if (normalized.startsWith("//")) {
+			normalized = normalized.substring(2);
+		}
+		if (normalized.startsWith("/")) {
+			normalized = normalized.substring(1);
+		}
+		int slash = normalized.indexOf('/');
+		if (slash <= 0) {
+			return null;
+		}
+		return normalized.substring(0, slash);
+	}
+
+	private String fileNameOfClasspathEntry(String entry) {
+		if (entry == null || entry.isEmpty()) {
+			return null;
+		}
+		String normalized = entry.replace('\\', '/');
+		int slash = normalized.lastIndexOf('/');
+		if (slash >= 0 && slash + 1 < normalized.length()) {
+			return normalized.substring(slash + 1);
+		}
+		return normalized;
+	}
+
+	private Path toFilePath(URI uri) {
+		if (uri == null) {
+			return null;
+		}
+		String scheme = uri.getScheme();
+		if (scheme == null || "file".equalsIgnoreCase(scheme)) {
+			try {
+				return Paths.get(uri);
+			} catch (Exception ignored) {
+				return null;
+			}
+		}
+
+		if ("jar".equalsIgnoreCase(scheme)) {
+			String ssp = uri.getSchemeSpecificPart();
+			if (ssp != null) {
+				int separator = ssp.indexOf("!/");
+				if (separator > 0) {
+					String outer = ssp.substring(0, separator);
+					try {
+						URI outerUri = URI.create(outer);
+						if ("file".equalsIgnoreCase(outerUri.getScheme())) {
+							return Paths.get(outerUri);
+						}
+					} catch (Exception ignored) {
+						return null;
+					}
+				}
+			}
+		}
+
+		return null;
 	}
 
 	/**

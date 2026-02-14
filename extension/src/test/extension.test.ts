@@ -167,6 +167,132 @@ describe("extension", () => {
     expect(mockLanguageClientCtor).toHaveBeenCalled();
   });
 
+  it("should include virtual schemes in document selector", async () => {
+    activate(mockContext);
+    await new Promise((r) => setTimeout(r, 30));
+
+    const clientOptions = mockLanguageClientCtor.mock.calls[0][3];
+    expect(clientOptions.documentSelector).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ scheme: "file", language: "groovy" }),
+        expect.objectContaining({ scheme: "untitled", language: "groovy" }),
+        expect.objectContaining({ scheme: "jar" }),
+        expect.objectContaining({ scheme: "jrt" }),
+        expect.objectContaining({ scheme: "decompiled" }),
+      ])
+    );
+  });
+
+  it("should delegate jar java definitions to Java extension when available", async () => {
+    vi.mocked(vscode.extensions.getExtension).mockReturnValue({ isActive: true } as any);
+    vi.mocked(vscode.commands.executeCommand).mockResolvedValue([
+      { uri: { toString: () => "file:///from-java" } },
+    ] as any);
+
+    activate(mockContext);
+    await new Promise((r) => setTimeout(r, 30));
+
+    const clientOptions = mockLanguageClientCtor.mock.calls[0][3];
+    const middleware = clientOptions.middleware;
+    const next = vi.fn().mockResolvedValue([{ uri: { toString: () => "file:///from-next" } }]);
+
+    const result = await middleware.provideDefinition(
+      { uri: { scheme: "jar", toString: () => "jar:/dep.jar/Foo.java" }, languageId: "java" },
+      { line: 1, character: 1 },
+      { isCancellationRequested: false },
+      next
+    );
+
+    expect(vscode.commands.executeCommand).toHaveBeenCalledWith(
+      "vscode.executeDefinitionProvider",
+      expect.objectContaining({ scheme: "jar" }),
+      expect.objectContaining({ line: 1, character: 1 })
+    );
+    expect(next).not.toHaveBeenCalled();
+    expect(result).toHaveLength(1);
+    expect((result as any[])[0].uri.toString()).toBe("file:///from-java");
+  });
+
+  it("should fallback to Groovy LS when Java delegation returns no result", async () => {
+    vi.mocked(vscode.extensions.getExtension).mockReturnValue({ isActive: true } as any);
+    vi.mocked(vscode.commands.executeCommand).mockResolvedValue([] as any);
+
+    activate(mockContext);
+    await new Promise((r) => setTimeout(r, 30));
+
+    const clientOptions = mockLanguageClientCtor.mock.calls[0][3];
+    const middleware = clientOptions.middleware;
+    const next = vi.fn().mockResolvedValue([{ uri: { toString: () => "file:///from-next" } }]);
+
+    const result = await middleware.provideDefinition(
+      { uri: { scheme: "jar", toString: () => "jar:/dep.jar/Foo.java" }, languageId: "java" },
+      { line: 1, character: 1 },
+      { isCancellationRequested: false },
+      next
+    );
+
+    expect(next).toHaveBeenCalled();
+    expect((result as any[])[0].uri.toString()).toBe("file:///from-next");
+  });
+
+  it("should activate Red Hat Java extension before delegation when inactive", async () => {
+    const activateJavaExtension = vi.fn().mockResolvedValue(undefined);
+    vi.mocked(vscode.extensions.getExtension).mockReturnValue({ isActive: false, activate: activateJavaExtension } as any);
+    vi.mocked(vscode.commands.executeCommand).mockResolvedValue([{ uri: { toString: () => "file:///from-java" } }] as any);
+
+    activate(mockContext);
+    await new Promise((r) => setTimeout(r, 30));
+
+    const clientOptions = mockLanguageClientCtor.mock.calls[0][3];
+    const middleware = clientOptions.middleware;
+    const next = vi.fn().mockResolvedValue([{ uri: { toString: () => "file:///from-next" } }]);
+
+    const result = await middleware.provideDefinition(
+      { uri: { scheme: "jar", path: "/dep/Foo.java", toString: () => "jar:/dep/Foo.java" }, languageId: "" },
+      { line: 1, character: 1 },
+      { isCancellationRequested: false },
+      next
+    );
+
+    expect(activateJavaExtension).toHaveBeenCalled();
+    expect(next).not.toHaveBeenCalled();
+    expect(result).toHaveLength(1);
+  });
+
+  it("should not call Groovy fallback during nested Java delegation", async () => {
+    vi.mocked(vscode.extensions.getExtension).mockReturnValue({ isActive: true } as any);
+
+    activate(mockContext);
+    await new Promise((r) => setTimeout(r, 30));
+
+    const clientOptions = mockLanguageClientCtor.mock.calls[0][3];
+    const middleware = clientOptions.middleware;
+    const nestedNext = vi.fn().mockResolvedValue([{ uri: { toString: () => "file:///from-nested-next" } }]);
+
+    vi.mocked(vscode.commands.executeCommand).mockImplementation(async (_cmd, uri, pos) => {
+      await middleware.provideDefinition(
+        { uri, languageId: "java" },
+        pos,
+        { isCancellationRequested: false },
+        nestedNext
+      );
+      return [{ uri: { toString: () => "file:///from-java" } }];
+    });
+
+    const next = vi.fn().mockResolvedValue([{ uri: { toString: () => "file:///from-next" } }]);
+    const result = await middleware.provideDefinition(
+      { uri: { scheme: "jar", toString: () => "jar:/dep.jar/Foo.java" }, languageId: "java" },
+      { line: 1, character: 1 },
+      { isCancellationRequested: false },
+      next
+    );
+
+    expect(nestedNext).not.toHaveBeenCalled();
+    expect(next).not.toHaveBeenCalled();
+    expect(result).toHaveLength(1);
+    expect((result as any[])[0].uri.toString()).toBe("file:///from-java");
+  });
+
   it("restart command should stop existing client", async () => {
     activate(mockContext);
     await new Promise((r) => setTimeout(r, 30));

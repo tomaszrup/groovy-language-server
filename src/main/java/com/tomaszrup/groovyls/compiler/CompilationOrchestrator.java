@@ -27,6 +27,7 @@ import java.nio.file.Path;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -56,6 +57,7 @@ import org.slf4j.LoggerFactory;
 public class CompilationOrchestrator {
 	private static final Logger logger = LoggerFactory.getLogger(CompilationOrchestrator.class);
 	private static final Pattern PATTERN_CONSTRUCTOR_CALL = Pattern.compile(".*new \\w*$");
+	private static final Set<String> REPORTED_GROOVY_BUG_KEYS = ConcurrentHashMap.newKeySet();
 
 	/**
 	 * Process-wide shared cache for ClassGraph scan results. Scopes with
@@ -223,10 +225,19 @@ public class CompilationOrchestrator {
 			logger.debug("Compilation failed (expected for incomplete code) for scope {}: {}", projectRoot,
 					e.getMessage());
 		} catch (GroovyBugError e) {
-			logger.debug(
-					"Groovy compiler bug during compilation for scope {} (this is usually harmless for code intelligence): {}",
-					projectRoot, e.getMessage());
-			logger.debug("GroovyBugError details", e);
+			if (isKnownHarmlessTraitComposerBug(e)) {
+				String key = String.valueOf(projectRoot) + "|" + String.valueOf(e.getMessage());
+				if (REPORTED_GROOVY_BUG_KEYS.add(key)) {
+					logger.debug(
+							"Known Groovy compiler bug during compilation for scope {} (suppressing stack trace; benign for language features): {}",
+							projectRoot, e.getMessage());
+				}
+			} else {
+				logger.debug(
+						"Groovy compiler bug during compilation for scope {} (this is usually harmless for code intelligence): {}",
+						projectRoot, e.getMessage());
+				logger.debug("GroovyBugError details", e);
+			}
 		} catch (Exception e) {
 			logger.warn("Unexpected exception during compilation for scope {}: {}",
 					projectRoot, e.getMessage());
@@ -275,7 +286,17 @@ public class CompilationOrchestrator {
 		} catch (CompilationFailedException e) {
 			logger.debug("Incremental compilation failed for {}: {}", projectRoot, e.getMessage());
 		} catch (GroovyBugError e) {
-			logger.debug("Groovy compiler bug during incremental compile for {}: {}", projectRoot, e.getMessage());
+			if (isKnownHarmlessTraitComposerBug(e)) {
+				String key = String.valueOf(projectRoot) + "|incremental|" + String.valueOf(e.getMessage());
+				if (REPORTED_GROOVY_BUG_KEYS.add(key)) {
+					logger.debug(
+							"Known Groovy compiler bug during incremental compile for {} (suppressing stack trace; benign for language features): {}",
+							projectRoot, e.getMessage());
+				}
+			} else {
+				logger.debug("Groovy compiler bug during incremental compile for {}: {}", projectRoot, e.getMessage());
+				logger.debug("GroovyBugError details", e);
+			}
 		} catch (Exception e) {
 			logger.warn("Unexpected exception during incremental compile for {}: {}", projectRoot, e.getMessage());
 		} catch (LinkageError e) {
@@ -289,6 +310,26 @@ public class CompilationOrchestrator {
 			throw e;
 		}
 		return incrementalUnit.getErrorCollector();
+	}
+
+	private static boolean isKnownHarmlessTraitComposerBug(Throwable throwable) {
+		for (Throwable current = throwable; current != null; current = current.getCause()) {
+			if (current instanceof NullPointerException && current.getMessage() != null
+					&& current.getMessage().contains("helperClassNode")) {
+				return true;
+			}
+			StackTraceElement[] stack = current.getStackTrace();
+			if (stack == null) {
+				continue;
+			}
+			for (StackTraceElement element : stack) {
+				if ("org.codehaus.groovy.transform.trait.TraitComposer".equals(element.getClassName())
+						&& "applyTrait".equals(element.getMethodName())) {
+					return true;
+				}
+			}
+		}
+		return false;
 	}
 
 	/**

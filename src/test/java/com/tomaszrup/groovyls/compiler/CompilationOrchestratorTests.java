@@ -15,6 +15,7 @@
 ////////////////////////////////////////////////////////////////////////////////
 package com.tomaszrup.groovyls.compiler;
 
+import java.lang.reflect.Method;
 import java.net.URI;
 
 import org.eclipse.lsp4j.Position;
@@ -180,5 +181,52 @@ class CompilationOrchestratorTests {
 	void testCompileNullCompilationUnit() {
 		var result = orchestrator.compile(null, java.nio.file.Paths.get("/test"));
 		Assertions.assertNull(result);
+	}
+
+	@Test
+	void testKnownHarmlessTraitComposerBugDetectedByNpeMessage() throws Exception {
+		Method method = CompilationOrchestrator.class
+				.getDeclaredMethod("isKnownHarmlessTraitComposerBug", Throwable.class);
+		method.setAccessible(true);
+
+		NullPointerException npe = new NullPointerException("Cannot invoke helperClassNode because it is null");
+		boolean detected = (boolean) method.invoke(null, npe);
+
+		Assertions.assertTrue(detected,
+				"NPE mentioning helperClassNode should be treated as known harmless trait compiler bug");
+	}
+
+	@Test
+	void testKnownHarmlessTraitComposerBugDetectedByStackTrace() throws Exception {
+		Method method = CompilationOrchestrator.class
+				.getDeclaredMethod("isKnownHarmlessTraitComposerBug", Throwable.class);
+		method.setAccessible(true);
+
+		RuntimeException runtimeException = new RuntimeException("some compiler error");
+		runtimeException.setStackTrace(new StackTraceElement[] {
+				new StackTraceElement(
+						"org.codehaus.groovy.transform.trait.TraitComposer",
+						"applyTrait",
+						"TraitComposer.java",
+						123)
+		});
+
+		boolean detected = (boolean) method.invoke(null, runtimeException);
+
+		Assertions.assertTrue(detected,
+				"TraitComposer.applyTrait in stack should be treated as known harmless trait compiler bug");
+	}
+
+	@Test
+	void testKnownHarmlessTraitComposerBugReturnsFalseForUnrelatedErrors() throws Exception {
+		Method method = CompilationOrchestrator.class
+				.getDeclaredMethod("isKnownHarmlessTraitComposerBug", Throwable.class);
+		method.setAccessible(true);
+
+		IllegalStateException unrelated = new IllegalStateException("regular parser failure");
+		boolean detected = (boolean) method.invoke(null, unrelated);
+
+		Assertions.assertFalse(detected,
+				"Unrelated exceptions should not be classified as known harmless trait compiler bug");
 	}
 }

@@ -51,6 +51,7 @@ const MAX_SERVER_RESTARTS = 5;
 const PROTOCOL_VERSION = "1";
 const REQUEST_GET_DECOMPILED_CONTENT = "groovy/getDecompiledContent";
 const REQUEST_GET_PROTOCOL_VERSION = "groovy/getProtocolVersion";
+const REQUEST_GET_JAVA_NAVIGATION_URI = "groovy/getJavaNavigationUri";
 const NOTIFICATION_STATUS_UPDATE = "groovy/statusUpdate";
 const NOTIFICATION_MEMORY_USAGE = "groovy/memoryUsage";
 
@@ -124,6 +125,112 @@ let lastMemoryText: string | null = null;
 let lastScopeCounts: { active: number; evicted: number; total: number } | null = null;
 /** Current status bar state, used to re-render when memory updates arrive. */
 let currentStatusState: "starting" | "importing" | "ready" | "error" | "stopped" = "stopped";
+/** Guard against recursive definition delegation through executeDefinitionProvider. */
+let javaDefinitionDelegationInProgress = false;
+
+function isVirtualDependencyDocument(document: vscode.TextDocument): boolean {
+  const scheme = (document.uri.scheme || "").toLowerCase();
+  return scheme === "jar" || scheme === "jrt" || scheme === "decompiled";
+}
+
+function isLikelyJavaVirtualDocument(document: vscode.TextDocument): boolean {
+  if (!isVirtualDependencyDocument(document)) {
+    return false;
+  }
+  const language = (document.languageId || "").toLowerCase();
+  if (language === "java") {
+    return true;
+  }
+  const path = document.uri.path || "";
+  return path.toLowerCase().endsWith(".java");
+}
+
+function hasRedHatJavaExtension(): boolean {
+  return Boolean(vscode.extensions.getExtension("redhat.java"));
+}
+
+function toDelegationUri(rawUri: string): vscode.Uri {
+  const decoded = decodeURIComponent(rawUri);
+  const jarFileMatch = decoded.match(/^jar:file:\/\/(.+)!\/(.+)$/i);
+  if (jarFileMatch) {
+    let outerPath = jarFileMatch[1];
+    const entryPath = jarFileMatch[2];
+    if (!outerPath.startsWith("/")) {
+      outerPath = `/${outerPath}`;
+    }
+    return vscode.Uri.from({
+      scheme: "jar",
+      path: `${outerPath}!/${entryPath}`,
+    });
+  }
+  return vscode.Uri.parse(decoded);
+}
+
+async function tryDelegateDefinitionToJava(
+  document: vscode.TextDocument,
+  position: vscode.Position,
+): Promise<vscode.Location[] | vscode.LocationLink[] | null> {
+  if (!isVirtualDependencyDocument(document)) {
+    return null;
+  }
+  const javaExt = vscode.extensions.getExtension("redhat.java");
+  if (!javaExt) {
+    return null;
+  }
+  if (javaDefinitionDelegationInProgress) {
+    return null;
+  }
+
+  javaDefinitionDelegationInProgress = true;
+  try {
+    if (!javaExt.isActive) {
+      await javaExt.activate();
+    }
+
+    let delegateDocumentUri = document.uri;
+    if (isLikelyJavaVirtualDocument(document) && languageClient) {
+      try {
+        const mappedUri = await languageClient.sendRequest<string | null>(
+          REQUEST_GET_JAVA_NAVIGATION_URI,
+          { uri: document.uri.toString() }
+        );
+        if (mappedUri && mappedUri.trim().length > 0 && mappedUri !== document.uri.toString()) {
+          delegateDocumentUri = toDelegationUri(mappedUri);
+          outputChannel?.appendLine(
+            `Resolved Java delegation URI ${document.uri.toString()} -> ${delegateDocumentUri.toString(true)}`
+          );
+        }
+      } catch (err) {
+        outputChannel?.appendLine(
+          `Failed to resolve Java delegation URI for ${document.uri.toString()}: ${String(err)}`
+        );
+      }
+    }
+
+    outputChannel?.appendLine(
+      `Delegating definition to Red Hat Java for ${delegateDocumentUri.toString(true)} (${document.languageId || "unknown"})`
+    );
+    const delegated = await vscode.commands.executeCommand<
+      vscode.Location[] | vscode.LocationLink[] | undefined
+    >("vscode.executeDefinitionProvider", delegateDocumentUri, position);
+    if (delegated && delegated.length > 0) {
+      outputChannel?.appendLine(
+        `Red Hat Java delegation returned ${delegated.length} location(s) for ${delegateDocumentUri.toString(true)}`
+      );
+      return delegated;
+    }
+    outputChannel?.appendLine(
+      `Red Hat Java delegation returned no result for ${delegateDocumentUri.toString(true)}`
+    );
+  } catch (err) {
+    outputChannel?.appendLine(
+      `Java definition delegation failed for ${document.uri.toString()}: ${String(err)}`
+    );
+  } finally {
+    javaDefinitionDelegationInProgress = false;
+  }
+  return null;
+}
 
 export function activate(context: vscode.ExtensionContext) {
   extensionContext = context;
@@ -507,7 +614,25 @@ function startLanguageServer() {
           documentSelector: [
             { scheme: "file", language: "groovy" },
             { scheme: "untitled", language: "groovy" },
+            { scheme: "jar" },
+            { scheme: "jrt" },
+            { scheme: "decompiled" },
           ],
+          middleware: {
+            provideDefinition: async (document, position, token, next) => {
+              if (
+                javaDefinitionDelegationInProgress &&
+                isVirtualDependencyDocument(document)
+              ) {
+                return null;
+              }
+              const delegated = await tryDelegateDefinitionToJava(document, position);
+              if (delegated && delegated.length > 0) {
+                return delegated;
+              }
+              return next(document, position, token);
+            },
+          },
           // Pass configuration to the server as initialization options
           initializationOptions: buildInitializationOptions(),
           synchronize: {

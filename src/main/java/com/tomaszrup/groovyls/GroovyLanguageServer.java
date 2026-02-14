@@ -785,6 +785,23 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     }
 
     /**
+     * Custom LSP request: resolve a URI form suitable for Java definition providers.
+     *
+     * @param params a JSON object with a {@code uri} string field
+     * @return Java-provider-compatible URI string, or {@code null} if not resolvable
+     */
+    @org.eclipse.lsp4j.jsonrpc.services.JsonRequest(Protocol.REQUEST_GET_JAVA_NAVIGATION_URI)
+    public CompletableFuture<String> getJavaNavigationUri(com.google.gson.JsonObject params) {
+        return CompletableFuture.supplyAsync(() -> {
+            String uri = params.has("uri") ? params.get("uri").getAsString() : null;
+            if (uri == null) {
+                return null;
+            }
+            return groovyServices.getJavaNavigationURI(uri);
+        });
+    }
+
+    /**
      * Custom LSP request: returns custom protocol contract version used by
      * extension↔server Groovy-specific messages.
      */

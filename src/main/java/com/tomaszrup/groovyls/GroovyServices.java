@@ -39,6 +39,8 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import com.google.gson.JsonObject;
 
@@ -92,6 +94,8 @@ import org.slf4j.LoggerFactory;
  */
 public class GroovyServices implements TextDocumentService, WorkspaceService, LanguageClientAware {
 	private static final Logger logger = LoggerFactory.getLogger(GroovyServices.class);
+	private static final Pattern JAVA_IMPORT_PATTERN = Pattern.compile("^\\s*import\\s+(?:static\\s+)?([\\w.$]+)\\s*;?\\s*$");
+	private static final Pattern JAVA_PACKAGE_PATTERN = Pattern.compile("^\\s*package\\s+([\\w.]+)\\s*;?\\s*$");
 
 	/** Debounce delay for didChange recompilation (milliseconds). */
 	private static final long DEBOUNCE_DELAY_MS = 300;
@@ -353,6 +357,31 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 		return null;
 	}
 
+	/**
+	 * Resolve a URI for Java definition providers.
+	 * Converts virtual dependency URIs to provider-compatible URI forms
+	 * (for example, source-jar entries as {@code jar:file:///...!/entry.java}).
+	 *
+	 * @param uri the current document URI
+	 * @return Java-provider-compatible URI string, or {@code null} if unavailable
+	 */
+	public String getJavaNavigationURI(String uri) {
+		for (ProjectScope scope : scopeManager.getProjectScopes()) {
+			JavaSourceLocator locator = scope.getJavaSourceLocator();
+			if (locator != null) {
+				String resolvedUri = locator.getJavaNavigationURI(uri);
+				if (resolvedUri != null) {
+					return resolvedUri;
+				}
+			}
+		}
+		ProjectScope ds = scopeManager.getDefaultScope();
+		if (ds != null && ds.getJavaSourceLocator() != null) {
+			return ds.getJavaSourceLocator().getJavaNavigationURI(uri);
+		}
+		return null;
+	}
+
 	public void onImportComplete() {
 		scopeManager.setImportInProgress(false);
 		List<ProjectScope> scopes = scopeManager.getProjectScopes();
@@ -556,26 +585,27 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	@Override
 	public void didOpen(DidOpenTextDocumentParams params) {
 		fileContentsTracker.didOpen(params);
-		URI uri = URI.create(params.getTextDocument().getUri());
-		ProjectScope scope = scopeManager.findProjectScope(uri);
-		if (scope != null) {
-			MdcProjectContext.setProject(scope.getProjectRoot());
-		}
+		URI openedUri = null;
 		try {
-			doDidOpen(uri, scope);
+			openedUri = URI.create(params.getTextDocument().getUri());
+			ProjectScope scope = scopeManager.findProjectScope(openedUri);
+			if (scope != null) {
+				MdcProjectContext.setProject(scope.getProjectRoot());
+			}
+			doDidOpen(openedUri, scope);
 		} catch (LinkageError e) {
 			// NoClassDefFoundError or similar — a project class could not be
 			// loaded during compilation.  Catch here so the error does NOT
 			// propagate to LSP4J's listener thread (which only catches
 			// Exception, not Error), which would kill the connection and
 			// cause the EPIPE seen by the VS Code client.
-			logger.warn("Classpath linkage error during didOpen for {}: {}", uri, e.toString());
+			logger.warn("Classpath linkage error during didOpen for {}: {}", openedUri, e.toString());
 			logger.debug("didOpen LinkageError details", e);
 		} catch (VirtualMachineError e) {
-			logger.error("VirtualMachineError during didOpen for {}: {}", uri, e.toString());
+			logger.error("VirtualMachineError during didOpen for {}: {}", openedUri, e.toString());
 			// Swallow to keep the LSP connection alive
 		} catch (Exception e) {
-			logger.warn("Unexpected exception during didOpen for {}: {}", uri, e.getMessage());
+			logger.warn("Unexpected exception during didOpen for {}: {}", openedUri, e.getMessage());
 			logger.debug("didOpen exception details", e);
 		} finally {
 			MdcProjectContext.clear();
@@ -1104,8 +1134,179 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			}
 
 			DefinitionProvider provider = new DefinitionProvider(visitor, scope.getJavaSourceLocator());
-			return provider.provideDefinition(params.getTextDocument(), params.getPosition());
+			return provider.provideDefinition(params.getTextDocument(), params.getPosition())
+					.thenApply(result -> {
+						if (!isEmptyDefinitionResult(result)) {
+							return result;
+						}
+						Either<List<? extends Location>, List<? extends LocationLink>> fallback =
+								resolveDefinitionFromJavaVirtualSource(uri, params.getPosition(),
+										scope.getJavaSourceLocator());
+						if (!isEmptyDefinitionResult(fallback)) {
+							logger.debug("Java virtual-source fallback resolved definition for {}", uri);
+							return fallback;
+						}
+						return result;
+					});
 		}, Either.forLeft(Collections.emptyList()));
+	}
+
+	private boolean isEmptyDefinitionResult(Either<List<? extends Location>, List<? extends LocationLink>> result) {
+		if (result == null) {
+			return true;
+		}
+		if (result.isLeft()) {
+			List<? extends Location> left = result.getLeft();
+			return left == null || left.isEmpty();
+		}
+		List<? extends LocationLink> right = result.getRight();
+		return right == null || right.isEmpty();
+	}
+
+	private Either<List<? extends Location>, List<? extends LocationLink>> resolveDefinitionFromJavaVirtualSource(
+			URI uri,
+			Position position,
+			JavaSourceLocator javaSourceLocator) {
+		if (uri == null || position == null || javaSourceLocator == null || !isLikelyJavaVirtualUri(uri)) {
+			return Either.forLeft(Collections.emptyList());
+		}
+
+		String contents = fileContentsTracker.getContents(uri);
+		if (contents == null || contents.isBlank()) {
+			return Either.forLeft(Collections.emptyList());
+		}
+
+		String symbol = symbolAtPosition(contents, position);
+		if (symbol == null || symbol.isBlank()) {
+			return Either.forLeft(Collections.emptyList());
+		}
+
+		List<String> candidates = javaSourceLocator.findClassNamesBySimpleName(symbol);
+		if (candidates == null || candidates.isEmpty()) {
+			return Either.forLeft(Collections.emptyList());
+		}
+
+		String preferred = choosePreferredCandidate(symbol, contents, candidates);
+		if (preferred != null) {
+			Location loc = javaSourceLocator.findLocationForClass(preferred);
+			if (loc != null) {
+				return Either.forLeft(Collections.singletonList(loc));
+			}
+		}
+
+		for (String candidate : candidates) {
+			Location loc = javaSourceLocator.findLocationForClass(candidate);
+			if (loc != null) {
+				return Either.forLeft(Collections.singletonList(loc));
+			}
+		}
+
+		return Either.forLeft(Collections.emptyList());
+	}
+
+	private boolean isLikelyJavaVirtualUri(URI uri) {
+		String scheme = uri.getScheme();
+		if (scheme == null) {
+			return false;
+		}
+		String normalized = scheme.toLowerCase();
+		if (!"jar".equals(normalized) && !"jrt".equals(normalized) && !"decompiled".equals(normalized)) {
+			return false;
+		}
+		String asText = uri.toString().toLowerCase();
+		return asText.endsWith(".java") || asText.contains(".java!");
+	}
+
+	private String symbolAtPosition(String contents, Position position) {
+		String[] lines = contents.split("\\R", -1);
+		if (position.getLine() < 0 || position.getLine() >= lines.length) {
+			return null;
+		}
+		String line = lines[position.getLine()];
+		if (line.isEmpty()) {
+			return null;
+		}
+
+		int character = Math.max(0, Math.min(position.getCharacter(), line.length()));
+		int index = character;
+		if (index >= line.length()) {
+			index = line.length() - 1;
+		}
+		if (index < 0) {
+			return null;
+		}
+
+		if (!Character.isJavaIdentifierPart(line.charAt(index)) && index > 0
+				&& Character.isJavaIdentifierPart(line.charAt(index - 1))) {
+			index--;
+		}
+		if (!Character.isJavaIdentifierPart(line.charAt(index))) {
+			return null;
+		}
+
+		int start = index;
+		while (start > 0 && Character.isJavaIdentifierPart(line.charAt(start - 1))) {
+			start--;
+		}
+		int end = index + 1;
+		while (end < line.length() && Character.isJavaIdentifierPart(line.charAt(end))) {
+			end++;
+		}
+		return line.substring(start, end);
+	}
+
+	private String choosePreferredCandidate(String simpleName, String contents, List<String> candidates) {
+		String imported = importedTypeForSimpleName(simpleName, contents);
+		if (imported != null && candidates.contains(imported)) {
+			return imported;
+		}
+
+		String packageName = packageName(contents);
+		if (packageName != null && !packageName.isBlank()) {
+			List<String> samePackage = new ArrayList<>();
+			for (String candidate : candidates) {
+				if (candidate.startsWith(packageName + ".")) {
+					samePackage.add(candidate);
+				}
+			}
+			if (samePackage.size() == 1) {
+				return samePackage.get(0);
+			}
+		}
+
+		if (candidates.size() == 1) {
+			return candidates.get(0);
+		}
+
+		return null;
+	}
+
+	private String importedTypeForSimpleName(String simpleName, String contents) {
+		for (String line : contents.split("\\R", -1)) {
+			Matcher matcher = JAVA_IMPORT_PATTERN.matcher(line);
+			if (!matcher.matches()) {
+				continue;
+			}
+			String imported = matcher.group(1);
+			if (imported == null || imported.endsWith(".*")) {
+				continue;
+			}
+			int lastDot = imported.lastIndexOf('.');
+			if (lastDot >= 0 && imported.substring(lastDot + 1).equals(simpleName)) {
+				return imported;
+			}
+		}
+		return null;
+	}
+
+	private String packageName(String contents) {
+		for (String line : contents.split("\\R", -1)) {
+			Matcher matcher = JAVA_PACKAGE_PATTERN.matcher(line);
+			if (matcher.matches()) {
+				return matcher.group(1);
+			}
+		}
+		return null;
 	}
 
 	@Override

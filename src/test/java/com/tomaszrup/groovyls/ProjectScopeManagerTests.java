@@ -299,6 +299,46 @@ class ProjectScopeManagerTests {
 		Assertions.assertNull(scope);
 	}
 
+	@Test
+	void testFindProjectScopeResolvesJarUriByOuterFilePath() {
+		manager.registerDiscoveredProjects(Arrays.asList(PROJECT_A));
+
+		URI jarUri = URI.create("jar:" + PROJECT_A.resolve("libs/spock-core.jar").toUri() + "!/spock/lang/Specification.groovy");
+		ProjectScope scope = manager.findProjectScope(jarUri);
+
+		Assertions.assertNotNull(scope);
+		Assertions.assertEquals(PROJECT_A, scope.getProjectRoot());
+	}
+
+	@Test
+	void testFindProjectScopeUsesSingleProjectFallbackForNonFileUri() {
+		manager.registerDiscoveredProjects(Arrays.asList(PROJECT_A));
+
+		URI virtualUri = URI.create("decompiled://spock/lang/Specification.groovy");
+		ProjectScope scope = manager.findProjectScope(virtualUri);
+
+		Assertions.assertNotNull(scope);
+		Assertions.assertEquals(PROJECT_A, scope.getProjectRoot());
+	}
+
+	@Test
+	void testFindProjectScopeMatchesVirtualJarUriByClasspathJarNameAcrossProjects() {
+		manager.registerDiscoveredProjects(Arrays.asList(PROJECT_A, PROJECT_B));
+
+		Map<Path, List<String>> classpaths = new HashMap<>();
+		classpaths.put(PROJECT_A, Arrays.asList(
+				"/repo/org/spockframework/spock-core/2.4-M1-groovy-4.0/spock-core-2.4-M1-groovy-4.0.jar"));
+		classpaths.put(PROJECT_B, Arrays.asList(
+				"/repo/org/junit/junit/4.13.2/junit-4.13.2.jar"));
+		manager.updateProjectClasspaths(classpaths);
+
+		URI virtualJarUri = URI.create("jar:/spock-core-2.4-M1-groovy-4.0-sources.jar/spock.lang/Specification.java");
+		ProjectScope scope = manager.findProjectScope(virtualJarUri);
+
+		Assertions.assertNotNull(scope);
+		Assertions.assertEquals(PROJECT_A, scope.getProjectRoot());
+	}
+
 	// --- findProjectScopeByRoot ---
 
 	@Test
