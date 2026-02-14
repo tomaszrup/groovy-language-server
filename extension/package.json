@@ -1,8 +1,8 @@
 {
   "name": "groovy-spock-support",
-  "displayName": "Groovy & Spock Language Support",
-  "description": "Language support for Groovy and Spock",
-  "version": "0.3.3",
+  "displayName": "Groovy Code Intelligence",
+  "description": "Code intelligence for Groovy (and Spock)",
+  "version": "0.3.4",
   "publisher": "TomaszRup",
   "homepage": "https://github.com/tomaszrup/groovy-language-server",
   "repository": {
