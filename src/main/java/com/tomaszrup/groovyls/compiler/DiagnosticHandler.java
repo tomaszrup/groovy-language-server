@@ -21,9 +21,7 @@ package com.tomaszrup.groovyls.compiler;
 
 import java.net.URI;
 import java.nio.file.Files;
-import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -131,9 +129,8 @@ public class DiagnosticHandler {
 							return;
 						}
 						URI uri;
-						try {
-							uri = Paths.get(sourceLocator).toUri();
-						} catch (InvalidPathException e) {
+						uri = GroovyLanguageServerUtils.sourceLocatorToUri(sourceLocator);
+						if (uri == null) {
 							logger.debug("Skipping diagnostic with invalid source locator '{}': {}", sourceLocator, cause.getMessage());
 							return;
 						}
@@ -235,7 +232,10 @@ public class DiagnosticHandler {
 			return "<unavailable>";
 		}
 		try {
-			Path p = Paths.get(sourceLocator);
+			Path p = GroovyLanguageServerUtils.sourceLocatorToPath(sourceLocator);
+			if (p == null) {
+				return "<not-a-file>";
+			}
 			if (!Files.isRegularFile(p)) {
 				return "<not-a-file>";
 			}

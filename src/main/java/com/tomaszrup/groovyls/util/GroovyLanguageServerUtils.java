@@ -21,6 +21,9 @@
 package com.tomaszrup.groovyls.util;
 
 import java.net.URI;
+import java.nio.file.InvalidPathException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 
 import org.codehaus.groovy.ast.ASTNode;
 import org.codehaus.groovy.ast.ClassNode;
@@ -38,6 +41,58 @@ import org.eclipse.lsp4j.SymbolInformation;
 import org.eclipse.lsp4j.SymbolKind;
 
 public class GroovyLanguageServerUtils {
+	/**
+	 * Convert a Groovy source locator to a canonical URI.
+	 *
+	 * <p>Accepts both filesystem paths and URI-form locators (for example
+	 * {@code file:///c:/path/file.groovy}). Returns {@code null} for values
+	 * that cannot be normalized.</p>
+	 */
+	public static URI sourceLocatorToUri(String sourceLocator) {
+		if (sourceLocator == null || sourceLocator.isBlank()) {
+			return null;
+		}
+		String normalized = sourceLocator.trim();
+		if (normalized.regionMatches(true, 0, "file:", 0, 5)) {
+			try {
+				Path path = Paths.get(URI.create(normalized));
+				return path.normalize().toUri();
+			} catch (IllegalArgumentException e) {
+				return null;
+			}
+		}
+		int colonIndex = normalized.indexOf(':');
+		if (colonIndex > 1) {
+			try {
+				return URI.create(normalized);
+			} catch (IllegalArgumentException e) {
+				return null;
+			}
+		}
+		try {
+			return Paths.get(normalized).normalize().toUri();
+		} catch (IllegalArgumentException e) {
+			return null;
+		}
+	}
+
+	/**
+	 * Convert a Groovy source locator to a local filesystem path when possible.
+	 *
+	 * <p>Returns {@code null} for non-file URIs or invalid locators.</p>
+	 */
+	public static Path sourceLocatorToPath(String sourceLocator) {
+		URI uri = sourceLocatorToUri(sourceLocator);
+		if (uri == null || uri.getScheme() == null || !"file".equalsIgnoreCase(uri.getScheme())) {
+			return null;
+		}
+		try {
+			return Paths.get(uri);
+		} catch (InvalidPathException e) {
+			return null;
+		}
+	}
+
 	/**
 	 * Converts a Groovy position to a LSP position.
 	 * 

@@ -72,6 +72,9 @@ public class GroovyNodeToStringUtils {
 			builder.append(superClass.getNameWithoutPackage());
 		}
 		ClassNode[] interfaces = classNode.getInterfaces();
+		if ((interfaces == null || interfaces.length == 0)) {
+			interfaces = classNode.getUnresolvedInterfaces();
+		}
 		if (interfaces != null && interfaces.length > 0) {
 			builder.append(isTrait || classNode.isInterface() ? " extends " : " implements ");
 			for (int i = 0; i < interfaces.length; i++) {

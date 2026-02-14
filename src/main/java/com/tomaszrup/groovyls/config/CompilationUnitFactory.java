@@ -788,16 +788,16 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 		if (!stubsToRemove.isEmpty()) {
 			compilationUnit.removeSources(stubsToRemove);
 		}
-		logger.debug("javaStubTrace projectRoot={} removedPreviousStubs={}", effectiveRoot, stubsToRemove.size());
+		logger.trace("javaStubTrace projectRoot={} removedPreviousStubs={}", effectiveRoot, stubsToRemove.size());
 
 		// 2. Scan Java source directories for .java files
 		Map<String, Path> javaIndex = scanJavaSources(effectiveRoot);
 		if (javaIndex.isEmpty()) {
-			logger.debug("javaStubTrace projectRoot={} javaSourceCount=0", effectiveRoot);
+			logger.trace("javaStubTrace projectRoot={} javaSourceCount=0", effectiveRoot);
 			return;
 		}
-		logger.debug("javaStubTrace projectRoot={} javaSourceCount={}", effectiveRoot, javaIndex.size());
-		if (logger.isInfoEnabled()) {
+		logger.trace("javaStubTrace projectRoot={} javaSourceCount={}", effectiveRoot, javaIndex.size());
+		if (logger.isDebugEnabled()) {
 			List<String> discovered = new ArrayList<>();
 			for (String fqcn : javaIndex.keySet()) {
 				discovered.add(fqcn);
@@ -805,7 +805,7 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 			Collections.sort(discovered);
 			int limit = Math.min(discovered.size(), 12);
 			List<String> sample = discovered.subList(0, limit);
-			logger.info("javaStubSummary projectRoot={} javaSourceCount={} sample={}",
+			logger.debug("javaStubSummary projectRoot={} javaSourceCount={} sample={}",
 					effectiveRoot, discovered.size(), sample);
 		}
 
@@ -819,9 +819,7 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 			// (e.g. the .class file exists in build/classes/)
 			File classFileOnClasspath = findClassFileOnClasspath(fqcn);
 			if (classFileOnClasspath != null) {
-				logger.debug("javaStubTrace skip fqcn={} source={} reason=classOnClasspath classFile={}",
-						fqcn, javaSourcePath, classFileOnClasspath);
-				logger.info("javaStubDecision fqcn={} source={} action=skip classFile={}",
+				logger.trace("javaStubTrace skip fqcn={} source={} reason=classOnClasspath classFile={}",
 						fqcn, javaSourcePath, classFileOnClasspath);
 				continue;
 			}
@@ -852,31 +850,13 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 					compilationUnit.getClassLoader(),
 					compilationUnit.getErrorCollector());
 			compilationUnit.addSource(su);
-			logger.debug("javaStubTrace add fqcn={} source={} stubUri={}", fqcn, javaSourcePath, stubUri);
-			logger.info("javaStubDecision fqcn={} source={} action=add stubUri={}", fqcn, javaSourcePath, stubUri);
+			logger.trace("javaStubTrace add fqcn={} source={} stubUri={}", fqcn, javaSourcePath, stubUri);
 			added++;
 		}
 
 		if (added > 0) {
-			logger.info("Added {} Java source stub(s) to compilation unit", added);
+			logger.debug("Added {} Java source stub(s) to compilation unit", added);
 		}
-	}
-
-	/**
-	 * Checks whether a compiled {@code .class} file for the given
-	 * fully-qualified class name exists on any <em>directory</em> classpath
-	 * entry.  If so, no synthetic stub is needed because the Groovy compiler
-	 * will resolve the class from the classpath directly.
-	 *
-	 * <p><b>Important:</b> we deliberately do <em>not</em> use
-	 * {@code classLoader.loadClass(fqcn)} because the
-	 * {@link GroovyClassLoader} caches classes that were compiled from
-	 * previous stub source units.  Those cached classes would cause this
-	 * method to falsely return {@code true}, preventing fresh stubs from
-	 * being created after a Java file is moved/renamed.</p>
-	 */
-	private boolean isClassOnClasspath(String fqcn) {
-		return findClassFileOnClasspath(fqcn) != null;
 	}
 
 	private File findClassFileOnClasspath(String fqcn) {

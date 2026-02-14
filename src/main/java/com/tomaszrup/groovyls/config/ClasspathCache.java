@@ -51,7 +51,7 @@ public class ClasspathCache {
     private static final Logger logger = LoggerFactory.getLogger(ClasspathCache.class);
 
     /** Bump when the JSON schema changes to force cache invalidation. */
-    private static final int CACHE_VERSION = 3;
+    private static final int CACHE_VERSION = 4;
 
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 
@@ -81,12 +81,20 @@ public class ClasspathCache {
         public Map<String, String> stamps;
         /** Resolved classpath entries for this project. */
         public List<String> classpath;
+        /** Detected Groovy dependency version for this project, if known. */
+        public String groovyVersion;
 
         public ProjectCacheEntry() {}
 
         public ProjectCacheEntry(Map<String, String> stamps, List<String> classpath) {
             this.stamps = stamps;
             this.classpath = classpath;
+        }
+
+        public ProjectCacheEntry(Map<String, String> stamps, List<String> classpath, String groovyVersion) {
+            this.stamps = stamps;
+            this.classpath = classpath;
+            this.groovyVersion = groovyVersion;
         }
     }
 
@@ -167,6 +175,17 @@ public class ClasspathCache {
                             Map<Path, List<String>> classpaths,
                             Map<String, String> buildFileHashes,
                             List<Path> discoveredProjects) {
+        save(workspaceRoot, classpaths, Collections.emptyMap(), buildFileHashes, discoveredProjects);
+    }
+
+    /**
+     * Persist resolved classpaths and optional per-project Groovy versions.
+     */
+    public static void save(Path workspaceRoot,
+                            Map<Path, List<String>> classpaths,
+                            Map<Path, String> projectGroovyVersions,
+                            Map<String, String> buildFileHashes,
+                            List<Path> discoveredProjects) {
         Path cacheFile = getCacheFile(workspaceRoot);
         try {
             Files.createDirectories(cacheFile.getParent());
@@ -180,7 +199,8 @@ public class ClasspathCache {
             for (Map.Entry<Path, List<String>> entry : classpaths.entrySet()) {
                 String rootKey = entry.getKey().toAbsolutePath().normalize().toString();
                 Map<String, String> projectStamps = computeBuildFileStampsForProject(entry.getKey());
-                data.projects.put(rootKey, new ProjectCacheEntry(projectStamps, entry.getValue()));
+                String groovyVersion = projectGroovyVersions.get(entry.getKey());
+                data.projects.put(rootKey, new ProjectCacheEntry(projectStamps, entry.getValue(), groovyVersion));
             }
 
             // Also persist the legacy fields for diagnostic / tooling purposes
@@ -227,6 +247,17 @@ public class ClasspathCache {
                                     Path projectRoot,
                                     List<String> classpath,
                                     List<Path> discoveredProjects) {
+        mergeProject(workspaceRoot, projectRoot, classpath, null, discoveredProjects);
+    }
+
+    /**
+     * Merge one project's classpath and optional Groovy version into cache.
+     */
+    public static void mergeProject(Path workspaceRoot,
+                                    Path projectRoot,
+                                    List<String> classpath,
+                                    String groovyVersion,
+                                    List<Path> discoveredProjects) {
         Path cacheFile = getCacheFile(workspaceRoot);
         try {
             Files.createDirectories(cacheFile.getParent());
@@ -259,7 +290,7 @@ public class ClasspathCache {
 
             String rootKey = projectRoot.toAbsolutePath().normalize().toString();
             Map<String, String> projectStamps = computeBuildFileStampsForProject(projectRoot);
-            data.projects.put(rootKey, new ProjectCacheEntry(projectStamps, classpath));
+            data.projects.put(rootKey, new ProjectCacheEntry(projectStamps, classpath, groovyVersion));
             data.classpaths.put(rootKey, classpath);
 
             // Rebuild global stamps from all per-project stamps
@@ -374,6 +405,19 @@ public class ClasspathCache {
         ProjectCacheEntry entry = cached.projects.get(key);
         if (entry == null || entry.classpath == null) return Optional.empty();
         return Optional.of(entry.classpath);
+    }
+
+    /**
+     * Get the cached Groovy version for a single project, or empty if unknown.
+     */
+    public static Optional<String> getProjectGroovyVersion(CacheData cached, Path projectRoot) {
+        if (cached.projects == null) return Optional.empty();
+        String key = projectRoot.toAbsolutePath().normalize().toString();
+        ProjectCacheEntry entry = cached.projects.get(key);
+        if (entry == null || entry.groovyVersion == null || entry.groovyVersion.isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of(entry.groovyVersion);
     }
 
     /**

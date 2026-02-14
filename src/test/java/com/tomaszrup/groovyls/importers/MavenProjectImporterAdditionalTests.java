@@ -25,6 +25,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Comparator;
@@ -284,5 +285,21 @@ class MavenProjectImporterAdditionalTests {
         Assertions.assertEquals(projA, keys.get(0));
         Assertions.assertEquals(projB, keys.get(1));
         Assertions.assertEquals(projC, keys.get(2));
+    }
+
+    @Test
+    void testIsLegitMavenWrapperCmdWithLongHeader() throws Exception {
+        Method method = MavenProjectImporter.class.getDeclaredMethod("isLegitMavenWrapper", Path.class);
+        method.setAccessible(true);
+
+        Path wrapper = tempDir.resolve("mvnw.cmd");
+        String longCommentPrefix = "@REM " + "x".repeat(700) + System.lineSeparator();
+        String content = longCommentPrefix
+                + "@REM Apache Maven Wrapper startup batch script" + System.lineSeparator();
+        Files.writeString(wrapper, content);
+
+        boolean legit = (boolean) method.invoke(importer, wrapper);
+        Assertions.assertTrue(legit,
+                "Expected .cmd wrapper with delayed maven marker to be treated as legitimate");
     }
 }

@@ -27,8 +27,10 @@ import org.junit.jupiter.api.Test;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Optional;
 
 class MavenProjectImporterTests {
 
@@ -334,4 +336,130 @@ class MavenProjectImporterTests {
                 entry -> entry.endsWith("target" + java.io.File.separator + "classes")
                         || entry.endsWith("target/classes")));
     }
+
+        @Test
+        void testDetectProjectGroovyVersionFromPomDependency() throws IOException {
+        Path project = tempDir.resolve("groovy-project");
+        Files.createDirectories(project);
+        Files.writeString(project.resolve("pom.xml"),
+            "<project>\n"
+                + "  <modelVersion>4.0.0</modelVersion>\n"
+                + "  <groupId>test</groupId>\n"
+                + "  <artifactId>app</artifactId>\n"
+                + "  <version>1.0</version>\n"
+                + "  <dependencies>\n"
+                + "    <dependency>\n"
+                + "      <groupId>org.apache.groovy</groupId>\n"
+                + "      <artifactId>groovy</artifactId>\n"
+                + "      <version>5.0.4</version>\n"
+                + "    </dependency>\n"
+                + "  </dependencies>\n"
+                + "</project>\n");
+
+        Optional<String> detected = importer.detectProjectGroovyVersion(project, Arrays.asList(
+            "/repo/org/apache/groovy/groovy/4.0.30/groovy-4.0.30.jar"));
+
+        Assertions.assertTrue(detected.isPresent());
+        Assertions.assertEquals("5.0.4", detected.get());
+        }
+
+        @Test
+        void testDetectProjectGroovyVersionFromPomPropertyReference() throws IOException {
+        Path project = tempDir.resolve("groovy-property-project");
+        Files.createDirectories(project);
+        Files.writeString(project.resolve("pom.xml"),
+            "<project>\n"
+                + "  <modelVersion>4.0.0</modelVersion>\n"
+                + "  <groupId>test</groupId>\n"
+                + "  <artifactId>app</artifactId>\n"
+                + "  <version>1.0</version>\n"
+                + "  <properties>\n"
+                + "    <groovy.version>4.0.30</groovy.version>\n"
+                + "  </properties>\n"
+                + "  <dependencyManagement>\n"
+                + "    <dependencies>\n"
+                + "      <dependency>\n"
+                + "        <groupId>org.apache.groovy</groupId>\n"
+                + "        <artifactId>groovy-bom</artifactId>\n"
+                + "        <version>${groovy.version}</version>\n"
+                + "        <type>pom</type>\n"
+                + "        <scope>import</scope>\n"
+                + "      </dependency>\n"
+                + "    </dependencies>\n"
+                + "  </dependencyManagement>\n"
+                + "</project>\n");
+
+        Optional<String> detected = importer.detectProjectGroovyVersion(project, Arrays.asList(
+            "/repo/org/apache/groovy/groovy/5.0.4/groovy-5.0.4.jar"));
+
+        Assertions.assertTrue(detected.isPresent());
+        Assertions.assertEquals("4.0.30", detected.get());
+        }
+
+        @Test
+        void testDetectProjectGroovyVersionFallsBackToClasspathWhenPomHasNoGroovy() throws IOException {
+        Path project = tempDir.resolve("no-groovy-pom-project");
+        Files.createDirectories(project);
+        Files.writeString(project.resolve("pom.xml"),
+            "<project>\n"
+                + "  <modelVersion>4.0.0</modelVersion>\n"
+                + "  <groupId>test</groupId>\n"
+                + "  <artifactId>app</artifactId>\n"
+                + "  <version>1.0</version>\n"
+                + "</project>\n");
+
+        Optional<String> detected = importer.detectProjectGroovyVersion(project, Arrays.asList(
+            "/repo/org/apache/groovy/groovy/5.0.4/groovy-5.0.4.jar"));
+
+        Assertions.assertTrue(detected.isPresent());
+        Assertions.assertEquals("5.0.4", detected.get());
+        }
+
+        @Test
+        void testShouldMarkClasspathResolvedFalseForTargetOnlyWhenPomHasDependencies() throws IOException {
+        Path project = tempDir.resolve("target-only-with-deps");
+        Files.createDirectories(project.resolve("target/classes"));
+        Files.createDirectories(project.resolve("target/test-classes"));
+        Files.writeString(project.resolve("pom.xml"),
+            "<project>\n"
+                + "  <modelVersion>4.0.0</modelVersion>\n"
+                + "  <groupId>test</groupId>\n"
+                + "  <artifactId>app</artifactId>\n"
+                + "  <version>1.0</version>\n"
+                + "  <dependencies>\n"
+                + "    <dependency>\n"
+                + "      <groupId>org.spockframework</groupId>\n"
+                + "      <artifactId>spock-core</artifactId>\n"
+                + "      <version>2.4-M1-groovy-4.0</version>\n"
+                + "      <scope>test</scope>\n"
+                + "    </dependency>\n"
+                + "  </dependencies>\n"
+                + "</project>\n");
+
+        List<String> classpath = Arrays.asList(
+            project.resolve("target/classes").toString(),
+            project.resolve("target/test-classes").toString());
+
+        Assertions.assertFalse(importer.shouldMarkClasspathResolved(project, classpath));
+        }
+
+        @Test
+        void testShouldMarkClasspathResolvedTrueForTargetOnlyWhenPomHasNoDependencies() throws IOException {
+        Path project = tempDir.resolve("target-only-no-deps");
+        Files.createDirectories(project.resolve("target/classes"));
+        Files.createDirectories(project.resolve("target/test-classes"));
+        Files.writeString(project.resolve("pom.xml"),
+            "<project>\n"
+                + "  <modelVersion>4.0.0</modelVersion>\n"
+                + "  <groupId>test</groupId>\n"
+                + "  <artifactId>app</artifactId>\n"
+                + "  <version>1.0</version>\n"
+                + "</project>\n");
+
+        List<String> classpath = Arrays.asList(
+            project.resolve("target/classes").toString(),
+            project.resolve("target/test-classes").toString());
+
+        Assertions.assertTrue(importer.shouldMarkClasspathResolved(project, classpath));
+        }
 }

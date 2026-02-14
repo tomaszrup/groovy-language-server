@@ -131,6 +131,12 @@ public class ProjectScope {
 	private volatile boolean classpathResolved = false;
 
 	/**
+	 * Detected Groovy runtime version for this project scope, derived from
+	 * resolved dependencies/classpath (e.g. "4.0.30", "5.0.4").
+	 */
+	private volatile String detectedGroovyVersion;
+
+	/**
 	 * Whether compilation of this scope failed with an unrecoverable error
 	 * (typically {@link OutOfMemoryError}). When set, the scope will not
 	 * be retried until the classpath changes (which calls
@@ -276,6 +282,14 @@ public class ProjectScope {
 
 	public void setClasspathResolved(boolean classpathResolved) {
 		this.classpathResolved = classpathResolved;
+	}
+
+	public String getDetectedGroovyVersion() {
+		return detectedGroovyVersion;
+	}
+
+	public void setDetectedGroovyVersion(String detectedGroovyVersion) {
+		this.detectedGroovyVersion = detectedGroovyVersion;
 	}
 
 	public boolean isCompilationFailed() {

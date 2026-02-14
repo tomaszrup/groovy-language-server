@@ -634,6 +634,8 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             // applied immediately; invalid or missing projects remain
             // unresolved and will be resolved lazily on first didOpen.
             Map<Path, List<String>> projectClasspaths = new LinkedHashMap<>();
+            Map<Path, String> projectGroovyVersions = new LinkedHashMap<>();
+            Map<Path, Boolean> projectResolvedStates = new LinkedHashMap<>();
             int cacheHits = 0;
 
             if (cachedData != null && !allDiscoveredRoots.isEmpty()) {
@@ -641,8 +643,20 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                     if (ClasspathCache.isValidForProject(cachedData, root)) {
                         Optional<List<String>> cached = ClasspathCache.getProjectClasspath(cachedData, root);
                         if (cached.isPresent()) {
-                            projectClasspaths.put(root, cached.get());
-                            cacheHits++;
+                            List<String> cachedClasspath = cached.get();
+                            ProjectImporter importer = importerMapLocal.get(root);
+                            boolean markResolved = importer == null
+                                    || importer.shouldMarkClasspathResolved(root, cachedClasspath);
+                            projectClasspaths.put(root, cachedClasspath);
+                            projectResolvedStates.put(root, markResolved);
+                            ClasspathCache.getProjectGroovyVersion(cachedData, root)
+                                    .ifPresent(version -> projectGroovyVersions.put(root, version));
+                            if (markResolved) {
+                                cacheHits++;
+                            } else {
+                                logger.info("Cached classpath for {} is incomplete; applying classpath but keeping scope unresolved",
+                                        root);
+                            }
                         }
                     }
                 }
@@ -660,7 +674,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             projectImporterMap.putAll(importerMapLocal);
 
             if (!projectClasspaths.isEmpty()) {
-                groovyServices.updateProjectClasspaths(projectClasspaths);
+                groovyServices.updateProjectClasspaths(projectClasspaths, projectGroovyVersions, projectResolvedStates);
             }
 
             int unresolvedCount = allDiscoveredRoots.size() - cacheHits;

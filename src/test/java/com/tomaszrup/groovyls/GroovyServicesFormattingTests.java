@@ -632,6 +632,47 @@ class GroovyServicesFormattingTests {
 	}
 
 	@Test
+	void testFormattingKeepsImportsUsedOnlyInAnnotations() throws Exception {
+		Path filePath = srcRoot.resolve("FormatKeepsAnnotationImports.groovy");
+		String uri = filePath.toUri().toString();
+		String contents = "package com.example\n"
+				+ "\n"
+				+ "import spock.lang.Ignore\n"
+				+ "import spock.lang.Specification\n"
+				+ "\n"
+				+ "class AnnotationSpec extends Specification {\n"
+				+ "    @Ignore\n"
+				+ "    def \"this test is ignored\"() {\n"
+				+ "        expect:\n"
+				+ "        false\n"
+				+ "    }\n"
+				+ "}\n";
+		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents);
+		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+
+		DocumentFormattingParams params = new DocumentFormattingParams(
+				new TextDocumentIdentifier(uri), new FormattingOptions(4, true));
+		List<? extends TextEdit> edits = services.formatting(params).get();
+
+		String formatted = applyEdits(contents, edits);
+		String expected = "package com.example\n"
+				+ "\n"
+				+ "import spock.lang.Ignore\n"
+				+ "import spock.lang.Specification\n"
+				+ "\n"
+				+ "class AnnotationSpec extends Specification {\n"
+				+ "    @Ignore\n"
+				+ "    def \"this test is ignored\"() {\n"
+				+ "        expect:\n"
+				+ "        false\n"
+				+ "    }\n"
+				+ "}\n";
+
+		Assertions.assertEquals(expected, formatted,
+				"Formatting should keep imports that are referenced only via annotations");
+	}
+
+	@Test
 	void testFormattingCollapsesMultipleBlankLinesAfterImportsToOne() throws Exception {
 		Path filePath = srcRoot.resolve("FormatCollapseImportBlankLines.groovy");
 		String uri = filePath.toUri().toString();

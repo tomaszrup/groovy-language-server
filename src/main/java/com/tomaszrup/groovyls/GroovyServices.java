@@ -54,7 +54,6 @@ import org.eclipse.lsp4j.services.WorkspaceService;
 import com.tomaszrup.groovyls.compiler.ClasspathSymbolIndex;
 import com.tomaszrup.groovyls.compiler.ast.ASTNodeVisitor;
 import com.tomaszrup.groovyls.config.ICompilationUnitFactory;
-import com.tomaszrup.groovyls.util.JavaSourceLocator;
 import com.tomaszrup.groovyls.providers.CodeActionProvider;
 import com.tomaszrup.groovyls.providers.CompletionProvider;
 import com.tomaszrup.groovyls.providers.DefinitionProvider;
@@ -74,7 +73,9 @@ import com.tomaszrup.groovyls.providers.TypeDefinitionProvider;
 import com.tomaszrup.groovyls.providers.WorkspaceSymbolProvider;
 import com.tomaszrup.groovyls.providers.codeactions.OrganizeImportsAction;
 import com.tomaszrup.groovyls.util.FileContentsTracker;
+import com.tomaszrup.groovyls.util.JavaSourceLocator;
 import com.tomaszrup.groovyls.util.MdcProjectContext;
+import com.tomaszrup.groovyls.util.GroovyVersionDetector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -215,6 +216,30 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 
 	protected SemanticTokensProvider createSemanticTokensProvider(ASTNodeVisitor visitor) {
 		return new SemanticTokensProvider(visitor, fileContentsTracker);
+	}
+
+	protected SemanticTokensProvider createSemanticTokensProvider(ASTNodeVisitor visitor, ProjectScope scope) {
+		boolean groovy4Compatibility = isGroovy4ColumnCompatibilityRequired(scope);
+		return new SemanticTokensProvider(visitor, fileContentsTracker, groovy4Compatibility);
+	}
+
+	private boolean isGroovy4ColumnCompatibilityRequired(ProjectScope scope) {
+		try {
+			Integer runtimeMajor = GroovyVersionDetector.major(groovy.lang.GroovySystem.getVersion()).orElse(null);
+			if (runtimeMajor != null && runtimeMajor <= 4) {
+				return true;
+			}
+		} catch (Throwable t) {
+			logger.debug("Could not detect Groovy runtime version for semantic token compatibility: {}",
+					t.toString());
+		}
+
+		if (scope == null) {
+			return false;
+		}
+
+		Integer projectMajor = GroovyVersionDetector.major(scope.getDetectedGroovyVersion()).orElse(null);
+		return projectMajor != null && projectMajor <= 4;
 	}
 
 	private <T> CompletableFuture<T> failSoftRequest(String requestName, URI uri,
@@ -460,7 +485,23 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	}
 
 	public void updateProjectClasspaths(Map<Path, List<String>> projectClasspaths) {
-		scopeManager.updateProjectClasspaths(projectClasspaths);
+		updateProjectClasspaths(projectClasspaths, java.util.Collections.emptyMap());
+	}
+
+	public void updateProjectClasspaths(Map<Path, List<String>> projectClasspaths,
+									 Map<Path, String> projectGroovyVersions) {
+		updateProjectClasspaths(projectClasspaths, projectGroovyVersions, java.util.Collections.emptyMap());
+		// Compilation is NOT done here — scopes compile lazily on first
+		// interaction (didOpen, didChange, hover, etc.) or via background
+		// compilation submitted by onImportComplete().  This avoids the
+		// expensive O(open-tabs × projects) synchronous compilation that
+		// caused log spam and long import times in large workspaces.
+	}
+
+	public void updateProjectClasspaths(Map<Path, List<String>> projectClasspaths,
+								 Map<Path, String> projectGroovyVersions,
+								 Map<Path, Boolean> projectResolvedStates) {
+		scopeManager.updateProjectClasspaths(projectClasspaths, projectGroovyVersions, projectResolvedStates);
 		// Compilation is NOT done here — scopes compile lazily on first
 		// interaction (didOpen, didChange, hover, etc.) or via background
 		// compilation submitted by onImportComplete().  This avoids the
@@ -469,7 +510,12 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	}
 
 	public void addProjects(Map<Path, List<String>> projectClasspaths) {
-		Set<URI> openURIs = scopeManager.addProjects(projectClasspaths);
+		addProjects(projectClasspaths, java.util.Collections.emptyMap());
+	}
+
+	public void addProjects(Map<Path, List<String>> projectClasspaths,
+							 Map<Path, String> projectGroovyVersions) {
+		Set<URI> openURIs = scopeManager.addProjects(projectClasspaths, projectGroovyVersions);
 
 		// Deduplicate by scope to avoid compiling the same project multiple times
 		Map<ProjectScope, URI> scopeToRepresentativeURI = new java.util.LinkedHashMap<>();
@@ -567,58 +613,40 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 	@Override
 	public void didChange(DidChangeTextDocumentParams params) {
 		fileContentsTracker.didChange(params);
-		try {
-			URI traceUri = URI.create(params.getTextDocument().getUri());
-			boolean importOrPackageEdit = false;
-			List<TextDocumentContentChangeEvent> changes = params.getContentChanges();
-			if (changes != null) {
-				for (TextDocumentContentChangeEvent ev : changes) {
-					String t = ev.getText();
-					if (t != null && (t.contains("import ") || t.contains("package ")
-							|| t.contains("com."))) {
-						importOrPackageEdit = true;
-						break;
-					}
-				}
-			}
-			if (importOrPackageEdit && logger.isInfoEnabled()) {
-				String trackedContents = fileContentsTracker.getContents(traceUri);
-				if (trackedContents != null) {
-					List<String> imports = collectImportLines(trackedContents, 8);
-					logger.info("didChangeImports uri={} imports={}", traceUri, imports);
-				}
-			}
-		} catch (Exception ignored) {
-			// trace-only path
-		}
-		if (logger.isDebugEnabled()) {
+		if (logger.isDebugEnabled() || logger.isTraceEnabled()) {
 			try {
 				URI traceUri = URI.create(params.getTextDocument().getUri());
 				VersionedTextDocumentIdentifier doc = params.getTextDocument();
 				List<TextDocumentContentChangeEvent> changes = params.getContentChanges();
-				logger.debug("didChangeTrace uri={} version={} changeCount={}",
-						traceUri, doc != null ? doc.getVersion() : null,
-						changes != null ? changes.size() : 0);
+				boolean importOrPackageEdit = false;
 				if (changes != null) {
-					for (int i = 0; i < changes.size(); i++) {
-						TextDocumentContentChangeEvent ev = changes.get(i);
-						logger.debug(
-								"didChangeTrace change[{}] range={} rangeLength={} textPreview={} textCodepoints={}",
-								i,
-								ev.getRange(),
-								ev.getRangeLength(),
-								preview(ev.getText(), 160),
-								codepointPreview(ev.getText(), 40));
+					for (TextDocumentContentChangeEvent ev : changes) {
+						String text = ev.getText();
+						if (text != null && (text.contains("import ") || text.contains("package ")
+								|| text.contains("com."))) {
+							importOrPackageEdit = true;
+							break;
+						}
 					}
 				}
 
-				String trackedContents = fileContentsTracker.getContents(traceUri);
-				if (trackedContents != null) {
-					List<String> interestingImports = collectImportLines(trackedContents, 12);
-					logger.debug("didChangeTrace trackedImports uri={} imports={}", traceUri, interestingImports);
+				if (logger.isDebugEnabled()) {
+					logger.debug("didChangeTrace uri={} version={} changeCount={} importOrPackageEdit={}",
+							traceUri,
+							doc != null ? doc.getVersion() : null,
+							changes != null ? changes.size() : 0,
+							importOrPackageEdit);
+				}
+
+				if (importOrPackageEdit && logger.isTraceEnabled()) {
+					String trackedContents = fileContentsTracker.getContents(traceUri);
+					if (trackedContents != null) {
+						List<String> imports = collectImportLines(trackedContents, 12);
+						logger.trace("didChangeImports uri={} imports={}", traceUri, imports);
+					}
 				}
 			} catch (Exception e) {
-				logger.debug("didChangeTrace logging failed: {}", e.toString());
+				logger.trace("didChangeTrace logging failed: {}", e.toString());
 			}
 		}
 
@@ -1354,7 +1382,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 				return CompletableFuture.completedFuture(new SemanticTokens(Collections.emptyList()));
 			}
 
-			SemanticTokensProvider provider = createSemanticTokensProvider(visitor);
+			SemanticTokensProvider provider = createSemanticTokensProvider(visitor, scope);
 			Path projectRoot = scope.getProjectRoot();
 			return provider.provideSemanticTokensFull(params.getTextDocument())
 					.handle((tokens, throwable) -> {
@@ -1404,7 +1432,7 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 				return CompletableFuture.completedFuture(new SemanticTokens(Collections.emptyList()));
 			}
 
-			SemanticTokensProvider provider = createSemanticTokensProvider(visitor);
+			SemanticTokensProvider provider = createSemanticTokensProvider(visitor, scope);
 			Path projectRoot = scope.getProjectRoot();
 			return provider.provideSemanticTokensRange(params.getTextDocument(), params.getRange())
 					.handle((tokens, throwable) -> {
@@ -1623,28 +1651,6 @@ public class GroovyServices implements TextDocumentService, WorkspaceService, La
 			return normalized;
 		}
 		return normalized.substring(0, maxLen) + "...";
-	}
-
-	private static String codepointPreview(String text, int maxCodepoints) {
-		if (text == null) {
-			return "<null>";
-		}
-		StringBuilder sb = new StringBuilder();
-		int idx = 0;
-		int count = 0;
-		while (idx < text.length() && count < maxCodepoints) {
-			int cp = text.codePointAt(idx);
-			if (count > 0) {
-				sb.append(' ');
-			}
-			sb.append(String.format("U+%04X", cp));
-			idx += Character.charCount(cp);
-			count++;
-		}
-		if (idx < text.length()) {
-			sb.append(" ...");
-		}
-		return sb.toString();
 	}
 
 	private static List<String> collectImportLines(String text, int maxLines) {

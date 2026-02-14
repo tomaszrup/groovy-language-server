@@ -2,7 +2,7 @@
   "name": "groovy-spock-support",
   "displayName": "Groovy & Spock Language Support",
   "description": "Language support for Groovy and Spock",
-  "version": "0.2.2",
+  "version": "0.3.1",
   "publisher": "TomaszRup",
   "homepage": "https://github.com/tomaszrup/groovy-language-server",
   "repository": {
@@ -139,7 +139,7 @@
         },
         "groovy.logLevel": {
           "type": "string",
-          "default": "INFO",
+          "default": "WARN",
           "enum": ["ERROR", "WARN", "INFO", "DEBUG", "TRACE"],
           "description": "Set the log level for the Groovy language server. Lower levels produce more output. Changing this restarts the server."
         },

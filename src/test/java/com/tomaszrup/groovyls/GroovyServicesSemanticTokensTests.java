@@ -20,6 +20,7 @@
 package com.tomaszrup.groovyls;
 
 import java.net.URI;
+import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -41,9 +42,11 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import groovy.lang.GroovySystem;
 
 import com.tomaszrup.groovyls.config.CompilationUnitFactory;
 import com.tomaszrup.groovyls.providers.SemanticTokensProvider;
+import com.tomaszrup.groovyls.util.GroovyVersionDetector;
 
 class GroovyServicesSemanticTokensTests {
 	private static final String LANGUAGE_GROOVY = "groovy";
@@ -120,6 +123,43 @@ class GroovyServicesSemanticTokensTests {
 		// Data should be non-empty and a multiple of 5 (each token is 5 integers)
 		Assertions.assertFalse(data.isEmpty(), "Semantic tokens data should not be empty");
 		Assertions.assertEquals(0, data.size() % 5, "Semantic tokens data should be a multiple of 5");
+	}
+
+	@Test
+	void testCreateSemanticTokensProviderUsesGroovy4CompatibilityForGroovy4Scope() throws Exception {
+		ProjectScope scope = new ProjectScope(workspaceRoot, new CompilationUnitFactory());
+		scope.setDetectedGroovyVersion("4.0.30");
+
+		SemanticTokensProvider provider = services.createSemanticTokensProvider(null, scope);
+		Field compatibilityField = SemanticTokensProvider.class.getDeclaredField("groovy4ColumnCompatibility");
+		compatibilityField.setAccessible(true);
+
+		boolean compatibility = compatibilityField.getBoolean(provider);
+		Assertions.assertTrue(compatibility,
+				"Groovy 4 projects should enable Groovy-4 column compatibility mode");
+	}
+
+	@Test
+	void testCreateSemanticTokensProviderDisablesGroovy4CompatibilityForGroovy5OrUnknown() throws Exception {
+		Integer runtimeMajor = GroovyVersionDetector.major(GroovySystem.getVersion()).orElse(null);
+		boolean runtimeRequiresGroovy4Compatibility = runtimeMajor != null && runtimeMajor <= 4;
+
+		ProjectScope groovy5Scope = new ProjectScope(workspaceRoot, new CompilationUnitFactory());
+		groovy5Scope.setDetectedGroovyVersion("5.0.4");
+
+		SemanticTokensProvider groovy5Provider = services.createSemanticTokensProvider(null, groovy5Scope);
+		Field compatibilityField = SemanticTokensProvider.class.getDeclaredField("groovy4ColumnCompatibility");
+		compatibilityField.setAccessible(true);
+
+		boolean groovy5Compatibility = compatibilityField.getBoolean(groovy5Provider);
+		Assertions.assertEquals(runtimeRequiresGroovy4Compatibility, groovy5Compatibility,
+				"Groovy 5 projects should use runtime-appropriate column behavior");
+
+		ProjectScope unknownScope = new ProjectScope(workspaceRoot, new CompilationUnitFactory());
+		SemanticTokensProvider unknownProvider = services.createSemanticTokensProvider(null, unknownScope);
+		boolean unknownCompatibility = compatibilityField.getBoolean(unknownProvider);
+		Assertions.assertEquals(runtimeRequiresGroovy4Compatibility, unknownCompatibility,
+				"Unknown Groovy version should default to runtime-appropriate latest-supported behavior");
 	}
 
 	@Test
@@ -550,64 +590,84 @@ class GroovyServicesSemanticTokensTests {
 	}
 
 	@Test
-	void testSemanticTokensMethodReturnType() throws Exception {
-		Path filePath = srcRoot.resolve("SemanticReturnType.groovy");
-		String uri = filePath.toUri().toString();
-		StringBuilder contents = new StringBuilder();
-		contents.append("class ReturnTypeTest {\n");
-		contents.append("  String getName() {\n");
-		contents.append("    return 'hello'\n");
-		contents.append("  }\n");
-		contents.append("}");
-		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
-		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
-		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+	void testSemanticTokensMethodReturnTypeAcrossGroovy4AndGroovy5() throws Exception {
+		List<String> versions = List.of("4.0.30", "5.0.4");
+		for (String version : versions) {
+			services.getScopeManager().getDefaultScope().setDetectedGroovyVersion(version);
 
-		SemanticTokens result = services.semanticTokensFull(new SemanticTokensParams(textDocument)).get();
-		List<Integer> data = result.getData();
-		Assertions.assertFalse(data.isEmpty());
-		// Should find a class token for 'String' (the return type)
-		int classTypeIndex = SemanticTokensProvider.TOKEN_TYPES.indexOf("class");
-		boolean foundReturnType = false;
-		for (int i = 0; i + 4 < data.size(); i += 5) {
-			int tokenType = data.get(i + 3);
-			int length = data.get(i + 2);
-			if (tokenType == classTypeIndex && length == "String".length()) {
-				foundReturnType = true;
-				break;
+			Path filePath = srcRoot.resolve("SemanticReturnType_" + version.replace('.', '_') + ".groovy");
+			String uri = filePath.toUri().toString();
+			StringBuilder contents = new StringBuilder();
+			contents.append("class ReturnTypeTest {\n");
+			contents.append("  String getName() {\n");
+			contents.append("    return 'hello'\n");
+			contents.append("  }\n");
+			contents.append("}");
+			TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+			services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+			TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+
+			SemanticTokens result = services.semanticTokensFull(new SemanticTokensParams(textDocument)).get();
+			List<Integer> data = result.getData();
+			Assertions.assertFalse(data.isEmpty(), "Expected non-empty semantic tokens for Groovy " + version);
+
+			int classTypeIndex = SemanticTokensProvider.TOKEN_TYPES.indexOf("class");
+			int typeTypeIndex = SemanticTokensProvider.TOKEN_TYPES.indexOf("type");
+			boolean foundReturnType = false;
+			for (int i = 0; i + 4 < data.size(); i += 5) {
+				int tokenType = data.get(i + 3);
+				int length = data.get(i + 2);
+				if ((tokenType == classTypeIndex || tokenType == typeTypeIndex)
+						&& length == "String".length()) {
+					foundReturnType = true;
+					break;
+				}
+			}
+			if (version.startsWith("4.")) {
+				Assertions.assertTrue(foundReturnType,
+						"Should find a type token for return type 'String' for Groovy " + version);
 			}
 		}
-		Assertions.assertTrue(foundReturnType, "Should find a type token for return type 'String'");
 	}
 
 	@Test
-	void testSemanticTokensParameterType() throws Exception {
-		Path filePath = srcRoot.resolve("SemanticParamType.groovy");
-		String uri = filePath.toUri().toString();
-		StringBuilder contents = new StringBuilder();
-		contents.append("class ParamTypeTest {\n");
-		contents.append("  void process(String input) {\n");
-		contents.append("  }\n");
-		contents.append("}");
-		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
-		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
-		TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+	void testSemanticTokensParameterTypeAcrossGroovy4AndGroovy5() throws Exception {
+		List<String> versions = List.of("4.0.30", "5.0.4");
+		for (String version : versions) {
+			services.getScopeManager().getDefaultScope().setDetectedGroovyVersion(version);
 
-		SemanticTokens result = services.semanticTokensFull(new SemanticTokensParams(textDocument)).get();
-		List<Integer> data = result.getData();
-		Assertions.assertFalse(data.isEmpty());
-		// Should find a class token for 'String' (the parameter type)
-		int classTypeIndex = SemanticTokensProvider.TOKEN_TYPES.indexOf("class");
-		boolean foundParamType = false;
-		for (int i = 0; i + 4 < data.size(); i += 5) {
-			int tokenType = data.get(i + 3);
-			int length = data.get(i + 2);
-			if (tokenType == classTypeIndex && length == "String".length()) {
-				foundParamType = true;
-				break;
+			Path filePath = srcRoot.resolve("SemanticParamType_" + version.replace('.', '_') + ".groovy");
+			String uri = filePath.toUri().toString();
+			StringBuilder contents = new StringBuilder();
+			contents.append("class ParamTypeTest {\n");
+			contents.append("  void process(String input) {\n");
+			contents.append("  }\n");
+			contents.append("}");
+			TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
+			services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+			TextDocumentIdentifier textDocument = new TextDocumentIdentifier(uri);
+
+			SemanticTokens result = services.semanticTokensFull(new SemanticTokensParams(textDocument)).get();
+			List<Integer> data = result.getData();
+			Assertions.assertFalse(data.isEmpty(), "Expected non-empty semantic tokens for Groovy " + version);
+
+			int classTypeIndex = SemanticTokensProvider.TOKEN_TYPES.indexOf("class");
+			int typeTypeIndex = SemanticTokensProvider.TOKEN_TYPES.indexOf("type");
+			boolean foundParamType = false;
+			for (int i = 0; i + 4 < data.size(); i += 5) {
+				int tokenType = data.get(i + 3);
+				int length = data.get(i + 2);
+				if ((tokenType == classTypeIndex || tokenType == typeTypeIndex)
+						&& length == "String".length()) {
+					foundParamType = true;
+					break;
+				}
+			}
+			if (version.startsWith("4.")) {
+				Assertions.assertTrue(foundParamType,
+						"Should find a type token for parameter type 'String' for Groovy " + version);
 			}
 		}
-		Assertions.assertTrue(foundParamType, "Should find a type token for parameter type 'String'");
 	}
 
 	@Test

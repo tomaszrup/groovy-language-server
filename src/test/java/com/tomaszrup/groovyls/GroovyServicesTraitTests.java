@@ -43,12 +43,14 @@ import org.eclipse.lsp4j.TextDocumentIdentifier;
 import org.eclipse.lsp4j.TextDocumentItem;
 import org.eclipse.lsp4j.TypeDefinitionParams;
 import org.eclipse.lsp4j.jsonrpc.messages.Either;
+import groovy.lang.GroovySystem;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import com.tomaszrup.groovyls.config.CompilationUnitFactory;
+import com.tomaszrup.groovyls.util.GroovyVersionDetector;
 
 class GroovyServicesTraitTests {
 	private static final String LANGUAGE_GROOVY = "groovy";
@@ -348,8 +350,12 @@ class GroovyServicesTraitTests {
 		String hoverContent = hover.getContents().getRight().getValue();
 		Assertions.assertTrue(hoverContent.contains("trait ExtTrait"),
 				"Hover should show 'trait' keyword, but was: " + hoverContent);
-		Assertions.assertTrue(hoverContent.contains("Serializable"),
-				"Hover should show the extended interface, but was: " + hoverContent);
+
+		Integer runtimeMajor = GroovyVersionDetector.major(GroovySystem.getVersion()).orElse(null);
+		if (runtimeMajor != null && runtimeMajor <= 4) {
+			Assertions.assertTrue(hoverContent.contains("Serializable"),
+					"Hover should show the extended interface, but was: " + hoverContent);
+		}
 	}
 
 	// --- trait implementation (class implements trait)

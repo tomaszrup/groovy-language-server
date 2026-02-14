@@ -24,8 +24,10 @@ import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import com.google.gson.JsonObject;
+import com.tomaszrup.groovyls.util.GroovyVersionDetector;
 
 /**
  * Abstraction for build-tool-specific project discovery, classpath resolution,
@@ -231,5 +233,37 @@ public interface ProjectImporter {
                 // best effort — compilation failure should not block startup
             }
         }
+    }
+
+    /**
+     * Best-effort detection of the project's Groovy dependency version.
+     * Implementers can override with build-tool-specific metadata extraction.
+     *
+     * <p>The default implementation infers version from classpath entries.</p>
+     *
+     * @param projectRoot      project root
+     * @param classpathEntries resolved classpath entries
+     * @return detected Groovy version, if known
+     */
+    default Optional<String> detectProjectGroovyVersion(Path projectRoot, List<String> classpathEntries) {
+        return GroovyVersionDetector.detect(classpathEntries);
+    }
+
+    /**
+     * Determines whether a resolved classpath should mark the project scope as
+     * fully resolved.
+     *
+     * <p>The default behavior treats any returned classpath as resolved.
+     * Importers can override this to keep scopes unresolved when classpath
+     * quality is insufficient (for example, Maven fallback that only contains
+     * {@code target/classes} and {@code target/test-classes} without external
+     * dependencies).</p>
+     *
+     * @param projectRoot the project root
+     * @param classpathEntries resolved classpath entries
+     * @return {@code true} if the scope should be marked classpath-resolved
+     */
+    default boolean shouldMarkClasspathResolved(Path projectRoot, List<String> classpathEntries) {
+        return true;
     }
 }

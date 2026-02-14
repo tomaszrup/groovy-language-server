@@ -25,10 +25,14 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 
 class GradleProjectImporterTests {
 
@@ -197,5 +201,34 @@ class GradleProjectImporterTests {
         List<Path> discovered = importer.discoverProjects(tempDir);
         Assertions.assertEquals(1, discovered.size());
         Assertions.assertEquals(project, discovered.get(0));
+    }
+
+    @Test
+    void testDetectProjectGroovyVersionFallsBackToClasspath() {
+        Optional<String> detected = importer.detectProjectGroovyVersion(
+                tempDir,
+                Arrays.asList("/repo/org/apache/groovy/groovy/5.0.4/groovy-5.0.4.jar"));
+
+        Assertions.assertTrue(detected.isPresent());
+        Assertions.assertEquals("5.0.4", detected.get());
+    }
+
+    @Test
+    void testDetectProjectGroovyVersionUsesCachedDetectedValue() throws Exception {
+        Path project = tempDir.resolve("cached-version-project").toAbsolutePath().normalize();
+        Files.createDirectories(project);
+
+        Field f = GradleProjectImporter.class.getDeclaredField("detectedGroovyVersionByProject");
+        f.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        Map<String, String> cache = (Map<String, String>) f.get(importer);
+        cache.put(project.toString().replace('\\', '/').toLowerCase(), "4.0.30");
+
+        Optional<String> detected = importer.detectProjectGroovyVersion(
+                project,
+                Arrays.asList("/repo/org/apache/groovy/groovy/5.0.4/groovy-5.0.4.jar"));
+
+        Assertions.assertTrue(detected.isPresent());
+        Assertions.assertEquals("4.0.30", detected.get());
     }
 }

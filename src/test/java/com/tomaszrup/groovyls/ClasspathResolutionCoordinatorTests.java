@@ -23,6 +23,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -160,6 +161,89 @@ class ClasspathResolutionCoordinatorTests {
 			Thread.sleep(100);
 		}
 		Assertions.assertFalse(scopeManager.isResolutionInFlight(PROJECT_A));
+	}
+
+	@Test
+	void testRequestResolutionPropagatesImporterDetectedGroovyVersion() throws Exception {
+		CountDownLatch resolveCalled = new CountDownLatch(1);
+		List<String> resolvedClasspath = Arrays.asList("/repo/org/apache/groovy/groovy/5.0.4/groovy-5.0.4.jar");
+
+		ProjectImporter stubImporter = new ProjectImporter() {
+			@Override public String getName() { return "StubImporter"; }
+			@Override public List<Path> discoverProjects(Path root) { return Collections.emptyList(); }
+			@Override public List<String> importProject(Path root) { return resolvedClasspath; }
+			@Override public List<String> resolveClasspath(Path root) {
+				resolveCalled.countDown();
+				return resolvedClasspath;
+			}
+			@Override public Optional<String> detectProjectGroovyVersion(Path projectRoot, List<String> classpathEntries) {
+				return Optional.of("4.0.30");
+			}
+			@Override public void recompile(Path root) {}
+			@Override public boolean isProjectFile(String path) { return false; }
+			@Override public boolean claimsProject(Path root) { return true; }
+		};
+		importerMap.put(PROJECT_A, stubImporter);
+
+		scopeManager.registerDiscoveredProjects(Arrays.asList(PROJECT_A));
+		ProjectScope scope = scopeManager.findProjectScopeByRoot(PROJECT_A);
+
+		coordinator.requestResolution(scope, PROJECT_A.resolve("src/Main.groovy").toUri());
+
+		boolean called = resolveCalled.await(10, TimeUnit.SECONDS);
+		Assertions.assertTrue(called, "resolveClasspath should be called within timeout");
+
+		long deadline = System.currentTimeMillis() + 10_000;
+		while (!scope.isClasspathResolved() && System.currentTimeMillis() < deadline) {
+			Thread.sleep(100);
+		}
+
+		Assertions.assertTrue(scope.isClasspathResolved());
+		Assertions.assertEquals("4.0.30", scope.getDetectedGroovyVersion(),
+				"Scope should use importer-provided Groovy version");
+	}
+
+	@Test
+	void testRequestResolutionKeepsScopeUnresolvedWhenImporterMarksClasspathIncomplete() throws Exception {
+		CountDownLatch resolveCalled = new CountDownLatch(1);
+		List<String> targetOnlyClasspath = Arrays.asList(
+				PROJECT_A.resolve("target/classes").toString(),
+				PROJECT_A.resolve("target/test-classes").toString());
+
+		ProjectImporter stubImporter = new ProjectImporter() {
+			@Override public String getName() { return "StubImporter"; }
+			@Override public List<Path> discoverProjects(Path root) { return Collections.emptyList(); }
+			@Override public List<String> importProject(Path root) { return targetOnlyClasspath; }
+			@Override public List<String> resolveClasspath(Path root) {
+				resolveCalled.countDown();
+				return targetOnlyClasspath;
+			}
+			@Override public boolean shouldMarkClasspathResolved(Path root, List<String> classpathEntries) {
+				return false;
+			}
+			@Override public void recompile(Path root) {}
+			@Override public boolean isProjectFile(String path) { return false; }
+			@Override public boolean claimsProject(Path root) { return true; }
+		};
+		importerMap.put(PROJECT_A, stubImporter);
+
+		scopeManager.registerDiscoveredProjects(Arrays.asList(PROJECT_A));
+		ProjectScope scope = scopeManager.findProjectScopeByRoot(PROJECT_A);
+
+		coordinator.requestResolution(scope, PROJECT_A.resolve("src/Main.groovy").toUri());
+
+		boolean called = resolveCalled.await(10, TimeUnit.SECONDS);
+		Assertions.assertTrue(called, "resolveClasspath should be called within timeout");
+
+		long deadline = System.currentTimeMillis() + 10_000;
+		while (scopeManager.isResolutionInFlight(PROJECT_A) && System.currentTimeMillis() < deadline) {
+			Thread.sleep(100);
+		}
+
+		Assertions.assertFalse(scope.isClasspathResolved(),
+				"Scope should remain unresolved when importer marks classpath incomplete");
+		Assertions.assertEquals(ClasspathResolutionCoordinator.ResolutionState.FAILED,
+				coordinator.getResolutionState(PROJECT_A));
 	}
 
 	// --- shutdown ---

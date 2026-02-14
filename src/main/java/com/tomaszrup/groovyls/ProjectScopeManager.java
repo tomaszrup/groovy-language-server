@@ -44,6 +44,7 @@ import com.tomaszrup.groovyls.compiler.SharedClasspathIndexCache;
 import com.tomaszrup.groovyls.config.CompilationUnitFactory;
 import com.tomaszrup.groovyls.config.ICompilationUnitFactory;
 import com.tomaszrup.groovyls.util.FileContentsTracker;
+import com.tomaszrup.groovyls.util.GroovyVersionDetector;
 import com.tomaszrup.groovyls.util.MemoryProfiler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -361,12 +362,36 @@ public class ProjectScopeManager {
 	 * first user interaction.
 	 */
 	public void updateProjectClasspaths(Map<Path, List<String>> projectClasspaths) {
+		updateProjectClasspaths(projectClasspaths, Collections.emptyMap());
+	}
+
+	/**
+	 * Update existing project scopes with their resolved classpaths and
+	 * optional Groovy version metadata.
+	 */
+	public void updateProjectClasspaths(Map<Path, List<String>> projectClasspaths,
+									 Map<Path, String> projectGroovyVersions) {
+		updateProjectClasspaths(projectClasspaths, projectGroovyVersions, Collections.emptyMap());
+	}
+
+	/**
+	 * Update existing project scopes with their resolved classpaths,
+	 * optional Groovy version metadata and optional per-project resolved-state flags.
+	 */
+	public void updateProjectClasspaths(Map<Path, List<String>> projectClasspaths,
+									 Map<Path, String> projectGroovyVersions,
+									 Map<Path, Boolean> projectResolvedStates) {
 		logger.info("updateProjectClasspaths called with {} projects", projectClasspaths.size());
 		List<ProjectScope> scopes = projectScopes;
 
 		for (ProjectScope scope : scopes) {
 			List<String> classpath = projectClasspaths.get(scope.getProjectRoot());
 			if (classpath != null) {
+				boolean markResolved = projectResolvedStates.getOrDefault(scope.getProjectRoot(), true);
+				String detectedGroovyVersion = projectGroovyVersions.get(scope.getProjectRoot());
+				if (detectedGroovyVersion == null || detectedGroovyVersion.isEmpty()) {
+					detectedGroovyVersion = GroovyVersionDetector.detect(classpath).orElse(null);
+				}
 				// Clean stale .class files before applying the classpath so
 				// deleted source files don't remain visible to the compiler.
 				if (scope.getProjectRoot() != null) {
@@ -377,7 +402,8 @@ public class ProjectScopeManager {
 				try {
 					scope.getCompilationUnitFactory()
 							.setAdditionalClasspathList(classpath);
-					scope.setClasspathResolved(true);
+					scope.setClasspathResolved(markResolved);
+					scope.setDetectedGroovyVersion(detectedGroovyVersion);
 					// Index dependency source JARs for Go to Definition
 					scope.updateSourceLocatorClasspath(classpath);
 					// Classpath changed — evict stale Javadoc cache entries
@@ -391,6 +417,9 @@ public class ProjectScopeManager {
 					}
 				} finally {
 					scope.getLock().writeLock().unlock();
+				}
+				if (!markResolved) {
+					logger.info("Applied classpath for {} but keeping scope unresolved", scope.getProjectRoot());
 				}
 			}
 		}
@@ -406,10 +435,33 @@ public class ProjectScopeManager {
 	 * @return the updated scope, or {@code null} if no matching scope was found
 	 */
 	public ProjectScope updateProjectClasspath(Path projectRoot, List<String> classpath) {
+		return updateProjectClasspath(projectRoot, classpath, null);
+	}
+
+	/**
+	 * Update a single project scope with its resolved classpath and optional
+	 * Groovy version metadata.
+	 */
+	public ProjectScope updateProjectClasspath(Path projectRoot, List<String> classpath, String groovyVersion) {
+		return updateProjectClasspath(projectRoot, classpath, groovyVersion, true);
+	}
+
+	/**
+	 * Update a single project scope with its resolved classpath and optional
+	 * Groovy version metadata, with explicit control of classpath-resolved state.
+	 */
+	public ProjectScope updateProjectClasspath(Path projectRoot,
+									 List<String> classpath,
+									 String groovyVersion,
+									 boolean markResolved) {
 		ProjectScope scope = findProjectScopeByRoot(projectRoot);
 		if (scope == null) {
 			logger.warn("updateProjectClasspath: no scope found for {}", projectRoot);
 			return null;
+		}
+		String detectedGroovyVersion = groovyVersion;
+		if (detectedGroovyVersion == null || detectedGroovyVersion.isEmpty()) {
+			detectedGroovyVersion = GroovyVersionDetector.detect(classpath).orElse(null);
 		}
 		// Clean stale .class files before applying the classpath
 		if (projectRoot != null) {
@@ -419,7 +471,8 @@ public class ProjectScopeManager {
 		scope.getLock().writeLock().lock();
 		try {
 			scope.getCompilationUnitFactory().setAdditionalClasspathList(classpath);
-			scope.setClasspathResolved(true);
+			scope.setClasspathResolved(markResolved);
+			scope.setDetectedGroovyVersion(detectedGroovyVersion);
 			// Reset any previous OOM failure — the classpath change may
 			// have reduced memory requirements (fewer deps) or the user
 			// may have increased -Xmx.
@@ -438,7 +491,8 @@ public class ProjectScopeManager {
 		} finally {
 			scope.getLock().writeLock().unlock();
 		}
-		logger.info("Updated classpath for project {} ({} entries)", projectRoot, classpath.size());
+		logger.info("Updated classpath for project {} ({} entries, resolved={})",
+				projectRoot, classpath.size(), markResolved);
 		return scope;
 	}
 
@@ -448,13 +502,22 @@ public class ProjectScopeManager {
 	 * @return set of open URIs that need compilation
 	 */
 	public Set<URI> addProjects(Map<Path, List<String>> projectClasspaths) {
+		return addProjects(projectClasspaths, Collections.emptyMap());
+	}
+
+	/**
+	 * Register all build-tool projects at once with their resolved classpaths
+	 * and optional Groovy version metadata.
+	 */
+	public Set<URI> addProjects(Map<Path, List<String>> projectClasspaths,
+								 Map<Path, String> projectGroovyVersions) {
 		invalidateWorkspaceLocalClasspathCaches(new ArrayList<>(projectClasspaths.keySet()));
 
 		synchronized (scopesMutationLock) {
-			logger.info("addProjects called with {} projects", projectClasspaths.size());
+			logger.debug("addProjects called with {} projects", projectClasspaths.size());
 			List<Path> projectRoots = new ArrayList<>(projectClasspaths.keySet());
 			for (Path p : projectRoots) {
-				logger.info("  project root: {}, classpath entries: {}", p, projectClasspaths.get(p).size());
+				logger.debug("  project root: {}, classpath entries: {}", p, projectClasspaths.get(p).size());
 			}
 
 			List<ProjectScope> newScopes = new ArrayList<>();
@@ -470,12 +533,17 @@ public class ProjectScopeManager {
 						excludedRoots.add(other);
 					}
 				}
-				logger.info("  Project {}: excluding {} subproject root(s): {}", projectRoot, excludedRoots.size(),
+				logger.debug("  Project {}: excluding {} subproject root(s): {}", projectRoot, excludedRoots.size(),
 						excludedRoots);
 				factory.setExcludedSubRoots(excludedRoots);
 
 				ProjectScope scope = new ProjectScope(projectRoot, factory);
 				scope.setClasspathResolved(true);
+				String detectedGroovyVersion = projectGroovyVersions.get(projectRoot);
+				if (detectedGroovyVersion == null || detectedGroovyVersion.isEmpty()) {
+					detectedGroovyVersion = GroovyVersionDetector.detect(classpath).orElse(null);
+				}
+				scope.setDetectedGroovyVersion(detectedGroovyVersion);
 				// Index dependency source JARs for Go to Definition
 				scope.updateSourceLocatorClasspath(classpath);
 				newScopes.add(scope);
@@ -484,6 +552,7 @@ public class ProjectScopeManager {
 			newScopes.sort((a, b) -> b.getProjectRoot().toString().length() - a.getProjectRoot().toString().length());
 			projectScopes = Collections.unmodifiableList(newScopes);
 			scopeCache.clear();
+			logger.info("Registered {} project scope(s)", newScopes.size());
 		}
 
 		clearDefaultScopeDiagnostics();

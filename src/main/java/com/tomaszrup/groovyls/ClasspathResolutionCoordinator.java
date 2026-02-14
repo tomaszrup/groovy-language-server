@@ -176,6 +176,10 @@ public class ClasspathResolutionCoordinator {
 
         // Resolve classpath for this single project
         List<String> classpath = importer.resolveClasspath(projectRoot);
+        boolean markResolved = importer.shouldMarkClasspathResolved(projectRoot, classpath);
+        String detectedGroovyVersion = importer
+            .detectProjectGroovyVersion(projectRoot, classpath)
+            .orElse(null);
 
         long elapsed = System.currentTimeMillis() - start;
         String resolvedMsg = "Classpath resolved for " + projectRoot.getFileName()
@@ -184,8 +188,18 @@ public class ClasspathResolutionCoordinator {
         sendStatusUpdate("ready", resolvedMsg);
 
         // Apply to scope
-        ProjectScope updatedScope = scopeManager.updateProjectClasspath(projectRoot, classpath);
-        transitionState(projectRoot, ResolutionState.RESOLVED);
+        ProjectScope updatedScope = scopeManager.updateProjectClasspath(
+            projectRoot, classpath, detectedGroovyVersion, markResolved);
+        if (markResolved) {
+            transitionState(projectRoot, ResolutionState.RESOLVED);
+        } else {
+            logger.warn("Classpath for {} applied but scope remains unresolved", projectRoot);
+            transitionState(projectRoot, ResolutionState.FAILED);
+            String retryMsg = "Classpath for " + projectRoot.getFileName()
+                    + " is incomplete (target-only). Dependencies will be retried on next file open.";
+            logProgress(retryMsg);
+            sendStatusUpdate("importing", retryMsg);
+        }
 
         // Compile Java/Kotlin sources so that .class files are up to date
         // before Groovy compilation.  The lazy resolve only resolves
@@ -200,8 +214,12 @@ public class ClasspathResolutionCoordinator {
         }
 
         // Save to cache
-        if (classpathCacheEnabled && workspaceRoot != null) {
-            ClasspathCache.mergeProject(workspaceRoot, projectRoot, classpath, allDiscoveredRoots);
+        if (classpathCacheEnabled && workspaceRoot != null && markResolved) {
+            String cachedGroovyVersion = updatedScope != null
+                ? updatedScope.getDetectedGroovyVersion()
+                : null;
+            ClasspathCache.mergeProject(workspaceRoot, projectRoot, classpath,
+                cachedGroovyVersion, allDiscoveredRoots);
         }
 
         // Compile if the scope has open files
@@ -315,12 +333,26 @@ public class ClasspathResolutionCoordinator {
             for (Map.Entry<Path, List<String>> entry : batchResult.entrySet()) {
                 Path root = entry.getKey();
                 List<String> classpath = entry.getValue();
+                boolean markResolved = importer.shouldMarkClasspathResolved(root, classpath);
+                String detectedGroovyVersion = importer
+                    .detectProjectGroovyVersion(root, classpath)
+                    .orElse(null);
 
-                scopeManager.updateProjectClasspath(root, classpath);
-                transitionState(root, ResolutionState.RESOLVED);
+                ProjectScope updatedScope = scopeManager.updateProjectClasspath(
+                    root, classpath, detectedGroovyVersion, markResolved);
+                if (markResolved) {
+                    transitionState(root, ResolutionState.RESOLVED);
+                } else {
+                    transitionState(root, ResolutionState.FAILED);
+                    logger.warn("Backfill classpath for {} is incomplete (target-only); scope remains unresolved", root);
+                }
 
-                if (classpathCacheEnabled && workspaceRoot != null) {
-                    ClasspathCache.mergeProject(workspaceRoot, root, classpath, allDiscoveredRoots);
+                if (classpathCacheEnabled && workspaceRoot != null && markResolved) {
+                    String cachedGroovyVersion = updatedScope != null
+                            ? updatedScope.getDetectedGroovyVersion()
+                            : null;
+                    ClasspathCache.mergeProject(workspaceRoot, root, classpath,
+                        cachedGroovyVersion, allDiscoveredRoots);
                 }
             }
 

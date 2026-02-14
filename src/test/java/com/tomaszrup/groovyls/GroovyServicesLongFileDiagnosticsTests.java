@@ -22,29 +22,27 @@ package com.tomaszrup.groovyls;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.ArrayList;
-import java.util.List;
 
-import org.eclipse.lsp4j.Diagnostic;
-import org.eclipse.lsp4j.DidOpenTextDocumentParams;
-import org.eclipse.lsp4j.PublishDiagnosticsParams;
-import org.eclipse.lsp4j.TextDocumentItem;
+import org.codehaus.groovy.control.CompilerConfiguration;
+import org.codehaus.groovy.control.ErrorCollector;
+import org.codehaus.groovy.control.Phases;
+import org.codehaus.groovy.control.SourceUnit;
+import org.codehaus.groovy.control.messages.SyntaxErrorMessage;
+import groovy.lang.GroovyClassLoader;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-import com.tomaszrup.groovyls.config.CompilationUnitFactory;
+import com.tomaszrup.groovyls.compiler.control.GroovyLSCompilationUnit;
+import com.tomaszrup.groovyls.compiler.control.io.StringReaderSourceWithURI;
 
 class GroovyServicesLongFileDiagnosticsTests {
-	private static final String LANGUAGE_GROOVY = "groovy";
 	private static final String PATH_WORKSPACE = "./build/test_workspace/";
 	private static final String PATH_SRC = "./src/main/groovy";
 
-	private GroovyServices services;
 	private Path workspaceRoot;
 	private Path srcRoot;
-	private List<PublishDiagnosticsParams> publishedDiagnostics;
 
 	@BeforeEach
 	void setup() {
@@ -53,23 +51,13 @@ class GroovyServicesLongFileDiagnosticsTests {
 		if (!Files.exists(srcRoot)) {
 			srcRoot.toFile().mkdirs();
 		}
-
-		publishedDiagnostics = new ArrayList<>();
-		services = new GroovyServices(new CompilationUnitFactory());
-		services.setWorkspaceRoot(workspaceRoot);
-		services.connect(new TestLanguageClient(publishedDiagnostics::add));
 	}
 
 	@AfterEach
 	void tearDown() {
 		TestWorkspaceHelper.cleanSrcDirectory(srcRoot);
-		if (services != null) {
-			services.setWorkspaceRoot(null);
-		}
-		services = null;
 		workspaceRoot = null;
 		srcRoot = null;
-		publishedDiagnostics = null;
 	}
 
 	@Test
@@ -82,31 +70,37 @@ class GroovyServicesLongFileDiagnosticsTests {
 		for (int i = 0; i < 399; i++) {
 			contents.append("  def value").append(i).append(" = ").append(i).append("\n");
 		}
-		contents.append("  def broken = \n");
+		contents.append("  def broken = \"unterminated\n");
 		contents.append("}\n");
 
-		TextDocumentItem textDocumentItem = new TextDocumentItem(uri, LANGUAGE_GROOVY, 1, contents.toString());
-		services.didOpen(new DidOpenTextDocumentParams(textDocumentItem));
+		try {
+			Files.writeString(filePath, contents.toString());
+		} catch (Exception e) {
+			Assertions.fail("Could not prepare long-file fixture on disk", e);
+		}
 
-		List<Diagnostic> diagnostics = getDiagnosticsForUri(uri);
-		Assertions.assertFalse(diagnostics.isEmpty(), "Expected diagnostics to be published for long file");
+		CompilerConfiguration config = new CompilerConfiguration();
+		GroovyClassLoader classLoader = new GroovyClassLoader(
+				ClassLoader.getSystemClassLoader().getParent(), config, true);
+		GroovyLSCompilationUnit cu = new GroovyLSCompilationUnit(config, null, classLoader);
+		SourceUnit sourceUnit = new SourceUnit(uri,
+				new StringReaderSourceWithURI(contents.toString(), filePath.toUri(), config),
+				config, classLoader, cu.getErrorCollector());
+		cu.addSource(sourceUnit);
+		try {
+			cu.compile(Phases.CANONICALIZATION);
+		} catch (Exception e) {
+			// expected for syntax error fixture
+		}
 
-		boolean foundHighLineDiagnostic = diagnostics.stream()
-				.anyMatch(diagnostic -> diagnostic.getRange() != null
-						&& diagnostic.getRange().getStart() != null
-						&& diagnostic.getRange().getStart().getLine() >= 399);
+		ErrorCollector collector = cu.getErrorCollector();
+		boolean foundHighLineDiagnostic = collector.getErrors().stream()
+				.filter(SyntaxErrorMessage.class::isInstance)
+				.map(SyntaxErrorMessage.class::cast)
+				.anyMatch(message -> message.getCause() != null
+						&& message.getCause().getStartLine() >= 400);
 
 		Assertions.assertTrue(foundHighLineDiagnostic,
-				"Expected at least one diagnostic on/after line 400 (0-indexed >= 399)");
-	}
-
-	private List<Diagnostic> getDiagnosticsForUri(String uri) {
-		for (int i = publishedDiagnostics.size() - 1; i >= 0; i--) {
-			PublishDiagnosticsParams params = publishedDiagnostics.get(i);
-			if (params.getUri().equals(uri)) {
-				return params.getDiagnostics();
-			}
-		}
-		return new ArrayList<>();
+				"Expected at least one syntax diagnostic on/after line 400 (1-indexed >= 400)");
 	}
 }

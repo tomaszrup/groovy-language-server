@@ -28,6 +28,7 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 import org.codehaus.groovy.ast.ASTNode;
+import org.codehaus.groovy.ast.AnnotationNode;
 import org.codehaus.groovy.ast.ClassNode;
 import org.codehaus.groovy.ast.ImportNode;
 import org.codehaus.groovy.ast.ModuleNode;
@@ -196,6 +197,9 @@ public class OrganizeImportsAction {
                 for (ClassNode iface : classNode.getUnresolvedInterfaces()) {
                     addClassNodeType(types, iface);
                 }
+            } else if (node instanceof AnnotationNode) {
+                AnnotationNode annotationNode = (AnnotationNode) node;
+                addClassNodeType(types, annotationNode.getClassNode());
             } else if (node instanceof ClassExpression) {
                 ClassExpression expr = (ClassExpression) node;
                 addClassNodeType(types, expr.getType());

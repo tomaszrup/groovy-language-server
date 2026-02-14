@@ -36,8 +36,22 @@ import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import javax.xml.XMLConstants;
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+import org.w3c.dom.Node;
+import org.w3c.dom.NodeList;
+
+import com.tomaszrup.groovyls.util.GroovyVersionDetector;
 
 /**
  * Discovers and imports Maven-based JVM projects. Shells out to the {@code mvn}
@@ -60,6 +74,9 @@ public class MavenProjectImporter implements ProjectImporter {
      * a new throw-away pool per call.
      */
     private volatile ExecutorService sharedImportPool;
+
+    private static final Pattern PROPERTY_REF = Pattern.compile("^\\$\\{([^}]+)}$");
+    private static final int WRAPPER_HEADER_SCAN_BYTES = 8192;
 
     public void setMavenHome(String mavenHome) {
         this.mavenHome = mavenHome;
@@ -245,6 +262,39 @@ public class MavenProjectImporter implements ProjectImporter {
         return filePath != null && filePath.endsWith("pom.xml");
     }
 
+    @Override
+    public Optional<String> detectProjectGroovyVersion(Path projectRoot, List<String> classpathEntries) {
+        Optional<String> fromPom = detectGroovyVersionFromPom(projectRoot);
+        if (fromPom.isPresent()) {
+            return fromPom;
+        }
+        return GroovyVersionDetector.detect(classpathEntries);
+    }
+
+    @Override
+    public boolean shouldMarkClasspathResolved(Path projectRoot, List<String> classpathEntries) {
+        if (projectRoot == null || classpathEntries == null || classpathEntries.isEmpty()) {
+            logger.warn("Maven classpath for {} is empty — keeping scope unresolved", projectRoot);
+            return false;
+        }
+
+        if (!containsOnlyTargetClassDirs(projectRoot, classpathEntries)) {
+            return true;
+        }
+
+        if (hasDeclaredPomDependencies(projectRoot)) {
+            logger.warn(
+                    "Maven classpath for {} contains only target class dirs and no dependency jars — keeping scope unresolved for retry",
+                    projectRoot);
+            return false;
+        }
+
+        logger.info(
+                "Maven classpath for {} contains only target class dirs, but pom.xml has no declared dependencies — treating as resolved",
+                projectRoot);
+        return true;
+    }
+
     // ---- private helpers ----
 
     /**
@@ -356,6 +406,219 @@ public class MavenProjectImporter implements ProjectImporter {
         }
     }
 
+    private Optional<String> detectGroovyVersionFromPom(Path projectRoot) {
+        Path pomPath = projectRoot.resolve("pom.xml");
+        if (!Files.isRegularFile(pomPath)) {
+            return Optional.empty();
+        }
+
+        try {
+            DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
+            dbf.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+            dbf.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+            dbf.setFeature("http://xml.org/sax/features/external-general-entities", false);
+            dbf.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+            dbf.setExpandEntityReferences(false);
+            dbf.setXIncludeAware(false);
+            dbf.setNamespaceAware(false);
+
+            DocumentBuilder db = dbf.newDocumentBuilder();
+            Document doc;
+            try (InputStream in = Files.newInputStream(pomPath)) {
+                doc = db.parse(in);
+            }
+
+            Element root = doc.getDocumentElement();
+            if (root == null) {
+                return Optional.empty();
+            }
+
+            Map<String, String> properties = readPomProperties(root);
+
+            Optional<String> fromDependencyManagement = findGroovyVersionInDependencies(
+                    childElement(root, "dependencyManagement"), properties);
+            if (fromDependencyManagement.isPresent()) {
+                return fromDependencyManagement;
+            }
+
+            return findGroovyVersionInDependencies(childElement(root, "dependencies"), properties);
+        } catch (Exception e) {
+            logger.debug("Could not parse pom.xml for Groovy version in {}: {}",
+                    projectRoot, e.getMessage());
+            return Optional.empty();
+        }
+    }
+
+    private boolean hasDeclaredPomDependencies(Path projectRoot) {
+        Path pomPath = projectRoot.resolve("pom.xml");
+        if (!Files.isRegularFile(pomPath)) {
+            return false;
+        }
+
+        try {
+            DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
+            dbf.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+            dbf.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+            dbf.setFeature("http://xml.org/sax/features/external-general-entities", false);
+            dbf.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+            dbf.setExpandEntityReferences(false);
+            dbf.setXIncludeAware(false);
+            dbf.setNamespaceAware(false);
+
+            DocumentBuilder db = dbf.newDocumentBuilder();
+            Document doc;
+            try (InputStream in = Files.newInputStream(pomPath)) {
+                doc = db.parse(in);
+            }
+
+            Element root = doc.getDocumentElement();
+            if (root == null) {
+                return false;
+            }
+
+            Element deps = childElement(root, "dependencies");
+            if (deps == null) {
+                return false;
+            }
+
+            NodeList dependencyNodes = deps.getElementsByTagName("dependency");
+            return dependencyNodes.getLength() > 0;
+        } catch (Exception e) {
+            logger.warn("Could not verify pom dependencies for {}: {}", projectRoot, e.getMessage());
+            return true;
+        }
+    }
+
+    private boolean containsOnlyTargetClassDirs(Path projectRoot, List<String> classpathEntries) {
+        if (classpathEntries.isEmpty()) {
+            return false;
+        }
+
+        Path targetClasses = projectRoot.resolve("target/classes").toAbsolutePath().normalize();
+        Path targetTestClasses = projectRoot.resolve("target/test-classes").toAbsolutePath().normalize();
+
+        for (String entry : classpathEntries) {
+            if (entry == null || entry.isBlank()) {
+                continue;
+            }
+            Path normalized;
+            try {
+                normalized = Path.of(entry).toAbsolutePath().normalize();
+            } catch (Exception e) {
+                return false;
+            }
+
+            if (!normalized.equals(targetClasses) && !normalized.equals(targetTestClasses)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private Optional<String> findGroovyVersionInDependencies(Element dependenciesElement,
+                                                             Map<String, String> properties) {
+        if (dependenciesElement == null) {
+            return Optional.empty();
+        }
+
+        NodeList dependencyNodes = dependenciesElement.getElementsByTagName("dependency");
+        String best = null;
+        for (int i = 0; i < dependencyNodes.getLength(); i++) {
+            Node node = dependencyNodes.item(i);
+            if (!(node instanceof Element)) {
+                continue;
+            }
+            Element dep = (Element) node;
+            String groupId = textOfChild(dep, "groupId");
+            String artifactId = textOfChild(dep, "artifactId");
+            String version = textOfChild(dep, "version");
+
+            if (!isGroovyDependency(groupId, artifactId) || version == null || version.isBlank()) {
+                continue;
+            }
+
+            String resolved = resolvePropertyReference(version.trim(), properties);
+            if (resolved == null || resolved.isBlank()) {
+                continue;
+            }
+
+            if (best == null) {
+                best = resolved;
+            } else {
+                Optional<String> max = GroovyVersionDetector.detect(Arrays.asList(
+                        "/fake/groovy-" + best + ".jar",
+                        "/fake/groovy-" + resolved + ".jar"));
+                if (max.isPresent() && max.get().equals(resolved)) {
+                    best = resolved;
+                }
+            }
+        }
+        return Optional.ofNullable(best);
+    }
+
+    private Map<String, String> readPomProperties(Element root) {
+        Map<String, String> properties = new LinkedHashMap<>();
+        Element propsElement = childElement(root, "properties");
+        if (propsElement == null) {
+            return properties;
+        }
+
+        NodeList nodes = propsElement.getChildNodes();
+        for (int i = 0; i < nodes.getLength(); i++) {
+            Node node = nodes.item(i);
+            if (node instanceof Element) {
+                String key = node.getNodeName();
+                String value = node.getTextContent();
+                if (key != null && value != null) {
+                    properties.put(key.trim(), value.trim());
+                }
+            }
+        }
+        return properties;
+    }
+
+    private String resolvePropertyReference(String version, Map<String, String> properties) {
+        Matcher m = PROPERTY_REF.matcher(version);
+        if (!m.matches()) {
+            return version;
+        }
+        String property = m.group(1);
+        String resolved = properties.get(property);
+        return resolved != null ? resolved : version;
+    }
+
+    private boolean isGroovyDependency(String groupId, String artifactId) {
+        if (groupId == null || artifactId == null) {
+            return false;
+        }
+        boolean groovyGroup = "org.apache.groovy".equals(groupId)
+                || "org.codehaus.groovy".equals(groupId);
+        return groovyGroup && artifactId.startsWith("groovy");
+    }
+
+    private Element childElement(Element parent, String name) {
+        if (parent == null) {
+            return null;
+        }
+        NodeList nodes = parent.getChildNodes();
+        for (int i = 0; i < nodes.getLength(); i++) {
+            Node n = nodes.item(i);
+            if (n instanceof Element && name.equals(n.getNodeName())) {
+                return (Element) n;
+            }
+        }
+        return null;
+    }
+
+    private String textOfChild(Element parent, String name) {
+        Element child = childElement(parent, name);
+        if (child == null) {
+            return null;
+        }
+        String value = child.getTextContent();
+        return value != null ? value.trim() : null;
+    }
+
     /**
      * Discover compiled class output directories under {@code target/}.
      */
@@ -380,7 +643,32 @@ public class MavenProjectImporter implements ProjectImporter {
      * @return the process exit code
      */
     private int runMaven(Path projectRoot, String... args) throws IOException, InterruptedException {
-        String mvnCommand = findMvnCommand(projectRoot);
+        String primaryCommand = findMvnCommand(projectRoot);
+        boolean usedWrapper = primaryCommand.toLowerCase().contains("mvnw");
+
+        try {
+            int exitCode = executeMavenCommand(projectRoot, primaryCommand, args);
+            if (exitCode == 0 || !usedWrapper) {
+                return exitCode;
+            }
+
+            String fallback = findSystemMvnCommand();
+            logger.warn("Maven wrapper failed for {} (exit code {}), retrying with {}",
+                    projectRoot, exitCode, fallback);
+            return executeMavenCommand(projectRoot, fallback, args);
+        } catch (IOException e) {
+            if (!usedWrapper) {
+                throw e;
+            }
+            String fallback = findSystemMvnCommand();
+            logger.warn("Maven wrapper execution failed for {} ({}), retrying with {}",
+                    projectRoot, e.getMessage(), fallback);
+            return executeMavenCommand(projectRoot, fallback, args);
+        }
+    }
+
+    private int executeMavenCommand(Path projectRoot, String mvnCommand, String... args)
+            throws IOException, InterruptedException {
         List<String> command = new ArrayList<>();
         command.add(mvnCommand);
         command.addAll(Arrays.asList(args));
@@ -390,10 +678,8 @@ public class MavenProjectImporter implements ProjectImporter {
                 .directory(projectRoot.toFile())
                 .redirectErrorStream(false);
 
-        // Inherit environment so that JAVA_HOME, M2_HOME etc. are available
         Process process = pb.start();
 
-        // Consume stdout and stderr to prevent blocking
         StreamGobbler stdoutGobbler = new StreamGobbler(process.getInputStream());
         StreamGobbler stderrGobbler = new StreamGobbler(process.getErrorStream());
         stdoutGobbler.start();
@@ -431,6 +717,11 @@ public class MavenProjectImporter implements ProjectImporter {
             logger.info("Using Maven Wrapper: {}", wrapper);
             return wrapper;
         }
+
+        return findSystemMvnCommand();
+    }
+
+    private String findSystemMvnCommand() {
 
         // 2. Check configured mavenHome
         if (mavenHome != null && !mavenHome.isEmpty()) {
@@ -487,7 +778,8 @@ public class MavenProjectImporter implements ProjectImporter {
     /**
      * Basic content validation of a Maven Wrapper script.
      *
-     * <p>Reads the first 512 bytes and checks for expected markers:
+        * <p>Reads the first {@value #WRAPPER_HEADER_SCAN_BYTES} bytes and checks
+        * for expected markers:
      * <ul>
      * <li>Unix ({@code mvnw}): must start with {@code #!} (shebang) and
      *     contain "maven" or "mvn" (case-insensitive).</li>
@@ -504,10 +796,16 @@ public class MavenProjectImporter implements ProjectImporter {
      */
     private boolean isLegitMavenWrapper(Path wrapperPath) {
         try {
-            byte[] buf = new byte[512];
-            int bytesRead;
+            byte[] buf = new byte[WRAPPER_HEADER_SCAN_BYTES];
+            int bytesRead = 0;
             try (InputStream in = Files.newInputStream(wrapperPath)) {
-                bytesRead = in.read(buf);
+                while (bytesRead < buf.length) {
+                    int read = in.read(buf, bytesRead, buf.length - bytesRead);
+                    if (read < 0) {
+                        break;
+                    }
+                    bytesRead += read;
+                }
             }
             if (bytesRead <= 0) {
                 logger.warn("Skipping empty Maven wrapper at {}", wrapperPath);

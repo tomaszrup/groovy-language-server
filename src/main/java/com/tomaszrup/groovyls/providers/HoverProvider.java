@@ -173,6 +173,10 @@ public class HoverProvider {
 	private String getContent(ASTNode hoverNode) {
 		if (hoverNode instanceof ClassNode) {
 			ClassNode classNode = (ClassNode) hoverNode;
+			ClassNode canonicalNode = ast.getClassNodeByName(classNode.getName());
+			if (canonicalNode != null) {
+				classNode = canonicalNode;
+			}
 			return GroovyNodeToStringUtils.classToString(classNode, ast);
 		} else if (hoverNode instanceof MethodNode) {
 			MethodNode methodNode = (MethodNode) hoverNode;

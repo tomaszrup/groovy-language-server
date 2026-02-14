@@ -21,7 +21,7 @@
 package com.tomaszrup.groovyls;
 
 import java.net.URI;
-import java.nio.file.InvalidPathException;
+import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.Comparator;
 import java.util.Collections;
@@ -31,6 +31,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Semaphore;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.codehaus.groovy.control.CompilationFailedException;
 import org.codehaus.groovy.control.CompilerConfiguration;
@@ -54,6 +56,8 @@ import com.tomaszrup.groovyls.compiler.DiagnosticHandler;
 import com.tomaszrup.groovyls.compiler.ast.ASTNodeVisitor;
 import com.tomaszrup.groovyls.compiler.control.GroovyLSCompilationUnit;
 import com.tomaszrup.groovyls.util.FileContentsTracker;
+import com.tomaszrup.groovyls.util.GroovyVersionDetector;
+import com.tomaszrup.groovyls.util.GroovyLanguageServerUtils;
 import com.tomaszrup.groovyls.util.MdcProjectContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -65,6 +69,28 @@ import org.slf4j.LoggerFactory;
  */
 public class CompilationService {
 	private static final Logger logger = LoggerFactory.getLogger(CompilationService.class);
+	private static final String VERSION_GUARD_DIAGNOSTIC_SOURCE = "groovy-language-server";
+	private static final Pattern IMPLICATION_OPERATOR_PATTERN = Pattern.compile("==>");
+	private static final Pattern INSTANCEOF_PATTERN_VARIABLE_PATTERN =
+			Pattern.compile("\\binstanceof\\s+[A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)*(?:<[^>]+>)?\\s+[A-Za-z_$][\\w$]*\\b");
+	private static final Pattern VAR_MULTI_ASSIGNMENT_PATTERN =
+			Pattern.compile("\\bvar\\s*\\(\\s*[^)]*\\)");
+	private static final Pattern FOR_LOOP_INDEX_VARIABLE_PATTERN =
+			Pattern.compile("\\bfor\\s*\\(\\s*[^,\\)]+,\\s*[^\\)]*\\bin\\b[^\\)]*\\)");
+	private static final Pattern UNDERSCORE_PLACEHOLDER_LAMBDA_PATTERN =
+			Pattern.compile("\\(\\s*[^)]*\\b_\\b[^)]*\\)\\s*->");
+	private static final Pattern UNDERSCORE_PLACEHOLDER_CLOSURE_PATTERN =
+			Pattern.compile("\\{[^\\n\\r{}]*\\b_\\b[^\\n\\r{}]*->");
+	private static final Pattern MULTIDIMENSIONAL_ARRAY_JAVA_LITERAL_PATTERN =
+			Pattern.compile("\\bnew\\s+[A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)*\\s*\\[\\s*]\\s*\\[\\s*]\\s*\\{\\s*\\{");
+	private static final java.util.List<GuardedSyntaxFeature> GROOVY5_SYNTAX_FEATURES = java.util.List.of(
+			new GuardedSyntaxFeature(IMPLICATION_OPERATOR_PATTERN, "implication operator (==>)"),
+			new GuardedSyntaxFeature(INSTANCEOF_PATTERN_VARIABLE_PATTERN, "instanceof pattern variable"),
+			new GuardedSyntaxFeature(VAR_MULTI_ASSIGNMENT_PATTERN, "var with multi-assignment"),
+			new GuardedSyntaxFeature(FOR_LOOP_INDEX_VARIABLE_PATTERN, "for-loop index variable declaration"),
+			new GuardedSyntaxFeature(UNDERSCORE_PLACEHOLDER_LAMBDA_PATTERN, "underscore placeholder parameters in lambdas"),
+			new GuardedSyntaxFeature(UNDERSCORE_PLACEHOLDER_CLOSURE_PATTERN, "underscore placeholder parameters in closures"),
+			new GuardedSyntaxFeature(MULTIDIMENSIONAL_ARRAY_JAVA_LITERAL_PATTERN, "Java-style multidimensional array literals"));
 
 	/**
 	 * Maximum number of simultaneously changed files for which incremental
@@ -213,6 +239,7 @@ public class CompilationService {
 			if (collector != null) {
 				DiagnosticHandler.DiagnosticResult result = diagnosticHandler.handleErrorCollector(
 						scope.getCompilationUnit(), collector, scope.getProjectRoot(), scope.getPrevDiagnosticsByFile());
+				result = mergeGroovyVersionSyntaxDiagnostics(scope, scope.getCompilationUnit(), result);
 				scope.setPrevDiagnosticsByFile(result.getDiagnosticsByFile());
 				LanguageClient client = languageClient;
 				if (client != null) {
@@ -245,10 +272,9 @@ public class CompilationService {
 				SyntaxErrorMessage sem = (SyntaxErrorMessage) message;
 				String sourceLocator = sem.getCause().getSourceLocator();
 				if (sourceLocator != null && !sourceLocator.isEmpty()) {
-					try {
-						errorURIs.add(Paths.get(sourceLocator).normalize().toUri());
-					} catch (InvalidPathException e) {
-						// skip invalid source locators
+					URI errorUri = GroovyLanguageServerUtils.sourceLocatorToUri(sourceLocator);
+					if (errorUri != null) {
+						errorURIs.add(errorUri);
 					}
 				}
 			}
@@ -374,6 +400,7 @@ public class CompilationService {
 					DiagnosticHandler.DiagnosticResult result = diagnosticHandler.handleErrorCollector(
 							incrementalUnit, collector, scope.getProjectRoot(),
 							scope.getPrevDiagnosticsByFile());
+					result = mergeGroovyVersionSyntaxDiagnostics(scope, incrementalUnit, result);
 					scope.setPrevDiagnosticsByFile(result.getDiagnosticsByFile());
 					LanguageClient client = languageClient;
 					if (client != null) {
@@ -648,6 +675,7 @@ public class CompilationService {
 		if (collector != null) {
 			DiagnosticHandler.DiagnosticResult result = diagnosticHandler.handleErrorCollector(
 					incrementalUnit, collector, scope.getProjectRoot(), scope.getPrevDiagnosticsByFile());
+			result = mergeGroovyVersionSyntaxDiagnostics(scope, incrementalUnit, result);
 			scope.setPrevDiagnosticsByFile(result.getDiagnosticsByFile());
 			LanguageClient client = languageClient;
 			if (client != null) {
@@ -837,6 +865,201 @@ public class CompilationService {
 				.sorted(Comparator.comparing(PublishDiagnosticsParams::getUri, Comparator.nullsFirst(String::compareTo)))
 				.map(this::normalizeDiagnosticsForPublishedDocument)
 				.forEach(client::publishDiagnostics);
+	}
+
+	private DiagnosticHandler.DiagnosticResult mergeGroovyVersionSyntaxDiagnostics(
+			ProjectScope scope,
+			GroovyLSCompilationUnit compilationUnit,
+			DiagnosticHandler.DiagnosticResult baseResult) {
+		if (scope == null || baseResult == null) {
+			return baseResult;
+		}
+
+		String detectedVersion = scope.getDetectedGroovyVersion();
+		Integer projectMajor = GroovyVersionDetector.major(detectedVersion).orElse(null);
+		if (projectMajor == null || projectMajor >= 5) {
+			if (logger.isDebugEnabled()) {
+				logger.debug(
+						"Groovy 5 syntax guard inactive for scope {} (detectedVersion={}, major={})",
+						scope.getProjectRoot(),
+						detectedVersion,
+						projectMajor);
+			}
+			return baseResult;
+		}
+		if (logger.isDebugEnabled()) {
+			logger.debug(
+					"Groovy 5 syntax guard active for scope {} (detectedVersion={}, major={}, guardedFeatures={})",
+					scope.getProjectRoot(),
+					detectedVersion,
+					projectMajor,
+					GROOVY5_SYNTAX_FEATURES.size());
+		}
+
+		Map<URI, List<Diagnostic>> mergedDiagnosticsByFile = new HashMap<>();
+		if (baseResult.getDiagnosticsByFile() != null) {
+			for (Map.Entry<URI, List<Diagnostic>> entry : baseResult.getDiagnosticsByFile().entrySet()) {
+				mergedDiagnosticsByFile.put(entry.getKey(), new java.util.ArrayList<>(entry.getValue()));
+			}
+		}
+
+		Map<URI, List<Diagnostic>> versionDiagnostics = collectGroovy5SyntaxDiagnostics(
+				compilationUnit, projectMajor, detectedVersion);
+		for (Map.Entry<URI, List<Diagnostic>> entry : versionDiagnostics.entrySet()) {
+			mergedDiagnosticsByFile
+					.computeIfAbsent(entry.getKey(), key -> new java.util.ArrayList<>())
+					.addAll(entry.getValue());
+		}
+
+		deduplicateDiagnostics(mergedDiagnosticsByFile);
+
+		Set<PublishDiagnosticsParams> diagnosticsToPublish = new HashSet<>();
+		for (Map.Entry<URI, List<Diagnostic>> entry : mergedDiagnosticsByFile.entrySet()) {
+			diagnosticsToPublish.add(new PublishDiagnosticsParams(entry.getKey().toString(), entry.getValue()));
+		}
+
+		Map<URI, List<Diagnostic>> previousDiagnosticsByFile = scope.getPrevDiagnosticsByFile();
+		if (previousDiagnosticsByFile != null) {
+			for (URI uri : previousDiagnosticsByFile.keySet()) {
+				if (!mergedDiagnosticsByFile.containsKey(uri)) {
+					diagnosticsToPublish.add(new PublishDiagnosticsParams(uri.toString(), new java.util.ArrayList<>()));
+				}
+			}
+		}
+
+		return new DiagnosticHandler.DiagnosticResult(diagnosticsToPublish, mergedDiagnosticsByFile);
+	}
+
+	private Map<URI, List<Diagnostic>> collectGroovy5SyntaxDiagnostics(
+			GroovyLSCompilationUnit compilationUnit,
+			int projectMajor,
+			String projectVersion) {
+		Map<URI, List<Diagnostic>> diagnosticsByFile = new HashMap<>();
+		if (compilationUnit == null || compilationUnit.getAST() == null || compilationUnit.getAST().getModules() == null) {
+			return diagnosticsByFile;
+		}
+
+		for (org.codehaus.groovy.ast.ModuleNode module : compilationUnit.getAST().getModules()) {
+			if (module == null || module.getContext() == null) {
+				continue;
+			}
+			org.codehaus.groovy.control.SourceUnit sourceUnit = module.getContext();
+			URI uri = GroovyLanguageServerUtils.sourceLocatorToUri(sourceUnit.getName());
+			if (uri == null) {
+				continue;
+			}
+
+			String source = fileContentsTracker.getContents(uri);
+			if (source == null && "file".equalsIgnoreCase(uri.getScheme())) {
+				try {
+					source = Files.readString(Paths.get(uri));
+				} catch (Exception ignored) {
+					source = null;
+				}
+			}
+			if (source == null || source.isEmpty()) {
+				continue;
+			}
+
+			List<Diagnostic> fileDiagnostics = new java.util.ArrayList<>();
+			for (GuardedSyntaxFeature feature : GROOVY5_SYNTAX_FEATURES) {
+				fileDiagnostics.addAll(createFeatureDiagnostics(
+						source,
+						feature.pattern,
+						feature.featureName,
+						projectMajor,
+						projectVersion));
+			}
+
+			if (!fileDiagnostics.isEmpty()) {
+				diagnosticsByFile.put(uri, fileDiagnostics);
+			}
+		}
+
+		return diagnosticsByFile;
+	}
+
+	private List<Diagnostic> createFeatureDiagnostics(
+			String source,
+			Pattern featurePattern,
+			String featureName,
+			int projectMajor,
+			String projectVersion) {
+		List<Diagnostic> diagnostics = new java.util.ArrayList<>();
+		Matcher matcher = featurePattern.matcher(source);
+		int[] lineStartOffsets = computeLineStartOffsets(source);
+		while (matcher.find()) {
+			int startOffset = matcher.start();
+			int endOffset = matcher.end();
+			Range range = new Range(
+					offsetToPosition(startOffset, source, lineStartOffsets),
+					offsetToPosition(endOffset, source, lineStartOffsets));
+
+			Diagnostic diagnostic = new Diagnostic();
+			diagnostic.setRange(range);
+			diagnostic.setSeverity(org.eclipse.lsp4j.DiagnosticSeverity.Error);
+			diagnostic.setSource(VERSION_GUARD_DIAGNOSTIC_SOURCE);
+			diagnostic.setMessage(String.format(
+					"%s require Groovy 5+, but this project resolves Groovy %s (major %d).",
+					featureName,
+					projectVersion != null ? projectVersion : Integer.toString(projectMajor),
+					projectMajor));
+			diagnostics.add(diagnostic);
+		}
+		return diagnostics;
+	}
+
+	private int[] computeLineStartOffsets(String source) {
+		java.util.ArrayList<Integer> starts = new java.util.ArrayList<>();
+		starts.add(0);
+		for (int i = 0; i < source.length(); i++) {
+			if (source.charAt(i) == '\n') {
+				starts.add(i + 1);
+			}
+		}
+		int[] result = new int[starts.size()];
+		for (int i = 0; i < starts.size(); i++) {
+			result[i] = starts.get(i);
+		}
+		return result;
+	}
+
+	private Position offsetToPosition(int offset, String source, int[] lineStartOffsets) {
+		int safeOffset = Math.max(0, Math.min(offset, source.length()));
+		int idx = java.util.Arrays.binarySearch(lineStartOffsets, safeOffset);
+		if (idx < 0) {
+			idx = -idx - 2;
+		}
+		if (idx < 0) {
+			idx = 0;
+		}
+		int lineStart = lineStartOffsets[idx];
+		int character = Math.max(0, safeOffset - lineStart);
+		return new Position(idx, character);
+	}
+
+	private void deduplicateDiagnostics(Map<URI, List<Diagnostic>> diagnosticsByFile) {
+		for (Map.Entry<URI, List<Diagnostic>> entry : diagnosticsByFile.entrySet()) {
+			List<Diagnostic> unique = new java.util.ArrayList<>();
+			Set<String> seen = new HashSet<>();
+			for (Diagnostic diagnostic : entry.getValue()) {
+				String key = diagnostic.getRange() + "|" + diagnostic.getMessage() + "|" + diagnostic.getSeverity();
+				if (seen.add(key)) {
+					unique.add(diagnostic);
+				}
+			}
+			entry.setValue(unique);
+		}
+	}
+
+	private static final class GuardedSyntaxFeature {
+		private final Pattern pattern;
+		private final String featureName;
+
+		private GuardedSyntaxFeature(Pattern pattern, String featureName) {
+			this.pattern = pattern;
+			this.featureName = featureName;
+		}
 	}
 
 	private PublishDiagnosticsParams normalizeDiagnosticsForPublishedDocument(PublishDiagnosticsParams params) {

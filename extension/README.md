@@ -100,6 +100,13 @@ Maven projects are imported by invoking `mvn` to resolve dependencies:
 - Per-project scoping — each Maven module gets its own classpath and compilation context
 - **Lazy on-demand resolution** and **persistent classpath cache** work identically to Gradle (see above)
 
+#### Groovy Version Support
+
+- Project-level feature behavior is version-aware for **Groovy 4 and 5** based on detected dependency version.
+- Semantic token column compatibility is selected using both detected project version and server runtime:
+  - Groovy 4 runtime keeps Groovy-4 column compatibility enabled
+  - Groovy 5+ runtime enables latest parser behavior for Groovy 5+ projects
+
 #### Priority
 
 If a directory contains both `build.gradle` and `pom.xml`, the Gradle importer takes priority.
@@ -136,7 +143,7 @@ The extension ships a `language-configuration.json` that enables rich editing su
 | `groovy.java.vmargs` | `string` | Extra JVM arguments for the language server (e.g. `"-Xmx2g"`). When unset, heap is auto-sized (512 MB – 4 GB) based on workspace size, G1GC is enabled, and `HeapDumpOnOutOfMemoryError` is set |
 | `groovy.classpath` | `string[]` | Additional `.jar` files to include on the classpath |
 | `groovy.debug.serverPort` | `number` | Connect to an existing Groovy LSP server on this TCP port instead of starting one automatically |
-| `groovy.logLevel` | `string` | Log level: `ERROR`, `WARN`, `INFO` (default), `DEBUG`, `TRACE`. Changing this restarts the server |
+| `groovy.logLevel` | `string` | Log level: `ERROR`, `WARN` (default), `INFO`, `DEBUG`, `TRACE`. Changing this restarts the server |
 | `groovy.showMemoryUsage` | `boolean` | Show JVM memory usage in the status bar (default: `false`) |
 | `groovy.semanticHighlighting.enabled` | `boolean` | Enable or disable semantic syntax highlighting (default: `true`) |
 | `groovy.formatting.enabled` | `boolean` | Enable or disable document formatting (default: `true`) |

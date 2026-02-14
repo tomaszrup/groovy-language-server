@@ -31,6 +31,10 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
+import org.codehaus.groovy.control.CompilerConfiguration;
+import org.codehaus.groovy.control.ErrorCollector;
+import org.codehaus.groovy.control.Phases;
+import org.codehaus.groovy.control.SourceUnit;
 import org.eclipse.lsp4j.Diagnostic;
 import org.eclipse.lsp4j.MessageActionItem;
 import org.eclipse.lsp4j.MessageParams;
@@ -39,12 +43,15 @@ import org.eclipse.lsp4j.PublishDiagnosticsParams;
 import org.eclipse.lsp4j.Range;
 import org.eclipse.lsp4j.ShowMessageRequestParams;
 import org.eclipse.lsp4j.services.LanguageClient;
+import groovy.lang.GroovyClassLoader;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import com.tomaszrup.groovyls.config.CompilationUnitFactory;
+import com.tomaszrup.groovyls.compiler.control.GroovyLSCompilationUnit;
+import com.tomaszrup.groovyls.compiler.control.io.StringReaderSourceWithURI;
 import com.tomaszrup.groovyls.util.FileContentsTracker;
 
 /**
@@ -202,6 +209,133 @@ class CompilationServiceTests {
 		compilationService.compile(scope);
 	}
 
+	@Test
+	void testCompileAddsGroovy5SyntaxDiagnosticForGroovy4Project() throws IOException {
+		Path file = srcDir.resolve("Groovy5Features.groovy");
+		Files.writeString(file,
+				"class Groovy5Features {\n"
+						+ "  boolean demo(Object obj, boolean a, boolean b) {\n"
+						+ "    def implied = a ==> b\n"
+						+ "    if (obj instanceof String s) {\n"
+						+ "      implied = implied && s.length() > 0\n"
+						+ "    }\n"
+						+ "    var (x, y) = [1, 2]\n"
+						+ "    for (int idx, var item in [1, 2, 3]) {\n"
+						+ "      implied = implied && (idx + item + x + y) >= 0\n"
+						+ "    }\n"
+						+ "    def lambda = (_, q) -> q\n"
+						+ "    def closure = { p, _, r -> p + r }\n"
+						+ "    int[][] nums = new int[][] {{1, 2}, {3, 4}}\n"
+						+ "    return implied && lambda(1, 2) == 2 && closure(1, 0, 2) == 3 && nums.size() == 2\n"
+						+ "  }\n"
+						+ "}\n");
+
+		CompilationUnitFactory factory = new CompilationUnitFactory();
+		ProjectScope scope = new ProjectScope(tempDir, factory);
+		scope.setClasspathResolved(true);
+		scope.setDetectedGroovyVersion("4.0.30");
+
+		CapturingLanguageClient client = new CapturingLanguageClient();
+		compilationService.setLanguageClient(client);
+
+		compilationService.ensureScopeCompiled(scope);
+
+		List<String> guardMessages = client.publishedDiagnostics.stream()
+				.flatMap(params -> params.getDiagnostics().stream())
+				.filter(d -> d.getMessage() != null && "groovy-language-server".equals(d.getSource()))
+				.map(Diagnostic::getMessage)
+				.toList();
+
+		Assertions.assertTrue(guardMessages.stream().anyMatch(m -> m.contains("implication operator (==>)")));
+		Assertions.assertTrue(guardMessages.stream().anyMatch(m -> m.contains("instanceof pattern variable")));
+		Assertions.assertTrue(guardMessages.stream().anyMatch(m -> m.contains("var with multi-assignment")));
+		Assertions.assertTrue(guardMessages.stream().anyMatch(m -> m.contains("for-loop index variable declaration")));
+		Assertions.assertTrue(guardMessages.stream().anyMatch(m -> m.contains("underscore placeholder parameters in lambdas")));
+		Assertions.assertTrue(guardMessages.stream().anyMatch(m -> m.contains("underscore placeholder parameters in closures")));
+		Assertions.assertTrue(guardMessages.stream().anyMatch(m -> m.contains("Java-style multidimensional array literals")));
+	}
+
+	@Test
+	void testCompileDoesNotAddGroovy5SyntaxDiagnosticForGroovy5Project() throws IOException {
+		Path file = srcDir.resolve("Groovy4Features.groovy");
+		Files.writeString(file,
+				"sealed class Groovy4Features permits Child {}\n"
+						+ "record Child(int value) extends Groovy4Features {}\n");
+
+		CompilationUnitFactory factory = new CompilationUnitFactory();
+		ProjectScope scope = new ProjectScope(tempDir, factory);
+		scope.setClasspathResolved(true);
+		scope.setDetectedGroovyVersion("4.0.30");
+
+		CapturingLanguageClient client = new CapturingLanguageClient();
+		compilationService.setLanguageClient(client);
+
+		compilationService.ensureScopeCompiled(scope);
+
+		boolean hasVersionGuardDiagnostic = client.publishedDiagnostics.stream()
+				.flatMap(params -> params.getDiagnostics().stream())
+				.anyMatch(d -> d.getMessage() != null
+						&& d.getMessage().contains("require Groovy 5+")
+						&& "groovy-language-server".equals(d.getSource()));
+		Assertions.assertFalse(hasVersionGuardDiagnostic,
+				"Did not expect Groovy 5 syntax diagnostic for Groovy 4 language features");
+	}
+
+	@Test
+	void testCompileAddsGroovy5SyntaxDiagnosticForImplicationOperatorInGroovy4Project() throws IOException {
+		Path file = srcDir.resolve("ImplicationSpec.groovy");
+		Files.writeString(file, "class ImplicationSpec {\n  boolean ok(boolean a, boolean b) {\n    a ==> b\n  }\n}\n");
+
+		CompilationUnitFactory factory = new CompilationUnitFactory();
+		ProjectScope scope = new ProjectScope(tempDir, factory);
+		scope.setClasspathResolved(true);
+		scope.setDetectedGroovyVersion("4.0.30");
+
+		CapturingLanguageClient client = new CapturingLanguageClient();
+		compilationService.setLanguageClient(client);
+
+		compilationService.ensureScopeCompiled(scope);
+
+		boolean hasImplicationDiagnostic = client.publishedDiagnostics.stream()
+				.flatMap(params -> params.getDiagnostics().stream())
+				.anyMatch(d -> d.getMessage() != null
+						&& d.getMessage().contains("implication operator (==>)")
+						&& "groovy-language-server".equals(d.getSource()));
+		Assertions.assertTrue(hasImplicationDiagnostic,
+				"Expected implication operator diagnostic for Groovy 4 project");
+	}
+
+	@Test
+	void testCompileDoesNotAddGroovy5SyntaxDiagnosticForGroovy5ProjectUsingGroovy5Syntax() throws IOException {
+		Path file = srcDir.resolve("Groovy5SyntaxAllowed.groovy");
+		Files.writeString(file,
+				"class Groovy5SyntaxAllowed {\n"
+						+ "  boolean ok(Object obj, boolean a, boolean b) {\n"
+						+ "    def v = a ==> b\n"
+						+ "    if (obj instanceof String s) { v = v && s.length() > 0 }\n"
+						+ "    return v\n"
+						+ "  }\n"
+						+ "}\n");
+
+		CompilationUnitFactory factory = new CompilationUnitFactory();
+		ProjectScope scope = new ProjectScope(tempDir, factory);
+		scope.setClasspathResolved(true);
+		scope.setDetectedGroovyVersion("5.0.4");
+
+		CapturingLanguageClient client = new CapturingLanguageClient();
+		compilationService.setLanguageClient(client);
+
+		compilationService.ensureScopeCompiled(scope);
+
+		boolean hasVersionGuardDiagnostic = client.publishedDiagnostics.stream()
+				.flatMap(params -> params.getDiagnostics().stream())
+				.anyMatch(d -> d.getMessage() != null
+						&& d.getMessage().contains("require Groovy 5+")
+						&& "groovy-language-server".equals(d.getSource()));
+		Assertions.assertFalse(hasVersionGuardDiagnostic,
+				"Did not expect Groovy 5 syntax diagnostic for Groovy 5 project");
+	}
+
 	// --- visitAST ---
 
 	@Test
@@ -349,6 +483,22 @@ class CompilationServiceTests {
 		client.publishedDiagnostics.clear();
 		publishBatch.invoke(compilationService, client, Collections.emptySet());
 		Assertions.assertTrue(client.publishedDiagnostics.isEmpty());
+	}
+
+	@Test
+	void testExtractErrorURIsAcceptsFileUriSourceLocator() throws Exception {
+		URI windowsFileUri = URI.create("file:///c:/Users/test/ExtractErrorUrisSpec.groovy");
+		ErrorCollector collector = compileSourceWithSyntaxError(windowsFileUri).getErrorCollector();
+
+		Method extractErrorURIs = CompilationService.class
+				.getDeclaredMethod("extractErrorURIs", ErrorCollector.class);
+		extractErrorURIs.setAccessible(true);
+
+		@SuppressWarnings("unchecked")
+		Set<URI> result = (Set<URI>) extractErrorURIs.invoke(compilationService, collector);
+
+		Assertions.assertTrue(result.contains(windowsFileUri),
+				"Should include file URI source locator in extracted error URIs");
 	}
 
 	@Test
@@ -575,6 +725,23 @@ class CompilationServiceTests {
 		Assertions.assertTrue(scope.isCompiled());
 		Assertions.assertNotNull(scope.getAstVisitor());
 		Assertions.assertNotNull(scope.getCompilationUnit());
+	}
+
+	private GroovyLSCompilationUnit compileSourceWithSyntaxError(URI uri) {
+		CompilerConfiguration config = new CompilerConfiguration();
+		GroovyClassLoader classLoader = new GroovyClassLoader(
+				ClassLoader.getSystemClassLoader().getParent(), config, true);
+		GroovyLSCompilationUnit cu = new GroovyLSCompilationUnit(config, null, classLoader);
+		SourceUnit sourceUnit = new SourceUnit(uri.toString(),
+				new StringReaderSourceWithURI("class Foo {\n  void bar(\n}\n", uri, config),
+				config, classLoader, cu.getErrorCollector());
+		cu.addSource(sourceUnit);
+		try {
+			cu.compile(Phases.CANONICALIZATION);
+		} catch (Exception e) {
+			// expected for syntax error tests
+		}
+		return cu;
 	}
 
 	private static class CapturingLanguageClient implements LanguageClient {

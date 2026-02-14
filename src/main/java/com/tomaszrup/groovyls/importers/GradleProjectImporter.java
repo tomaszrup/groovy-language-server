@@ -35,6 +35,8 @@ import java.util.*;
 import java.util.stream.Stream;
 import java.util.concurrent.ConcurrentHashMap;
 
+import com.tomaszrup.groovyls.util.GroovyVersionDetector;
+
 /**
  * Discovers and imports Gradle-based JVM projects. Uses the Gradle Tooling API
  * to compile Java sources, resolve dependency classpaths via an injected init
@@ -67,6 +69,12 @@ public class GradleProjectImporter implements ProjectImporter {
     private final Set<Path> validatedRoots = ConcurrentHashMap.newKeySet();
 
     /**
+     * Best-effort cache of detected Groovy versions keyed by normalized project
+     * root path. Populated from init-script output during classpath resolution.
+     */
+    private final Map<String, String> detectedGroovyVersionByProject = new ConcurrentHashMap<>();
+
+    /**
      * Sets an upper bound for the Gradle-root search.  When set,
      * {@link #findGradleRoot(Path)} will not walk above this directory.
      */
@@ -90,6 +98,17 @@ public class GradleProjectImporter implements ProjectImporter {
     @Override
     public String getName() {
         return "Gradle";
+    }
+
+    @Override
+    public Optional<String> detectProjectGroovyVersion(Path projectRoot, List<String> classpathEntries) {
+        if (projectRoot != null) {
+            String cached = detectedGroovyVersionByProject.get(normalise(projectRoot));
+            if (cached != null && !cached.isEmpty()) {
+                return Optional.of(cached);
+            }
+        }
+        return GroovyVersionDetector.detect(classpathEntries);
     }
 
     @Override
@@ -616,6 +635,24 @@ public class GradleProjectImporter implements ProjectImporter {
                 "                    } catch (Exception e) { /* skip */ }\n" +
                 "                }\n" +
                 "            }\n" +
+                "            def groovyVersions = new LinkedHashSet()\n" +
+                "            ['compileClasspath', 'runtimeClasspath', 'testCompileClasspath', 'testRuntimeClasspath'].each { configName ->\n" +
+                "                def config = configurations.findByName(configName)\n" +
+                "                if (config != null && config.canBeResolved) {\n" +
+                "                    try {\n" +
+                "                        config.resolvedConfiguration.resolvedArtifacts.each { artifact ->\n" +
+                "                            def id = artifact.moduleVersion.id\n" +
+                "                            if ((id.group == 'org.apache.groovy' || id.group == 'org.codehaus.groovy')\n" +
+                "                                    && id.name.startsWith('groovy')) {\n" +
+                "                                groovyVersions.add(id.version)\n" +
+                "                            }\n" +
+                "                        }\n" +
+                "                    } catch (Exception e) { /* skip */ }\n" +
+                "                }\n" +
+                "            }\n" +
+                "            groovyVersions.each { version ->\n" +
+                "                println \"GROOVYLS_GROOVY_VERSION:${project.projectDir.absolutePath}:${version}\"\n" +
+                "            }\n" +
                 "        }\n" +
                 "    }\n" +
                 "}\n";
@@ -634,13 +671,15 @@ public class GradleProjectImporter implements ProjectImporter {
                 line = line.trim();
                 boolean isMain = line.startsWith("GROOVYLS_CP_MAIN:");
                 boolean isTest = line.startsWith("GROOVYLS_CP_TEST:");
+                boolean isGroovyVersion = line.startsWith("GROOVYLS_GROOVY_VERSION:");
                 // Backward compat: also accept old untagged format
                 boolean isLegacy = !isMain && !isTest && line.startsWith("GROOVYLS_CP:");
-                if (!isMain && !isTest && !isLegacy) {
+                if (!isMain && !isTest && !isLegacy && !isGroovyVersion) {
                     continue;
                 }
                 String prefix = isMain ? "GROOVYLS_CP_MAIN:"
                                : isTest ? "GROOVYLS_CP_TEST:"
+                               : isGroovyVersion ? "GROOVYLS_GROOVY_VERSION:"
                                : "GROOVYLS_CP:";
                 String rest = line.substring(prefix.length());
                 // Format: <projectDir>:<classpathEntry>
@@ -651,7 +690,15 @@ public class GradleProjectImporter implements ProjectImporter {
                     continue;
                 }
                 String projectDir = normalise(rest.substring(0, separatorIdx));
-                String cpEntry = rest.substring(separatorIdx + 1);
+                String value = rest.substring(separatorIdx + 1);
+                if (isGroovyVersion) {
+                    if (!value.isEmpty()) {
+                        detectedGroovyVersionByProject.merge(projectDir, value,
+                                this::pickHigherGroovyVersion);
+                    }
+                    continue;
+                }
+                String cpEntry = value;
                 if (new File(cpEntry).exists()) {
                     // Canonicalize to handle Windows drive-letter casing (C:\ vs c:\)
                     try {
@@ -773,6 +820,24 @@ public class GradleProjectImporter implements ProjectImporter {
                 "                        } catch (Exception e) { /* skip */ }\n" +
                 "                    }\n" +
                 "                }\n" +
+                "                def groovyVersions = new LinkedHashSet()\n" +
+                "                ['compileClasspath', 'runtimeClasspath', 'testCompileClasspath', 'testRuntimeClasspath'].each { configName ->\n" +
+                "                    def config = configurations.findByName(configName)\n" +
+                "                    if (config != null && config.canBeResolved) {\n" +
+                "                        try {\n" +
+                "                            config.resolvedConfiguration.resolvedArtifacts.each { artifact ->\n" +
+                "                                def id = artifact.moduleVersion.id\n" +
+                "                                if ((id.group == 'org.apache.groovy' || id.group == 'org.codehaus.groovy')\n" +
+                "                                        && id.name.startsWith('groovy')) {\n" +
+                "                                    groovyVersions.add(id.version)\n" +
+                "                                }\n" +
+                "                            }\n" +
+                "                        } catch (Exception e) { /* skip */ }\n" +
+                "                    }\n" +
+                "                }\n" +
+                "                groovyVersions.each { version ->\n" +
+                "                    println \"GROOVYLS_GROOVY_VERSION:${project.projectDir.absolutePath}:${version}\"\n" +
+                "                }\n" +
                 "            }\n" +
                 "        }\n" +
                 "    }\n" +
@@ -792,12 +857,14 @@ public class GradleProjectImporter implements ProjectImporter {
                 line = line.trim();
                 boolean isMain = line.startsWith("GROOVYLS_CP_MAIN:");
                 boolean isTest = line.startsWith("GROOVYLS_CP_TEST:");
+                boolean isGroovyVersion = line.startsWith("GROOVYLS_GROOVY_VERSION:");
                 boolean isLegacy = !isMain && !isTest && line.startsWith("GROOVYLS_CP:");
-                if (!isMain && !isTest && !isLegacy) {
+                if (!isMain && !isTest && !isLegacy && !isGroovyVersion) {
                     continue;
                 }
                 String prefix = isMain ? "GROOVYLS_CP_MAIN:"
                                : isTest ? "GROOVYLS_CP_TEST:"
+                               : isGroovyVersion ? "GROOVYLS_GROOVY_VERSION:"
                                : "GROOVYLS_CP:";
                 String rest = line.substring(prefix.length());
                 int separatorIdx = findProjectDirSeparator(rest);
@@ -805,7 +872,15 @@ public class GradleProjectImporter implements ProjectImporter {
                     continue;
                 }
                 String projectDir = normalise(rest.substring(0, separatorIdx));
-                String cpEntry = rest.substring(separatorIdx + 1);
+                String value = rest.substring(separatorIdx + 1);
+                if (isGroovyVersion) {
+                    if (!value.isEmpty()) {
+                        detectedGroovyVersionByProject.merge(projectDir, value,
+                                this::pickHigherGroovyVersion);
+                    }
+                    continue;
+                }
+                String cpEntry = value;
                 if (new File(cpEntry).exists()) {
                     try {
                         cpEntry = new File(cpEntry).getCanonicalPath();
@@ -834,6 +909,13 @@ public class GradleProjectImporter implements ProjectImporter {
             classpathsByProject.put(entry.getKey(), new ArrayList<>(entry.getValue()));
         }
         return classpathsByProject;
+    }
+
+    private String pickHigherGroovyVersion(String left, String right) {
+        Optional<String> detected = GroovyVersionDetector.detect(Arrays.asList(
+                "/fake/groovy-" + left + ".jar",
+                "/fake/groovy-" + right + ".jar"));
+        return detected.orElse(right);
     }
 
     /**
@@ -913,7 +995,7 @@ public class GradleProjectImporter implements ProjectImporter {
 
     /**
      * Creates an OutputStream that routes each line of output to the SLF4J
-     * logger at DEBUG level, instead of dumping to System.out/System.err.
+        * logger at TRACE level, instead of dumping to System.out/System.err.
      */
     private OutputStream newLogOutputStream() {
         return new OutputStream() {
@@ -947,7 +1029,7 @@ public class GradleProjectImporter implements ProjectImporter {
             public void flush() {
                 String line = buffer.toString(StandardCharsets.UTF_8).stripTrailing();
                 if (!line.isEmpty()) {
-                    logger.debug("[Gradle] {}", line);
+                    logger.trace("[Gradle] {}", line);
                 }
                 buffer.reset();
             }

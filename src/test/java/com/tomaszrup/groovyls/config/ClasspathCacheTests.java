@@ -412,4 +412,29 @@ class ClasspathCacheTests {
         assertTrue(lastModified > 0, "Last modified should be positive");
         assertEquals(20, size, "Size should match 'apply plugin: \'java\'' (20 bytes)");
     }
+
+    @Test
+    void saveAndLoadPreservesProjectGroovyVersion() throws IOException {
+        Path workspaceRoot = tempDir.resolve("workspace-groovy-version");
+        Path projectRoot = workspaceRoot.resolve("projectA");
+        Files.createDirectories(projectRoot);
+        Files.write(projectRoot.resolve("build.gradle"), "plugins { id 'groovy' }".getBytes(StandardCharsets.UTF_8));
+
+        Map<Path, List<String>> classpaths = new LinkedHashMap<>();
+        classpaths.put(projectRoot,
+                Arrays.asList("/repo/org/apache/groovy/groovy/5.0.4/groovy-5.0.4.jar"));
+
+        Map<Path, String> versions = new LinkedHashMap<>();
+        versions.put(projectRoot, "5.0.4");
+
+        Map<String, String> stamps = ClasspathCache.computeBuildFileStamps(Collections.singletonList(projectRoot));
+        ClasspathCache.save(workspaceRoot, classpaths, versions, stamps, Collections.singletonList(projectRoot));
+
+        Optional<ClasspathCache.CacheData> loaded = ClasspathCache.load(workspaceRoot);
+        assertTrue(loaded.isPresent());
+
+        Optional<String> groovyVersion = ClasspathCache.getProjectGroovyVersion(loaded.get(), projectRoot);
+        assertTrue(groovyVersion.isPresent());
+        assertEquals("5.0.4", groovyVersion.get());
+    }
 }

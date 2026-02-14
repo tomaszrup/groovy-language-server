@@ -452,9 +452,28 @@ class ProjectScopeManagerTests {
 	void testUpdateProjectClasspathSingle() {
 		manager.registerDiscoveredProjects(Arrays.asList(PROJECT_A));
 
-		ProjectScope result = manager.updateProjectClasspath(PROJECT_A, Arrays.asList("/lib/x.jar"));
+		ProjectScope result = manager.updateProjectClasspath(PROJECT_A,
+				Arrays.asList("/repo/org/apache/groovy/groovy/5.0.4/groovy-5.0.4.jar"));
 		Assertions.assertNotNull(result);
 		Assertions.assertTrue(result.isClasspathResolved());
+		Assertions.assertEquals("5.0.4", result.getDetectedGroovyVersion());
+	}
+
+	@Test
+	void testUpdateProjectClasspathsUsesProvidedGroovyVersion() {
+		manager.registerDiscoveredProjects(Arrays.asList(PROJECT_A));
+
+		Map<Path, List<String>> classpaths = new HashMap<>();
+		classpaths.put(PROJECT_A, Arrays.asList("/lib/dep1.jar"));
+
+		Map<Path, String> versions = new HashMap<>();
+		versions.put(PROJECT_A, "4.0.30");
+
+		manager.updateProjectClasspaths(classpaths, versions);
+
+		ProjectScope scopeA = manager.findProjectScopeByRoot(PROJECT_A);
+		Assertions.assertNotNull(scopeA);
+		Assertions.assertEquals("4.0.30", scopeA.getDetectedGroovyVersion());
 	}
 
 	@Test

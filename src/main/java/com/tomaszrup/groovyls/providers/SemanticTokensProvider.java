@@ -114,12 +114,19 @@ public class SemanticTokensProvider {
 
 	private ASTNodeVisitor ast;
 	private FileContentsTracker fileContentsTracker;
+	private final boolean groovy4ColumnCompatibility;
 	private String[] sourceLines;
 	private Set<ClassNode> classNodeSet;
 
 	public SemanticTokensProvider(ASTNodeVisitor ast, FileContentsTracker fileContentsTracker) {
+		this(ast, fileContentsTracker, true);
+	}
+
+	public SemanticTokensProvider(ASTNodeVisitor ast, FileContentsTracker fileContentsTracker,
+								 boolean groovy4ColumnCompatibility) {
 		this.ast = ast;
 		this.fileContentsTracker = fileContentsTracker;
+		this.groovy4ColumnCompatibility = groovy4ColumnCompatibility;
 	}
 
 	public static SemanticTokensLegend getLegend() {
@@ -284,9 +291,12 @@ public class SemanticTokensProvider {
 		int line = node.getLineNumber();
 		int column = node.getColumnNumber();
 
-		// In Groovy 4, ClassNode.getColumnNumber() points to the 'class'/'interface'/'enum'
-		// keyword, not the class name. Find the actual name in the source.
-		int nameCol = findNameColumn(line, column, name);
+		int nameCol = -1;
+		if (groovy4ColumnCompatibility) {
+			// In Groovy 4, ClassNode.getColumnNumber() points to the declaration keyword,
+			// not the class name. Find the actual name in the source.
+			nameCol = findNameColumn(line, column, name);
+		}
 
 		// Emit a keyword token for the declaration keyword (class/interface/enum/trait/record)
 		// so it gets highlighted even when semantic tokens override TextMate scoping.
@@ -408,12 +418,13 @@ public class SemanticTokensProvider {
 		int line = node.getLineNumber();
 		int column = node.getColumnNumber();
 
-		// In Groovy 4, MethodNode.getColumnNumber() points to the first modifier
-		// or return type keyword, not the method name. Find the actual name in
-		// the source.
-		int nameCol = findNameColumn(line, column, name);
-		if (nameCol > 0) {
-			column = nameCol;
+		if (groovy4ColumnCompatibility) {
+			// In Groovy 4, MethodNode.getColumnNumber() points to the first modifier
+			// or return type keyword, not the method name.
+			int nameCol = findNameColumn(line, column, name);
+			if (nameCol > 0) {
+				column = nameCol;
+			}
 		}
 
 		// Emit a type token for the method's return type (e.g. 'String' in 'String getName()')
@@ -436,11 +447,13 @@ public class SemanticTokensProvider {
 		int line = node.getLineNumber();
 		int column = node.getColumnNumber();
 
-		// In Groovy 4, FieldNode.getColumnNumber() may point to the TYPE name,
-		// not the field NAME. Find the actual name in the source.
-		int nameCol = findNameColumn(line, column, name);
-		if (nameCol > 0 && nameCol > column) {
-			column = nameCol;
+		if (groovy4ColumnCompatibility) {
+			// In Groovy 4, FieldNode.getColumnNumber() may point to the TYPE name,
+			// not the field NAME.
+			int nameCol = findNameColumn(line, column, name);
+			if (nameCol > 0 && nameCol > column) {
+				column = nameCol;
+			}
 		}
 
 		// Add type reference token for explicitly-typed field declarations
@@ -473,11 +486,13 @@ public class SemanticTokensProvider {
 		int line = node.getLineNumber();
 		int column = node.getColumnNumber();
 
-		// In Groovy 4, PropertyNode.getColumnNumber() may point to the TYPE name,
-		// not the property NAME. Find the actual name in the source.
-		int nameCol = findNameColumn(line, column, name);
-		if (nameCol > 0 && nameCol > column) {
-			column = nameCol;
+		if (groovy4ColumnCompatibility) {
+			// In Groovy 4, PropertyNode.getColumnNumber() may point to the TYPE name,
+			// not the property NAME.
+			int nameCol = findNameColumn(line, column, name);
+			if (nameCol > 0 && nameCol > column) {
+				column = nameCol;
+			}
 		}
 
 		// Add type reference token for explicitly-typed property declarations
@@ -505,17 +520,16 @@ public class SemanticTokensProvider {
 		int line = node.getLineNumber();
 		int column = node.getColumnNumber();
 
-		// In Groovy 4's Parrot parser, Parameter.getColumnNumber() points to the
-		// start of the TYPE (e.g. "int"), not the parameter NAME (e.g. "currentFrame").
-		// For single-line parameters without default values, getLastColumnNumber()
-		// is the exclusive end of the name, so we can compute the name's start.
-		if (node.getLastLineNumber() == line
-				&& node.getLastColumnNumber() > 0
-				&& !node.hasInitialExpression()) {
-			int nameStart = node.getLastColumnNumber() - name.length();
-			if (nameStart > column) {
-				// The name must come after the type — use the computed position
-				column = nameStart;
+		if (groovy4ColumnCompatibility) {
+			// In Groovy 4's Parrot parser, Parameter.getColumnNumber() points to the
+			// start of the TYPE, not the parameter NAME.
+			if (node.getLastLineNumber() == line
+					&& node.getLastColumnNumber() > 0
+					&& !node.hasInitialExpression()) {
+				int nameStart = node.getLastColumnNumber() - name.length();
+				if (nameStart > column) {
+					column = nameStart;
+				}
 			}
 		}
 
@@ -608,11 +622,13 @@ public class SemanticTokensProvider {
 			int line = typeNode.getLineNumber();
 			int column = typeNode.getColumnNumber();
 
-			// In Groovy 4, the type node's getColumnNumber() in a constructor call
-			// may point to the 'new' keyword. Find the actual type name in the source.
-			int nameCol = findNameColumn(line, column, name);
-			if (nameCol > 0) {
-				column = nameCol;
+			if (groovy4ColumnCompatibility) {
+				// In Groovy 4, the type node's getColumnNumber() in a constructor call
+				// may point to the 'new' keyword.
+				int nameCol = findNameColumn(line, column, name);
+				if (nameCol > 0) {
+					column = nameCol;
+				}
 			}
 
 			addToken(tokens, line, column, name.length(), tokenType, 0);
@@ -757,23 +773,38 @@ public class SemanticTokensProvider {
 	private void addMethodReturnTypeToken(MethodNode node, int nameLine, int nameColumn,
 			List<SemanticToken> tokens) {
 		if (node.isDynamicReturnType()) {
-			return; // 'def' return type — no explicit type to highlight
+			IdentifierOccurrence inferred = findPreviousIdentifierBefore(nameLine, nameColumn);
+			if (inferred == null || "def".equals(inferred.identifier)
+					|| isPrimitiveType(inferred.identifier)) {
+				return;
+			}
+			addToken(tokens, nameLine, inferred.column, inferred.identifier.length(), TYPE_CLASS, 0);
+			return;
 		}
 		ClassNode returnType = node.getReturnType();
-		if (returnType == null || returnType.getLineNumber() == -1) {
+		if (returnType == null) {
 			return;
 		}
 		String typeName = returnType.getNameWithoutPackage();
 		if (isPrimitiveType(typeName)) {
 			return;
 		}
-		// Verify the return type position is before the method name
-		if (returnType.getLineNumber() > nameLine
-				|| (returnType.getLineNumber() == nameLine && returnType.getColumnNumber() >= nameColumn)) {
-			return;
+		int typeLine = returnType.getLineNumber();
+		int typeColumn = returnType.getColumnNumber();
+		if (typeLine <= 0) {
+			typeLine = nameLine;
+		}
+		boolean validAstPosition = typeLine > 0
+				&& (typeLine < nameLine || (typeLine == nameLine && typeColumn > 0 && typeColumn < nameColumn));
+		if (!validAstPosition) {
+			typeLine = nameLine;
+			typeColumn = findIdentifierColumnBefore(nameLine, nameColumn, typeName);
+			if (typeColumn <= 0) {
+				return;
+			}
 		}
 		int tokenType = classNodeToTokenType(returnType);
-		addToken(tokens, returnType.getLineNumber(), returnType.getColumnNumber(), typeName.length(), tokenType, 0);
+		addToken(tokens, typeLine, typeColumn, typeName.length(), tokenType, 0);
 
 		// Also emit tokens for generic type arguments in the return type (e.g. List<String>)
 		addGenericTypeParameterTokens(returnType.getGenericsTypes(), tokens);
@@ -787,23 +818,38 @@ public class SemanticTokensProvider {
 	private void addParameterTypeToken(Parameter node, int nameLine, int nameColumn,
 			List<SemanticToken> tokens) {
 		if (node.isDynamicTyped()) {
+			IdentifierOccurrence inferred = findPreviousIdentifierBefore(nameLine, nameColumn);
+			if (inferred == null || "def".equals(inferred.identifier)
+					|| isPrimitiveType(inferred.identifier)) {
+				return;
+			}
+			addToken(tokens, nameLine, inferred.column, inferred.identifier.length(), TYPE_CLASS, 0);
 			return;
 		}
 		ClassNode paramType = node.getOriginType();
-		if (paramType == null || paramType.getLineNumber() == -1) {
+		if (paramType == null) {
 			return;
 		}
 		String typeName = paramType.getNameWithoutPackage();
 		if (isPrimitiveType(typeName)) {
 			return;
 		}
-		// Verify the type position is before the parameter name
-		if (paramType.getLineNumber() > nameLine
-				|| (paramType.getLineNumber() == nameLine && paramType.getColumnNumber() >= nameColumn)) {
-			return;
+		int typeLine = paramType.getLineNumber();
+		int typeColumn = paramType.getColumnNumber();
+		if (typeLine <= 0) {
+			typeLine = nameLine;
+		}
+		boolean validAstPosition = typeLine > 0
+				&& (typeLine < nameLine || (typeLine == nameLine && typeColumn > 0 && typeColumn < nameColumn));
+		if (!validAstPosition) {
+			typeLine = nameLine;
+			typeColumn = findIdentifierColumnBefore(nameLine, nameColumn, typeName);
+			if (typeColumn <= 0) {
+				return;
+			}
 		}
 		int tokenType = classNodeToTokenType(paramType);
-		addToken(tokens, paramType.getLineNumber(), paramType.getColumnNumber(), typeName.length(), tokenType, 0);
+		addToken(tokens, typeLine, typeColumn, typeName.length(), tokenType, 0);
 
 		// Also emit tokens for generic type arguments (e.g. List<String>)
 		addGenericTypeParameterTokens(paramType.getGenericsTypes(), tokens);
@@ -886,6 +932,62 @@ public class SemanticTokensProvider {
 					}
 				}
 			}
+		}
+	}
+
+	private int findIdentifierColumnBefore(int groovyLine, int beforeColumn, String identifier) {
+		if (sourceLines == null || groovyLine <= 0 || groovyLine > sourceLines.length
+				|| identifier == null || identifier.isEmpty()) {
+			return -1;
+		}
+		String line = sourceLines[groovyLine - 1];
+		int searchEndExclusive = beforeColumn > 0 ? Math.min(beforeColumn - 1, line.length()) : line.length();
+		if (searchEndExclusive <= 0) {
+			return -1;
+		}
+		int idx = line.lastIndexOf(identifier, searchEndExclusive - 1);
+		while (idx >= 0) {
+			boolean startOk = idx == 0 || !Character.isJavaIdentifierPart(line.charAt(idx - 1));
+			int endIndex = idx + identifier.length();
+			boolean endOk = endIndex >= line.length() || !Character.isJavaIdentifierPart(line.charAt(endIndex));
+			if (startOk && endOk) {
+				return idx + 1;
+			}
+			idx = line.lastIndexOf(identifier, idx - 1);
+		}
+		return -1;
+	}
+
+	private IdentifierOccurrence findPreviousIdentifierBefore(int groovyLine, int beforeColumn) {
+		if (sourceLines == null || groovyLine <= 0 || groovyLine > sourceLines.length) {
+			return null;
+		}
+		String line = sourceLines[groovyLine - 1];
+		int idx = beforeColumn > 0 ? Math.min(beforeColumn - 2, line.length() - 1) : line.length() - 1;
+		while (idx >= 0 && Character.isWhitespace(line.charAt(idx))) {
+			idx--;
+		}
+		if (idx < 0 || !Character.isJavaIdentifierPart(line.charAt(idx))) {
+			return null;
+		}
+		int end = idx;
+		while (idx >= 0 && Character.isJavaIdentifierPart(line.charAt(idx))) {
+			idx--;
+		}
+		int start = idx + 1;
+		if (start > end) {
+			return null;
+		}
+		return new IdentifierOccurrence(line.substring(start, end + 1), start + 1);
+	}
+
+	private static final class IdentifierOccurrence {
+		private final String identifier;
+		private final int column;
+
+		private IdentifierOccurrence(String identifier, int column) {
+			this.identifier = identifier;
+			this.column = column;
 		}
 	}
 
