@@ -71,6 +71,7 @@ public class TestLanguageClient implements LanguageClient {
 
     @Override
     public void telemetryEvent(Object object) {
+        // no-op for tests
     }
 
     @Override
@@ -80,6 +81,7 @@ public class TestLanguageClient implements LanguageClient {
 
     @Override
     public void showMessage(MessageParams messageParams) {
+        // no-op for tests
     }
 
     @Override
@@ -91,6 +93,7 @@ public class TestLanguageClient implements LanguageClient {
 
     @Override
     public void logMessage(MessageParams message) {
+        // no-op for tests
     }
 
     @Override

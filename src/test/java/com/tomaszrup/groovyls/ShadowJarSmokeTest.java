@@ -1,28 +1,30 @@
+package com.tomaszrup.groovyls;
+
 import org.codehaus.groovy.control.CompilationUnit;
 import org.codehaus.groovy.control.CompilerConfiguration;
 import org.codehaus.groovy.control.Phases;
-import org.codehaus.groovy.control.SourceUnit;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Smoke test that runs against the shadow JAR to verify all Groovy
  * classes needed for compilation are present after minimization.
  *
  * Usage:
- *   java -cp build/libs/groovy-language-server-all.jar ShadowJarSmokeTest.java
+ *   java -cp build/libs/groovy-language-server-all.jar com.tomaszrup.groovyls.ShadowJarSmokeTest
  */
+@SuppressWarnings("all")
 public class ShadowJarSmokeTest {
+	private static final Logger logger = LoggerFactory.getLogger(ShadowJarSmokeTest.class);
+
     public static void main(String[] args) {
-        System.out.println("=== Shadow JAR Smoke Test ===");
+        logger.info("=== Shadow JAR Smoke Test ===");
 
         try {
-            // 1. Create a CompilationUnit — this triggers ClassHelper, VMPluginFactory,
-            //    DefaultGroovyMethods, and dgmimpl static initialization
             CompilerConfiguration config = new CompilerConfiguration();
             CompilationUnit unit = new CompilationUnit(config);
-            System.out.println("[PASS] CompilationUnit created successfully");
+            logger.info("[PASS] CompilationUnit created successfully");
 
-            // 2. Add a Groovy source and compile to SEMANTIC_ANALYSIS
-            //    (same phase the language server uses)
             String groovySource = String.join("\n",
                 "package test",
                 "",
@@ -43,32 +45,29 @@ public class ShadowJarSmokeTest {
 
             unit.addSource("Hello.groovy", groovySource);
             unit.compile(Phases.SEMANTIC_ANALYSIS);
-            System.out.println("[PASS] Compiled to SEMANTIC_ANALYSIS phase");
+            logger.info("[PASS] Compiled to SEMANTIC_ANALYSIS phase");
 
-            // 3. Verify AST was built
             var modules = unit.getAST().getModules();
             if (modules.isEmpty()) {
-                System.out.println("[FAIL] No modules in AST");
+                logger.error("[FAIL] No modules in AST");
                 System.exit(1);
             }
-            var classNodes = modules.get(0).getClasses();
-            System.out.println("[PASS] AST contains " + classNodes.size() + " class(es)");
 
-            // 4. Verify class node details are accessible
+            var classNodes = modules.get(0).getClasses();
+            logger.info("[PASS] AST contains {} class(es)", classNodes.size());
+
             var helloClass = classNodes.stream()
                 .filter(c -> c.getNameWithoutPackage().equals("Hello"))
                 .findFirst()
-                .orElseThrow(() -> new RuntimeException("Hello class not found in AST"));
+                .orElseThrow(() -> new IllegalStateException("Hello class not found in AST"));
 
             var methods = helloClass.getMethods();
             var fields = helloClass.getFields();
-            System.out.println("[PASS] Hello class has " + methods.size() + " method(s), " + fields.size() + " field(s)");
+            logger.info("[PASS] Hello class has {} method(s), {} field(s)", methods.size(), fields.size());
 
-            System.out.println("\n=== All checks passed! Shadow JAR is functional. ===");
-
-        } catch (Throwable t) {
-            System.out.println("[FAIL] " + t.getClass().getSimpleName() + ": " + t.getMessage());
-            t.printStackTrace();
+            logger.info("=== All checks passed! Shadow JAR is functional. ===");
+        } catch (RuntimeException | LinkageError e) {
+            logger.error("[FAIL] {}: {}", e.getClass().getSimpleName(), e.getMessage(), e);
             System.exit(1);
         }
     }

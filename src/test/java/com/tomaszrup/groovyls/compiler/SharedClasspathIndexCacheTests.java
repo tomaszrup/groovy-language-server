@@ -30,7 +30,8 @@ class SharedClasspathIndexCacheTests {
 
         Assertions.assertNotNull(first);
         Assertions.assertNotNull(first.getIndex());
-        Assertions.assertNull(first.getOwnClasspathElementPaths());
+        Assertions.assertTrue(first.getOwnClasspathElementPaths() == null
+                || first.getOwnClasspathElementPaths().isEmpty());
 
         Assertions.assertNotNull(second);
         Assertions.assertSame(first.getIndex(), second.getIndex());

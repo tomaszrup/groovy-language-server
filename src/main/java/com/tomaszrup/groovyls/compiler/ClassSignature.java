@@ -82,21 +82,7 @@ public class ClassSignature {
 			if (method.isSynthetic()) {
 				continue;
 			}
-			StringBuilder sb = new StringBuilder();
-			if (method.isStatic()) {
-				sb.append("static ");
-			}
-			sb.append(method.getReturnType().getName()).append(' ');
-			sb.append(method.getName()).append('(');
-			Parameter[] params = method.getParameters();
-			for (int i = 0; i < params.length; i++) {
-				if (i > 0) {
-					sb.append(',');
-				}
-				sb.append(params[i].getType().getName());
-			}
-			sb.append(')');
-			methodSignatures.add(sb.toString());
+			methodSignatures.add(buildMethodSignature(method));
 		}
 
 		Set<String> fieldSignatures = new TreeSet<>();
@@ -114,6 +100,24 @@ public class ClassSignature {
 
 		return new ClassSignature(name, superClassName, interfaceNames,
 				methodSignatures, fieldSignatures, propertySignatures);
+	}
+
+	private static String buildMethodSignature(MethodNode method) {
+		StringBuilder sb = new StringBuilder();
+		if (method.isStatic()) {
+			sb.append("static ");
+		}
+		sb.append(method.getReturnType().getName()).append(' ');
+		sb.append(method.getName()).append('(');
+		Parameter[] params = method.getParameters();
+		for (int i = 0; i < params.length; i++) {
+			if (i > 0) {
+				sb.append(',');
+			}
+			sb.append(params[i].getType().getName());
+		}
+		sb.append(')');
+		return sb.toString();
 	}
 
 	@Override

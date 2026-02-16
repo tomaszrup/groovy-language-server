@@ -26,6 +26,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
@@ -71,8 +72,7 @@ class ClasspathResolutionCoordinatorTests {
 
 	@Test
 	void testRequestResolutionNullScope() {
-		// Should be a no-op
-		coordinator.requestResolution(null, URI.create("file:///test.groovy"));
+		Assertions.assertDoesNotThrow(() -> coordinator.requestResolution(null, URI.create("file:///test.groovy")));
 	}
 
 	@Test
@@ -90,8 +90,8 @@ class ClasspathResolutionCoordinatorTests {
 	@Test
 	void testRequestResolutionNullProjectRoot() {
 		ProjectScope scope = scopeManager.getDefaultScope();
-		// Default scope has null projectRoot — should be a no-op
-		coordinator.requestResolution(scope, URI.create("file:///test.groovy"));
+		Assertions.assertDoesNotThrow(
+				() -> coordinator.requestResolution(scope, URI.create("file:///test.groovy")));
 	}
 
 	// --- requestResolution: duplicate suppression ---
@@ -127,7 +127,9 @@ class ClasspathResolutionCoordinatorTests {
 				resolveCalled.countDown();
 				return resolvedClasspath;
 			}
-			@Override public void recompile(Path root) {}
+			@Override public void recompile(Path root) {
+				// no-op for test stub
+			}
 			@Override public boolean isProjectFile(String path) { return false; }
 			@Override public boolean claimsProject(Path root) { return true; }
 		};
@@ -144,22 +146,15 @@ class ClasspathResolutionCoordinatorTests {
 		boolean called = resolveCalled.await(10, TimeUnit.SECONDS);
 		Assertions.assertTrue(called, "resolveClasspath should be called within timeout");
 
-		// Wait for the full async task to finish (including scope update)
-		// Poll for completion since the task runs after resolveClasspath returns
-		long deadline = System.currentTimeMillis() + 10_000;
-		while (!scope.isClasspathResolved() && System.currentTimeMillis() < deadline) {
-			Thread.sleep(100);
-		}
-		Assertions.assertTrue(scope.isClasspathResolved(),
+		Assertions.assertTrue(waitUntil(scope::isClasspathResolved, 10_000),
 				"Scope classpath should be resolved after async task completes");
+		Assertions.assertTrue(waitUntil(
+				() -> coordinator.getResolutionState(PROJECT_A) == ClasspathResolutionCoordinator.ResolutionState.RESOLVED,
+				10_000));
 		Assertions.assertEquals(ClasspathResolutionCoordinator.ResolutionState.RESOLVED,
 				coordinator.getResolutionState(PROJECT_A));
 
-		// Resolution in-flight flag should be cleared
-		deadline = System.currentTimeMillis() + 5_000;
-		while (scopeManager.isResolutionInFlight(PROJECT_A) && System.currentTimeMillis() < deadline) {
-			Thread.sleep(100);
-		}
+		Assertions.assertTrue(waitUntil(() -> !scopeManager.isResolutionInFlight(PROJECT_A), 5_000));
 		Assertions.assertFalse(scopeManager.isResolutionInFlight(PROJECT_A));
 	}
 
@@ -179,7 +174,9 @@ class ClasspathResolutionCoordinatorTests {
 			@Override public Optional<String> detectProjectGroovyVersion(Path projectRoot, List<String> classpathEntries) {
 				return Optional.of("4.0.30");
 			}
-			@Override public void recompile(Path root) {}
+			@Override public void recompile(Path root) {
+				// no-op for test stub
+			}
 			@Override public boolean isProjectFile(String path) { return false; }
 			@Override public boolean claimsProject(Path root) { return true; }
 		};
@@ -193,12 +190,7 @@ class ClasspathResolutionCoordinatorTests {
 		boolean called = resolveCalled.await(10, TimeUnit.SECONDS);
 		Assertions.assertTrue(called, "resolveClasspath should be called within timeout");
 
-		long deadline = System.currentTimeMillis() + 10_000;
-		while (!scope.isClasspathResolved() && System.currentTimeMillis() < deadline) {
-			Thread.sleep(100);
-		}
-
-		Assertions.assertTrue(scope.isClasspathResolved());
+		Assertions.assertTrue(waitUntil(scope::isClasspathResolved, 10_000));
 		Assertions.assertEquals("4.0.30", scope.getDetectedGroovyVersion(),
 				"Scope should use importer-provided Groovy version");
 	}
@@ -221,7 +213,9 @@ class ClasspathResolutionCoordinatorTests {
 			@Override public boolean shouldMarkClasspathResolved(Path root, List<String> classpathEntries) {
 				return false;
 			}
-			@Override public void recompile(Path root) {}
+			@Override public void recompile(Path root) {
+				// no-op for test stub
+			}
 			@Override public boolean isProjectFile(String path) { return false; }
 			@Override public boolean claimsProject(Path root) { return true; }
 		};
@@ -235,10 +229,7 @@ class ClasspathResolutionCoordinatorTests {
 		boolean called = resolveCalled.await(10, TimeUnit.SECONDS);
 		Assertions.assertTrue(called, "resolveClasspath should be called within timeout");
 
-		long deadline = System.currentTimeMillis() + 10_000;
-		while (scopeManager.isResolutionInFlight(PROJECT_A) && System.currentTimeMillis() < deadline) {
-			Thread.sleep(100);
-		}
+		Assertions.assertTrue(waitUntil(() -> !scopeManager.isResolutionInFlight(PROJECT_A), 10_000));
 
 		Assertions.assertFalse(scope.isClasspathResolved(),
 				"Scope should remain unresolved when importer marks classpath incomplete");
@@ -250,56 +241,65 @@ class ClasspathResolutionCoordinatorTests {
 
 	@Test
 	void testShutdown() {
-		coordinator.shutdown();
-		// Should not throw even when called multiple times
-		coordinator.shutdown();
+		Assertions.assertDoesNotThrow(() -> {
+			coordinator.shutdown();
+			coordinator.shutdown();
+		});
 	}
 
 	// --- setters ---
 
 	@Test
 	void testSetLanguageClient() {
-		coordinator.setLanguageClient(null);
-		// No exception
+		Assertions.assertDoesNotThrow(() -> coordinator.setLanguageClient(null));
 	}
 
 	@Test
 	void testSetWorkspaceRoot() {
-		coordinator.setWorkspaceRoot(ROOT);
-		// No exception
+		Assertions.assertDoesNotThrow(() -> coordinator.setWorkspaceRoot(ROOT));
 	}
 
 	@Test
 	void testSetAllDiscoveredRoots() {
-		coordinator.setAllDiscoveredRoots(Arrays.asList(PROJECT_A, PROJECT_B));
-		// No exception
+		Assertions.assertDoesNotThrow(() -> coordinator.setAllDiscoveredRoots(Arrays.asList(PROJECT_A, PROJECT_B)));
 	}
 
 	@Test
 	void testSetClasspathCacheEnabled() {
-		coordinator.setClasspathCacheEnabled(false);
-		coordinator.setClasspathCacheEnabled(true);
-		// No exception
+		Assertions.assertDoesNotThrow(() -> {
+			coordinator.setClasspathCacheEnabled(false);
+			coordinator.setClasspathCacheEnabled(true);
+		});
 	}
 
 	// --- requestResolution: no importer found ---
 
 	@Test
-	void testRequestResolutionNoImporter() throws Exception {
+	void testRequestResolutionNoImporter() {
 		// No importer registered for PROJECT_A
 		scopeManager.registerDiscoveredProjects(Arrays.asList(PROJECT_A));
 		ProjectScope scope = scopeManager.findProjectScopeByRoot(PROJECT_A);
 
 		coordinator.requestResolution(scope, PROJECT_A.resolve("src/Foo.groovy").toUri());
 
-		// Give async task time to run
-		Thread.sleep(500);
+		Assertions.assertTrue(waitUntil(() -> !scopeManager.isResolutionInFlight(PROJECT_A), 5_000));
 
 		// Resolution completes (fails gracefully) but scope stays unresolved
 		Assertions.assertFalse(scope.isClasspathResolved());
 		Assertions.assertFalse(scopeManager.isResolutionInFlight(PROJECT_A));
 		Assertions.assertEquals(ClasspathResolutionCoordinator.ResolutionState.FAILED,
 				coordinator.getResolutionState(PROJECT_A));
+	}
+
+	private static boolean waitUntil(BooleanSupplier condition, long timeoutMillis) {
+		long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+		while (System.nanoTime() < deadline) {
+			if (condition.getAsBoolean()) {
+				return true;
+			}
+			Thread.onSpinWait();
+		}
+		return condition.getAsBoolean();
 	}
 
 }

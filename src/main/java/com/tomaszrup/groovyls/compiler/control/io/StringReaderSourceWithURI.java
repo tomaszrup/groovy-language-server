@@ -33,6 +33,7 @@ public class StringReaderSourceWithURI extends StringReaderSource {
 		this.uri = uri;
 	}
 
+	@Override
 	public URI getURI() {
 		return uri;
 	}

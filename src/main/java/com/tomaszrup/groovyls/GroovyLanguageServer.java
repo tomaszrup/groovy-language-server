@@ -20,8 +20,6 @@
 ////////////////////////////////////////////////////////////////////////////////
 package com.tomaszrup.groovyls;
 
-import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.tomaszrup.groovyls.compiler.SharedClassGraphCache;
 import com.tomaszrup.groovyls.config.ClasspathCache;
@@ -47,24 +45,26 @@ import java.nio.file.Paths;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Level;
 import java.util.stream.Collectors;
 
 public class GroovyLanguageServer implements LanguageServer, LanguageClientAware {
 
     private static final Logger logger = LoggerFactory.getLogger(GroovyLanguageServer.class);
+    private static final String GROOVY_SETTINGS_KEY = "groovy";
+    private static final String STATUS_READY = "ready";
+    private static final String STATUS_IMPORTING = "importing";
+    private static final String PROJECT_IMPORT_CANCELLED = "Project import cancelled";
     private GroovyLanguageClient client;
 
     public static void main(String[] args) throws IOException {
         // Install a global uncaught-exception handler so that unexpected
         // exceptions on any thread are logged instead of silently killing
         // the JVM process (which the client sees as an EPIPE).
-        Thread.setDefaultUncaughtExceptionHandler((thread, throwable) -> {
-            System.err.println("[FATAL] Uncaught exception on thread " + thread.getName());
-            throwable.printStackTrace(System.err);
+        Thread.setDefaultUncaughtExceptionHandler((thread, throwable) ->
             logger.error("Uncaught exception on thread {}: {}",
-                    thread.getName(), throwable.getMessage(), throwable);
-        });
+                thread.getName(), throwable.getMessage(), throwable));
 
         // Suppress noisy "Unmatched cancel notification for request id" warnings
         // from LSP4J's RemoteEndpoint. These occur normally when the client
@@ -95,14 +95,14 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         } else {
             logger.info("Groovy Language Server starting in stdio mode.");
             InputStream in = System.in;
-            OutputStream out = System.out;
+            OutputStream out = new BufferedOutputStream(new FileOutputStream(FileDescriptor.out));
             startServer(in, out);
         }
     }
 
     private static void startServer(InputStream in, OutputStream out) {
         // Redirect System.out to System.err to avoid corrupting the communication channel
-        System.setOut(new PrintStream(System.err));
+        System.setOut(new PrintStream(OutputStream.nullOutputStream()));
 
         GroovyLanguageServer server = new GroovyLanguageServer();
         Launcher<GroovyLanguageClient> launcher = Launcher.createLauncher(server, GroovyLanguageClient.class, in, out);
@@ -131,7 +131,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     /** Shared executor pools for all server components. */
     private final ExecutorPools executorPools = new ExecutorPools();
     /** Future for the background import task, used for cancellation on shutdown. */
-    private volatile Future<?> importFuture;
+    private final AtomicReference<Future<?>> importFuture = new AtomicReference<>();
     /** Whether the on-disk classpath cache is enabled (default: true). */
     private volatile boolean classpathCacheEnabled = true;
     /**
@@ -139,7 +139,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
      * all importers are enabled.  Populated from the {@code groovy.project.importers}
      * VS Code setting via {@code initializationOptions}.
      */
-    private volatile Set<String> enabledImporters = Collections.emptySet();
+    private final AtomicReference<Set<String>> enabledImporters = new AtomicReference<>(Collections.emptySet());
 
     /** Whether backfill of sibling Gradle subprojects is enabled (default: false). */
     private volatile boolean backfillSiblingProjects = false;
@@ -152,10 +152,10 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
      * {@link #importProjectsAsync} once the scope manager and importer map
      * are initialized.
      */
-    private volatile ClasspathResolutionCoordinator resolutionCoordinator;
+    private final AtomicReference<ClasspathResolutionCoordinator> resolutionCoordinator = new AtomicReference<>();
 
     /** Future for the periodic memory usage reporter, cancelled on shutdown. */
-    private volatile java.util.concurrent.ScheduledFuture<?> memoryReporterFuture;
+    private final AtomicReference<java.util.concurrent.ScheduledFuture<?>> memoryReporterFuture = new AtomicReference<>();
 
     public GroovyLanguageServer() {
         this(new CompilationUnitFactory());
@@ -184,10 +184,10 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
      * {@link ProjectImporter#applySettings(JsonObject)}.
      */
     private void applyImporterSettings(JsonObject settings) {
-        if (!settings.has("groovy") || !settings.get("groovy").isJsonObject()) {
+        if (!settings.has(GROOVY_SETTINGS_KEY) || !settings.get(GROOVY_SETTINGS_KEY).isJsonObject()) {
             return;
         }
-        JsonObject groovy = settings.get("groovy").getAsJsonObject();
+        JsonObject groovy = settings.get(GROOVY_SETTINGS_KEY).getAsJsonObject();
         for (ProjectImporter importer : importers) {
             importer.applySettings(groovy);
         }
@@ -222,109 +222,92 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
 
     @Override
     public CompletableFuture<InitializeResult> initialize(InitializeParams params) {
-        String workspaceUriString = null;
         List<WorkspaceFolder> workspaceFolders = params.getWorkspaceFolders();
+        logInitializeWorkspaceFolders(workspaceFolders);
+        String workspaceUriString = resolvePrimaryWorkspaceUri(workspaceFolders);
+        setWorkspaceRootIfPresent(workspaceUriString);
+
+        applyInitializationOptions(params.getInitializationOptions());
+        groovyServices.getScopeManager().setScopeEvictionTTLSeconds(scopeEvictionTTLSeconds);
+        setWorkspaceBoundOnImporters(workspaceUriString);
+
+        ServerCapabilities serverCapabilities = createServerCapabilities();
+        scheduleInitialImport(workspaceFolders);
+
+        // Start periodic memory usage reporter (every 5 seconds)
+        startMemoryReporter();
+
+        InitializeResult initializeResult = new InitializeResult(serverCapabilities);
+        return CompletableFuture.completedFuture(initializeResult);
+    }
+
+    private void logInitializeWorkspaceFolders(List<WorkspaceFolder> workspaceFolders) {
         if (workspaceFolders != null && !workspaceFolders.isEmpty()) {
             logger.info("Initialize received workspace folders: {}",
                     workspaceFolders.stream().map(WorkspaceFolder::getUri).collect(Collectors.toList()));
         } else {
             logger.info("Initialize received no workspace folders");
         }
-        if (workspaceFolders != null && !workspaceFolders.isEmpty()) {
-            workspaceUriString = workspaceFolders.get(0).getUri();
-            logger.info("Primary workspace root selected from first folder: {}", workspaceUriString);
-        }
-        if (workspaceUriString != null) {
-            URI uri = URI.create(workspaceUriString);
-            Path workspaceRoot = Paths.get(uri);
-            groovyServices.setWorkspaceRoot(workspaceRoot);
-        }
+    }
 
-        // Parse initializationOptions for cache settings
-        Object initOptions = params.getInitializationOptions();
-        if (initOptions instanceof JsonObject) {
-            JsonObject opts = (JsonObject) initOptions;
-            if (opts.has("protocolVersion") && opts.get("protocolVersion").isJsonPrimitive()) {
-                String clientProtocolVersion = opts.get("protocolVersion").getAsString();
-                if (!Protocol.VERSION.equals(clientProtocolVersion)) {
-                    logger.warn("Protocol version mismatch: extension={}, server={}. "
-                                    + "Some custom features may not work as expected.",
-                            clientProtocolVersion, Protocol.VERSION);
-                }
-            }
-            // Apply log level before any other processing so all subsequent
-            // log messages respect the configured level.
-            if (opts.has("logLevel") && opts.get("logLevel").isJsonPrimitive()) {
-                applyLogLevel(opts.get("logLevel").getAsString());
-            }
-            if (opts.has("classpathCache")
-                    && opts.get("classpathCache").isJsonPrimitive()
-                    && !opts.get("classpathCache").getAsBoolean()) {
-                classpathCacheEnabled = false;
-                logger.info("Classpath caching disabled via initializationOptions");
-            }
-            // Parse enabled importers list (e.g. ["Gradle", "Maven"])
-            if (opts.has("enabledImporters") && opts.get("enabledImporters").isJsonArray()) {
-                JsonArray arr = opts.getAsJsonArray("enabledImporters");
-                Set<String> enabled = new LinkedHashSet<>();
-                for (JsonElement el : arr) {
-                    if (el.isJsonPrimitive()) {
-                        enabled.add(el.getAsString());
-                    }
-                }
-                if (!enabled.isEmpty()) {
-                    enabledImporters = Collections.unmodifiableSet(enabled);
-                    logger.info("Enabled importers: {}", enabledImporters);
-                }
-            }
-            // Memory management settings
-            if (opts.has("backfillSiblingProjects") && opts.get("backfillSiblingProjects").isJsonPrimitive()) {
-                backfillSiblingProjects = opts.get("backfillSiblingProjects").getAsBoolean();
-                logger.info("Backfill sibling projects: {}", backfillSiblingProjects);
-            }
-            if (opts.has("scopeEvictionTTLSeconds") && opts.get("scopeEvictionTTLSeconds").isJsonPrimitive()) {
-                scopeEvictionTTLSeconds = opts.get("scopeEvictionTTLSeconds").getAsLong();
-                logger.info("Scope eviction TTL: {}s", scopeEvictionTTLSeconds);
-            }
-            if (opts.has("memoryPressureThreshold") && opts.get("memoryPressureThreshold").isJsonPrimitive()) {
-                double threshold = opts.get("memoryPressureThreshold").getAsDouble();
-                groovyServices.getScopeManager().setMemoryPressureThreshold(threshold);
-            }
-            // Configurable ClassGraph rejected packages
-            if (opts.has("rejectedPackages") && opts.get("rejectedPackages").isJsonArray()) {
-                JsonArray arr = opts.getAsJsonArray("rejectedPackages");
-                java.util.List<String> packages = new java.util.ArrayList<>();
-                for (JsonElement el : arr) {
-                    if (el.isJsonPrimitive()) {
-                        String pkg = el.getAsString().trim();
-                        if (!pkg.isEmpty()) {
-                            packages.add(pkg);
-                        }
-                    }
-                }
-                SharedClassGraphCache.getInstance().setAdditionalRejectedPackages(packages);
-            }
+    private String resolvePrimaryWorkspaceUri(List<WorkspaceFolder> workspaceFolders) {
+        if (workspaceFolders == null || workspaceFolders.isEmpty()) {
+            return null;
         }
+        String workspaceUriString = workspaceFolders.get(0).getUri();
+        logger.info("Primary workspace root selected from first folder: {}", workspaceUriString);
+        return workspaceUriString;
+    }
 
-        // Apply memory settings to scope manager
-        groovyServices.getScopeManager().setScopeEvictionTTLSeconds(scopeEvictionTTLSeconds);
-
-        // Set workspace bound on importers so build-tool root searches
-        // stop at the workspace root instead of walking to the filesystem root.
-        if (workspaceUriString != null) {
-            Path wsRoot = Paths.get(URI.create(workspaceUriString));
-            for (ProjectImporter importer : importers) {
-                importer.setWorkspaceBound(wsRoot);
-            }
+    private void setWorkspaceRootIfPresent(String workspaceUriString) {
+        if (workspaceUriString == null) {
+            return;
         }
+        URI uri = URI.create(workspaceUriString);
+        Path workspaceRoot = Paths.get(uri);
+        groovyServices.setWorkspaceRoot(workspaceRoot);
+    }
 
-        // Build capabilities immediately so the client doesn't block
+    private void applyInitializationOptions(Object initOptions) {
+        InitializationOptionsParser.ParsedOptions parsed =
+                InitializationOptionsParser.parse(initOptions);
+        if (parsed == null) {
+            return;
+        }
+        if (parsed.classpathCacheDisabled) {
+            classpathCacheEnabled = false;
+        }
+        if (!parsed.enabledImporters.isEmpty()) {
+            enabledImporters.set(parsed.enabledImporters);
+        }
+        if (parsed.backfillSiblingProjects != null) {
+            backfillSiblingProjects = parsed.backfillSiblingProjects;
+        }
+        if (parsed.scopeEvictionTTLSeconds != null) {
+            scopeEvictionTTLSeconds = parsed.scopeEvictionTTLSeconds;
+        }
+        if (parsed.memoryPressureThreshold != null) {
+            groovyServices.getScopeManager().setMemoryPressureThreshold(parsed.memoryPressureThreshold);
+        }
+        if (!parsed.rejectedPackages.isEmpty()) {
+            SharedClassGraphCache.getInstance().setAdditionalRejectedPackages(parsed.rejectedPackages);
+        }
+    }
+
+    private void setWorkspaceBoundOnImporters(String workspaceUriString) {
+        if (workspaceUriString == null) {
+            return;
+        }
+        Path wsRoot = Paths.get(URI.create(workspaceUriString));
+        for (ProjectImporter importer : importers) {
+            importer.setWorkspaceBound(wsRoot);
+        }
+    }
+
+    private ServerCapabilities createServerCapabilities() {
         CompletionOptions completionOptions = new CompletionOptions(true, Arrays.asList("."));
         ServerCapabilities serverCapabilities = new ServerCapabilities();
         serverCapabilities.setCompletionProvider(completionOptions);
-        // Use full text sync to avoid rare range-application corruption
-        // during complex cross-file workspace edits (e.g. Java move/rename
-        // operations that rewrite Groovy imports).
         serverCapabilities.setTextDocumentSync(TextDocumentSyncKind.Full);
         serverCapabilities.setDocumentSymbolProvider(true);
         serverCapabilities.setWorkspaceSymbolProvider(true);
@@ -334,46 +317,44 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         serverCapabilities.setImplementationProvider(true);
         serverCapabilities.setDocumentHighlightProvider(true);
         serverCapabilities.setHoverProvider(true);
+
         RenameOptions renameOptions = new RenameOptions();
         renameOptions.setPrepareProvider(true);
         serverCapabilities.setRenameProvider(renameOptions);
+
         CodeActionOptions codeActionOptions = new CodeActionOptions();
         codeActionOptions.setCodeActionKinds(Arrays.asList(
                 CodeActionKind.QuickFix,
                 CodeActionKind.Refactor,
                 CodeActionKind.SourceOrganizeImports));
         serverCapabilities.setCodeActionProvider(codeActionOptions);
+
         SignatureHelpOptions signatureHelpOptions = new SignatureHelpOptions();
         signatureHelpOptions.setTriggerCharacters(Arrays.asList("(", ","));
         serverCapabilities.setSignatureHelpProvider(signatureHelpOptions);
+
         SemanticTokensWithRegistrationOptions semanticTokensOptions = new SemanticTokensWithRegistrationOptions();
         semanticTokensOptions.setLegend(com.tomaszrup.groovyls.providers.SemanticTokensProvider.getLegend());
         semanticTokensOptions.setFull(true);
         semanticTokensOptions.setRange(true);
         serverCapabilities.setSemanticTokensProvider(semanticTokensOptions);
+
         InlayHintRegistrationOptions inlayHintOptions = new InlayHintRegistrationOptions();
         inlayHintOptions.setResolveProvider(false);
         serverCapabilities.setInlayHintProvider(inlayHintOptions);
         serverCapabilities.setDocumentFormattingProvider(true);
+        return serverCapabilities;
+    }
 
-        // Schedule heavy Gradle/Maven import work on a background thread so
-        // the LSP initialization response is returned immediately.
-        List<WorkspaceFolder> folders = params.getWorkspaceFolders();
+    private void scheduleInitialImport(List<WorkspaceFolder> folders) {
         if (folders != null && !folders.isEmpty()) {
             final List<WorkspaceFolder> foldersSnapshot = new ArrayList<>(folders);
             groovyServices.setImportInProgress(true);
-            importFuture = executorPools.getImportPool().submit(() -> importProjectsAsync(foldersSnapshot));
-        } else {
-            // No workspace folders — nothing to import, signal completion
-            logProgress("Project import complete");
-            sendStatusUpdate("ready", "Project import complete");
+            importFuture.set(executorPools.getImportPool().submit(() -> importProjectsAsync(foldersSnapshot)));
+            return;
         }
-
-        // Start periodic memory usage reporter (every 5 seconds)
-        startMemoryReporter();
-
-        InitializeResult initializeResult = new InitializeResult(serverCapabilities);
-        return CompletableFuture.completedFuture(initializeResult);
+        logProgress("Project import complete");
+        sendStatusUpdate(STATUS_READY, "Project import complete");
     }
 
     /**
@@ -382,20 +363,13 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
      *
      * <p><b>Performance strategy (lazy two-phase import):</b>
      * <ol>
-     *   <li><b>Phase 1 — Discovery (fast):</b> discover all projects across
-     *       all importers and register scopes immediately with empty
-     *       classpaths.  This lets {@code didOpen} compile files with basic
-     *       syntax while the classpath is being resolved.</li>
-     *   <li><b>Phase 1b — Cache check:</b> if a valid classpath cache
-     *       exists, apply cached classpaths instantly.</li>
-     *   <li><b>Phase 2 — Classpath resolution (no compilation):</b> resolve
-     *       dependency JARs and discover existing class-output directories
-     *       via {@link ProjectImporter#resolveClasspaths}. This is
-     *       dramatically faster than a full import because it skips the
-     *       expensive {@code classes}/{@code testClasses} build tasks.</li>
-     *   <li>Update scopes with resolved classpaths; recompile any files
-     *       the user already had open.</li>
+     *   <li><b>Phase 1 — Discovery:</b> discover/import project roots and register scopes.</li>
+     *   <li><b>Phase 1b — Cache check:</b> validate and apply cached classpaths per project.</li>
+     *   <li><b>Phase 2 — Lazy resolution:</b> unresolved projects resolve classpath on first open.</li>
+     *   <li><b>Phase 3 — Finalization:</b> wire coordinator, compile open files, persist cache.</li>
      * </ol>
+
+     * @param folders workspace folders from initialize
      */
     private void importProjectsAsync(List<WorkspaceFolder> folders) {
         long totalStart = System.currentTimeMillis();
@@ -405,328 +379,50 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                     folders.stream().map(WorkspaceFolder::getUri).collect(Collectors.toList()));
             Map<Path, ProjectImporter> importerMapLocal = new ConcurrentHashMap<>();
             Set<Path> claimedRoots = Collections.synchronizedSet(new LinkedHashSet<>());
-            // Tracks project roots discovered AFTER a cache hit — these are
-            // added to allDiscoveredRoots and will resolve lazily on first file open.
             List<Path> newUncachedRoots = new ArrayList<>();
-
-            // ── Phase 0: Try cache-first ──────────────────────────────────
-            // Load the on-disk cache ONCE.  This single load is used for
-            // all subsequent cache-validity checks (Phases 0, 1b).
             Path workspaceRoot = groovyServices.getWorkspaceRoot();
-            boolean cacheHit = false;
-            List<Path> cachedDiscoveredRoots = null;
-            ClasspathCache.CacheData cachedData = null;
-
-            if (classpathCacheEnabled && workspaceRoot != null) {
-                long cacheStart = System.currentTimeMillis();
-                Optional<ClasspathCache.CacheData> cached = ClasspathCache.load(workspaceRoot);
-                if (cached.isPresent()) {
-                    cachedData = cached.get();
-                    // We need project roots to validate stamps.  If the cache
-                    // contains a discovered-projects list we can use that;
-                    // otherwise we must fall through to discovery.
-                    Optional<List<Path>> cachedRoots = ClasspathCache.toDiscoveredProjectsList(cachedData);
-                    if (cachedRoots.isPresent()) {
-                        Map<String, String> currentStamps =
-                                ClasspathCache.computeBuildFileStamps(cachedRoots.get());
-                        if (ClasspathCache.isValid(cachedData, currentStamps)
-                                && ClasspathCache.areClasspathEntriesPresent(cachedData, 5)) {
-                            cachedDiscoveredRoots = cachedRoots.get();
-                            cacheHit = true;
-
-                            long cacheElapsed = System.currentTimeMillis() - cacheStart;
-                            String cacheMsg = "Using cached classpath ("
-                                    + cachedDiscoveredRoots.size() + " projects, "
-                                    + cacheElapsed + "ms)";
-                            logProgress(cacheMsg);
-                            sendStatusUpdate("importing", cacheMsg);
-                        } else {
-                            logger.info("Classpath cache stamp mismatch or stale entries — will re-discover and resolve");
-                        }
-                    } else {
-                        logger.info("Classpath cache has no discovered-projects list — will discover");
-                    }
-                }
-            }
-
-            // ── Phase 1: Discover projects ────────────────────────────────
-            // Map: importer → list of discovered project roots
             Map<ProjectImporter, List<Path>> discoveredByImporter = new LinkedHashMap<>();
-            List<Path> allDiscoveredRoots;
-
-            if (cacheHit && cachedDiscoveredRoots != null) {
-                // Start with the cached project list.
-                allDiscoveredRoots = new ArrayList<>(cachedDiscoveredRoots);
-                String cachedListMsg = "Using cached project list (" + allDiscoveredRoots.size() + " projects)";
-                logProgress(cachedListMsg);
-                sendStatusUpdate("importing", cachedListMsg);
-
-                // We still need to populate importerMapLocal so that
-                // recompileProject() can look up the right importer.
-                // Assign all cached roots to the first importer that claims them.
-                for (Path root : allDiscoveredRoots) {
-                    for (ProjectImporter importer : importers) {
-                        if (importer.claimsProject(root)) {
-                            importerMapLocal.put(root, importer);
-                            discoveredByImporter
-                                    .computeIfAbsent(importer, k -> new ArrayList<>())
-                                    .add(root);
-                            claimedRoots.add(root);
-                            break;
-                        }
-                    }
-                }
-
-                // ── Detect NEW projects not in the cache ──────────────────
-                // Run a fast discovery pass to find projects that were added
-                // to the workspace since the cache was built.  Discovery uses
-                // directory pruning so it's very quick.
-                Set<String> enabledNames = enabledImporters;
-                List<Path> freshGradleRoots = new ArrayList<>();
-                List<Path> freshMavenRoots = new ArrayList<>();
-                for (WorkspaceFolder folder : folders) {
-                    Path folderPath = Paths.get(URI.create(folder.getUri()));
-                    try {
-                        ProjectDiscovery.DiscoveryResult result =
-                                ProjectDiscovery.discoverAll(folderPath, enabledNames);
-                        freshGradleRoots.addAll(result.gradleProjects);
-                        freshMavenRoots.addAll(result.mavenProjects);
-                    } catch (IOException e) {
-                        logger.error("Error discovering new projects in {}: {}",
-                                folderPath, e.getMessage(), e);
-                    }
-                }
-
-                // Find roots that are freshly discovered but NOT in the cache.
-                // Use the unified discovered lists and let each root find its importer.
-                List<Path> allFreshRoots = new ArrayList<>();
-                allFreshRoots.addAll(freshGradleRoots);
-                allFreshRoots.addAll(freshMavenRoots);
-
-                List<Path> newRoots = newUncachedRoots;
-                for (Path p : allFreshRoots) {
-                    if (claimedRoots.add(p)) {
-                        for (ProjectImporter importer : importers) {
-                            if (importer.claimsProject(p)) {
-                                newRoots.add(p);
-                                importerMapLocal.put(p, importer);
-                                discoveredByImporter
-                                        .computeIfAbsent(importer, k -> new ArrayList<>())
-                                        .add(p);
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                if (!newRoots.isEmpty()) {
-                    String detectedMsg = "Detected " + newRoots.size()
-                            + " new project(s) not in cache: " + newRoots;
-                    logProgress(detectedMsg);
-                    sendStatusUpdate("importing", detectedMsg);
-                    allDiscoveredRoots.addAll(newRoots);
-                    // We keep cacheHit=true so Phase 2 doesn't re-resolve
-                    // the cached projects.  New projects will be resolved
-                    // separately after Phase 1a registration.
-                }
-            } else {
-                // No usable cache — discover from scratch using a SINGLE
-                // unified filesystem walk that finds both Gradle and Maven
-                // projects with directory pruning (skips .git, node_modules,
-                // build, target, etc.)
-                long discoveryStart = System.currentTimeMillis();
-                logProgress("Discovering projects...");
-                sendStatusUpdate("importing", "Discovering projects...");
-
-                // Determine which importer names are enabled
-                Set<String> enabledNames = enabledImporters;
-
-                List<Path> gradleRoots = new ArrayList<>();
-                List<Path> mavenRoots = new ArrayList<>();
-
-                for (WorkspaceFolder folder : folders) {
-                    if (Thread.currentThread().isInterrupted()) {
-                        logProgress("Project import cancelled");
-                        sendStatusUpdate("ready", "Project import cancelled");
-                        return;
-                    }
-                    Path folderPath = Paths.get(URI.create(folder.getUri()));
-
-                    try {
-                        ProjectDiscovery.DiscoveryResult result =
-                                ProjectDiscovery.discoverAll(folderPath, enabledNames);
-                        gradleRoots.addAll(result.gradleProjects);
-                        mavenRoots.addAll(result.mavenProjects);
-                    } catch (IOException e) {
-                        logger.error("Error discovering projects in {}: {}",
-                                folderPath, e.getMessage(), e);
-                    }
-                }
-
-                // Map discovered roots to their importers using claimsProject(),
-                // respecting priority (importers list order — Gradle first).
-                // Collect all discovered roots and let each find its importer.
-                List<Path> allFreshDiscovered = new ArrayList<>();
-                allFreshDiscovered.addAll(gradleRoots);
-                allFreshDiscovered.addAll(mavenRoots);
-
-                for (Path p : allFreshDiscovered) {
-                    if (claimedRoots.add(p)) {
-                        for (ProjectImporter importer : importers) {
-                            if (importer.claimsProject(p)) {
-                                discoveredByImporter
-                                        .computeIfAbsent(importer, k -> new ArrayList<>())
-                                        .add(p);
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                // Log per-importer discovery counts
-                for (ProjectImporter importer : importers) {
-                    List<Path> discovered = discoveredByImporter.getOrDefault(importer, List.of());
-                    if (!discovered.isEmpty()) {
-                        String msg = "Found " + discovered.size() + " " + importer.getName() + " project(s)";
-                        logProgress(msg);
-                        sendStatusUpdate("importing", msg);
-                    } else {
-                        logProgress("No " + importer.getName() + " projects found");
-                        sendStatusUpdate("importing", "No " + importer.getName() + " projects found");
-                    }
-                }
-
-                long discoveryElapsed = System.currentTimeMillis() - discoveryStart;
-
-                allDiscoveredRoots = discoveredByImporter.values().stream()
-                        .flatMap(List::stream).collect(Collectors.toList());
-
-                String discoveryMsg = "Discovery completed in " + discoveryElapsed + "ms ("
-                        + allDiscoveredRoots.size() + " projects)";
-                logProgress(discoveryMsg);
-                sendStatusUpdate("importing", discoveryMsg);
-            }
-
-            if (Thread.currentThread().isInterrupted()) {
-                logProgress("Project import cancelled");
-                sendStatusUpdate("ready", "Project import cancelled");
+            CacheBootstrapResult cacheBootstrap = loadValidCacheBootstrap(workspaceRoot);
+            List<Path> allDiscoveredRoots = runProjectDiscoveryPhase(
+                    folders,
+                    cacheBootstrap,
+                    importerMapLocal,
+                    claimedRoots,
+                    newUncachedRoots,
+                    discoveredByImporter);
+            if (allDiscoveredRoots == null || isImportInterrupted()) {
                 return;
             }
 
-            // ── Phase 1a: Register scopes ─────────────────────────────────
-            if (!allDiscoveredRoots.isEmpty()) {
-                String regMsg = "Discovered " + allDiscoveredRoots.size()
-                        + " project(s), registering scopes...";
-                logProgress(regMsg);
-                sendStatusUpdate("importing", regMsg);
-                groovyServices.registerDiscoveredProjects(allDiscoveredRoots);
+            registerDiscoveredScopes(allDiscoveredRoots, discoveredByImporter, importerMapLocal);
 
-                for (Map.Entry<ProjectImporter, List<Path>> de : discoveredByImporter.entrySet()) {
-                    for (Path root : de.getValue()) {
-                        importerMapLocal.put(root, de.getKey());
-                    }
-                }
-            }
+            CachedClasspathApplyResult cachedClasspathResult = applyCachedProjectClasspaths(
+                    cacheBootstrap.cachedData,
+                    allDiscoveredRoots,
+                    importerMapLocal);
 
-            // ── Phase 1b: Apply per-project cached classpaths ────────────
-            // With the v3 per-project cache, we validate each project's
-            // stamps independently.  Valid projects get their classpath
-            // applied immediately; invalid or missing projects remain
-            // unresolved and will be resolved lazily on first didOpen.
-            Map<Path, List<String>> projectClasspaths = new LinkedHashMap<>();
-            Map<Path, String> projectGroovyVersions = new LinkedHashMap<>();
-            Map<Path, Boolean> projectResolvedStates = new LinkedHashMap<>();
-            int cacheHits = 0;
-
-            if (cachedData != null && !allDiscoveredRoots.isEmpty()) {
-                for (Path root : allDiscoveredRoots) {
-                    if (ClasspathCache.isValidForProject(cachedData, root)) {
-                        Optional<List<String>> cached = ClasspathCache.getProjectClasspath(cachedData, root);
-                        if (cached.isPresent()) {
-                            List<String> cachedClasspath = cached.get();
-                            ProjectImporter importer = importerMapLocal.get(root);
-                            boolean markResolved = importer == null
-                                    || importer.shouldMarkClasspathResolved(root, cachedClasspath);
-                            projectClasspaths.put(root, cachedClasspath);
-                            projectResolvedStates.put(root, markResolved);
-                            ClasspathCache.getProjectGroovyVersion(cachedData, root)
-                                    .ifPresent(version -> projectGroovyVersions.put(root, version));
-                            if (markResolved) {
-                                cacheHits++;
-                            } else {
-                                logger.info("Cached classpath for {} is incomplete; applying classpath but keeping scope unresolved",
-                                        root);
-                            }
-                        }
-                    }
-                }
-                if (cacheHits > 0) {
-                    String appliedMsg = "Applied cached classpaths for " + cacheHits
-                            + "/" + allDiscoveredRoots.size() + " project(s)";
-                    logProgress(appliedMsg);
-                    sendStatusUpdate("importing", appliedMsg);
-                }
-            }
-
-            // ── Phase 2: Apply cached classpaths + set up lazy resolution ─
-            // Unlike the old approach, we do NOT bulk-resolve uncached projects
-            // here.  Instead, they resolve lazily when the user opens a file.
             projectImporterMap.putAll(importerMapLocal);
-
-            if (!projectClasspaths.isEmpty()) {
-                groovyServices.updateProjectClasspaths(projectClasspaths, projectGroovyVersions, projectResolvedStates);
+            if (!cachedClasspathResult.projectClasspaths.isEmpty()) {
+                groovyServices.updateProjectClasspaths(
+                        cachedClasspathResult.projectClasspaths,
+                        cachedClasspathResult.projectGroovyVersions,
+                        cachedClasspathResult.projectResolvedStates);
             }
 
-            int unresolvedCount = allDiscoveredRoots.size() - cacheHits;
+            int unresolvedCount = allDiscoveredRoots.size() - cachedClasspathResult.cacheHits;
             if (unresolvedCount > 0) {
                 logProgress(unresolvedCount + " project(s) will resolve classpath on first file open");
-                sendStatusUpdate("importing", unresolvedCount + " project(s) will resolve classpath on first file open");
+                sendStatusUpdate(STATUS_IMPORTING, unresolvedCount + " project(s) will resolve classpath on first file open");
             }
 
-            // ── Phase 2a: Compile Java sources ───────────────────────────
-            // When using cached classpaths, Java sources may not have been
-            // compiled since the last server run.  Run the build tool's
-            // compile tasks (e.g. Gradle 'classes testClasses') to ensure
-            // .class files are up to date before Groovy compilation starts.
-            // Gradle's incremental build is very fast when nothing changed.
-            if (!allDiscoveredRoots.isEmpty()) {
-                for (Map.Entry<ProjectImporter, List<Path>> de : discoveredByImporter.entrySet()) {
-                    ProjectImporter imp = de.getKey();
-                    List<Path> roots = de.getValue();
-                    if (!roots.isEmpty()) {
-                        String compileMsg = "Compiling " + imp.getName() + " sources ("
-                                + roots.size() + " project(s))...";
-                        logProgress(compileMsg);
-                        sendStatusUpdate("importing", compileMsg);
-                        try {
-                            imp.compileSources(roots);
-                        } catch (Exception e) {
-                            logger.warn("Source compilation failed for {}: {}",
-                                    imp.getName(), e.getMessage());
-                        }
-                    }
-                }
-            }
-
-            // ── Phase 3: Wire up the lazy resolution coordinator ──────────
-            ClasspathResolutionCoordinator coordinator = new ClasspathResolutionCoordinator(
-                    groovyServices.getScopeManager(),
-                    groovyServices.getCompilationService(),
-                    projectImporterMap,
-                    executorPools);
-            coordinator.setLanguageClient(client);
-            coordinator.setWorkspaceRoot(workspaceRoot);
-            coordinator.setAllDiscoveredRoots(allDiscoveredRoots);
-            coordinator.setClasspathCacheEnabled(classpathCacheEnabled);
-            coordinator.setBackfillEnabled(backfillSiblingProjects);
-            this.resolutionCoordinator = coordinator;
-            groovyServices.setResolutionCoordinator(coordinator);
+            compileDiscoveredProjectSources(allDiscoveredRoots, discoveredByImporter);
+            installResolutionCoordinator(workspaceRoot, allDiscoveredRoots);
 
             long totalElapsed = System.currentTimeMillis() - totalStart;
             String completeMsg = "Project discovery complete (" + totalElapsed + "ms, "
-                    + cacheHits + " cached, " + unresolvedCount + " lazy)";
+                    + cachedClasspathResult.cacheHits + " cached, " + unresolvedCount + " lazy)";
             logProgress(completeMsg);
-            sendStatusUpdate("ready", completeMsg);
+            sendStatusUpdate(STATUS_READY, completeMsg);
 
             // Start the eviction scheduler after import is complete
             groovyServices.getScopeManager().startEvictionScheduler(executorPools.getSchedulingPool());
@@ -740,16 +436,363 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         }
     }
 
+    private CacheBootstrapResult loadValidCacheBootstrap(Path workspaceRoot) {
+        if (!classpathCacheEnabled || workspaceRoot == null) {
+            return new CacheBootstrapResult(false, null, null);
+        }
+        long cacheStart = System.currentTimeMillis();
+        Optional<ClasspathCache.CacheData> cached = ClasspathCache.load(workspaceRoot);
+        if (!cached.isPresent()) {
+            return new CacheBootstrapResult(false, null, null);
+        }
+
+        ClasspathCache.CacheData cachedData = cached.get();
+        Optional<List<Path>> cachedRoots = ClasspathCache.toDiscoveredProjectsList(cachedData);
+        if (!cachedRoots.isPresent()) {
+            logger.info("Classpath cache has no discovered-projects list — will discover");
+            return new CacheBootstrapResult(false, null, cachedData);
+        }
+
+        Map<String, String> currentStamps = ClasspathCache.computeBuildFileStamps(cachedRoots.get());
+        boolean valid = ClasspathCache.isValid(cachedData, currentStamps)
+                && ClasspathCache.areClasspathEntriesPresent(cachedData, 5);
+        if (!valid) {
+            logger.info("Classpath cache stamp mismatch or stale entries — will re-discover and resolve");
+            return new CacheBootstrapResult(false, null, cachedData);
+        }
+
+        long cacheElapsed = System.currentTimeMillis() - cacheStart;
+        String cacheMsg = "Using cached classpath (" + cachedRoots.get().size() + " projects, " + cacheElapsed + "ms)";
+        logProgress(cacheMsg);
+        sendStatusUpdate(STATUS_IMPORTING, cacheMsg);
+        return new CacheBootstrapResult(true, cachedRoots.get(), cachedData);
+    }
+
+    private List<Path> runProjectDiscoveryPhase(
+            List<WorkspaceFolder> folders,
+            CacheBootstrapResult cacheBootstrap,
+            Map<Path, ProjectImporter> importerMapLocal,
+            Set<Path> claimedRoots,
+            List<Path> newUncachedRoots,
+            Map<ProjectImporter, List<Path>> discoveredByImporter) {
+        if (cacheBootstrap.cacheHit && cacheBootstrap.cachedDiscoveredRoots != null) {
+            return runCachedDiscoveryPath(
+                    folders,
+                    cacheBootstrap.cachedDiscoveredRoots,
+                    importerMapLocal,
+                    claimedRoots,
+                    newUncachedRoots,
+                    discoveredByImporter);
+        }
+        return runFreshDiscoveryPath(folders, importerMapLocal, claimedRoots, discoveredByImporter);
+    }
+
+    private List<Path> runCachedDiscoveryPath(
+            List<WorkspaceFolder> folders,
+            List<Path> cachedDiscoveredRoots,
+            Map<Path, ProjectImporter> importerMapLocal,
+            Set<Path> claimedRoots,
+            List<Path> newUncachedRoots,
+            Map<ProjectImporter, List<Path>> discoveredByImporter) {
+        List<Path> allDiscoveredRoots = new ArrayList<>(cachedDiscoveredRoots);
+        String cachedListMsg = "Using cached project list (" + allDiscoveredRoots.size() + " projects)";
+        logProgress(cachedListMsg);
+        sendStatusUpdate(STATUS_IMPORTING, cachedListMsg);
+
+        assignRootsToImporters(allDiscoveredRoots, importerMapLocal, discoveredByImporter, claimedRoots, null);
+
+        List<Path> freshRoots = discoverRootsForFolders(folders, "Error discovering new projects in {}: {}");
+        assignRootsToImporters(freshRoots, importerMapLocal, discoveredByImporter, claimedRoots, newUncachedRoots);
+        if (!newUncachedRoots.isEmpty()) {
+            String detectedMsg = "Detected " + newUncachedRoots.size() + " new project(s) not in cache: " + newUncachedRoots;
+            logProgress(detectedMsg);
+            sendStatusUpdate(STATUS_IMPORTING, detectedMsg);
+            allDiscoveredRoots.addAll(newUncachedRoots);
+        }
+        return allDiscoveredRoots;
+    }
+
+    private List<Path> runFreshDiscoveryPath(
+            List<WorkspaceFolder> folders,
+            Map<Path, ProjectImporter> importerMapLocal,
+            Set<Path> claimedRoots,
+            Map<ProjectImporter, List<Path>> discoveredByImporter) {
+        long discoveryStart = System.currentTimeMillis();
+        logProgress("Discovering projects...");
+        sendStatusUpdate(STATUS_IMPORTING, "Discovering projects...");
+
+        List<Path> allFreshDiscovered = new ArrayList<>();
+        Set<String> enabledNames = enabledImporters.get();
+        List<Path> gradleRoots = new ArrayList<>();
+        List<Path> mavenRoots = new ArrayList<>();
+
+        for (WorkspaceFolder folder : folders) {
+            if (isImportInterrupted()) {
+                return Collections.emptyList();
+            }
+            Path folderPath = Paths.get(URI.create(folder.getUri()));
+            collectDiscoveredProjects(folderPath, enabledNames, gradleRoots, mavenRoots,
+                    "Error discovering projects in {}: {}");
+        }
+
+        allFreshDiscovered.addAll(gradleRoots);
+        allFreshDiscovered.addAll(mavenRoots);
+        assignRootsToImporters(allFreshDiscovered, importerMapLocal, discoveredByImporter, claimedRoots, null);
+
+        logPerImporterDiscoveryCounts(discoveredByImporter);
+
+        long discoveryElapsed = System.currentTimeMillis() - discoveryStart;
+        List<Path> allDiscoveredRoots = discoveredByImporter.values().stream()
+                .flatMap(List::stream)
+                .collect(Collectors.toList());
+        String discoveryMsg = "Discovery completed in " + discoveryElapsed + "ms ("
+                + allDiscoveredRoots.size() + " projects)";
+        logProgress(discoveryMsg);
+        sendStatusUpdate(STATUS_IMPORTING, discoveryMsg);
+        return allDiscoveredRoots;
+    }
+
+    private List<Path> discoverRootsForFolders(List<WorkspaceFolder> folders, String errorPattern) {
+        Set<String> enabledNames = enabledImporters.get();
+        List<Path> gradleRoots = new ArrayList<>();
+        List<Path> mavenRoots = new ArrayList<>();
+        for (WorkspaceFolder folder : folders) {
+            Path folderPath = Paths.get(URI.create(folder.getUri()));
+            collectDiscoveredProjects(folderPath, enabledNames, gradleRoots, mavenRoots, errorPattern);
+        }
+        List<Path> allFreshRoots = new ArrayList<>();
+        allFreshRoots.addAll(gradleRoots);
+        allFreshRoots.addAll(mavenRoots);
+        return allFreshRoots;
+    }
+
+    private void assignRootsToImporters(
+            List<Path> roots,
+            Map<Path, ProjectImporter> importerMapLocal,
+            Map<ProjectImporter, List<Path>> discoveredByImporter,
+            Set<Path> claimedRoots,
+            List<Path> acceptedRoots) {
+        for (Path root : roots) {
+            if (!claimedRoots.add(root)) {
+                continue;
+            }
+            for (ProjectImporter importer : importers) {
+                if (importer.claimsProject(root)) {
+                    importerMapLocal.put(root, importer);
+                    discoveredByImporter.computeIfAbsent(importer, k -> new ArrayList<>()).add(root);
+                    if (acceptedRoots != null) {
+                        acceptedRoots.add(root);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    private void logPerImporterDiscoveryCounts(Map<ProjectImporter, List<Path>> discoveredByImporter) {
+        for (ProjectImporter importer : importers) {
+            List<Path> discovered = discoveredByImporter.getOrDefault(importer, List.of());
+            if (!discovered.isEmpty()) {
+                String msg = "Found " + discovered.size() + " " + importer.getName() + " project(s)";
+                logProgress(msg);
+                sendStatusUpdate(STATUS_IMPORTING, msg);
+            } else {
+                String msg = "No " + importer.getName() + " projects found";
+                logProgress(msg);
+                sendStatusUpdate(STATUS_IMPORTING, msg);
+            }
+        }
+    }
+
+    private void registerDiscoveredScopes(
+            List<Path> allDiscoveredRoots,
+            Map<ProjectImporter, List<Path>> discoveredByImporter,
+            Map<Path, ProjectImporter> importerMapLocal) {
+        if (allDiscoveredRoots.isEmpty()) {
+            return;
+        }
+        String regMsg = "Discovered " + allDiscoveredRoots.size() + " project(s), registering scopes...";
+        logProgress(regMsg);
+        sendStatusUpdate(STATUS_IMPORTING, regMsg);
+        groovyServices.registerDiscoveredProjects(allDiscoveredRoots);
+
+        for (Map.Entry<ProjectImporter, List<Path>> entry : discoveredByImporter.entrySet()) {
+            for (Path root : entry.getValue()) {
+                importerMapLocal.put(root, entry.getKey());
+            }
+        }
+    }
+
+    private CachedClasspathApplyResult applyCachedProjectClasspaths(
+            ClasspathCache.CacheData cachedData,
+            List<Path> allDiscoveredRoots,
+            Map<Path, ProjectImporter> importerMapLocal) {
+        Map<Path, List<String>> projectClasspaths = new LinkedHashMap<>();
+        Map<Path, String> projectGroovyVersions = new LinkedHashMap<>();
+        Map<Path, Boolean> projectResolvedStates = new LinkedHashMap<>();
+        int cacheHits = 0;
+
+        if (cachedData != null && !allDiscoveredRoots.isEmpty()) {
+            for (Path root : allDiscoveredRoots) {
+                Optional<CachedClasspathCandidate> candidate = getCachedClasspathCandidate(cachedData, root, importerMapLocal);
+                if (candidate.isPresent()) {
+                    CachedClasspathCandidate cachedCandidate = candidate.get();
+                    projectClasspaths.put(root, cachedCandidate.classpath);
+                    projectResolvedStates.put(root, cachedCandidate.markResolved);
+                    ClasspathCache.getProjectGroovyVersion(cachedData, root)
+                            .ifPresent(version -> projectGroovyVersions.put(root, version));
+                    if (cachedCandidate.markResolved) {
+                        cacheHits++;
+                    } else {
+                        logger.info("Cached classpath for {} is incomplete; applying classpath but keeping scope unresolved",
+                                root);
+                    }
+                }
+            }
+
+            if (cacheHits > 0) {
+                String appliedMsg = "Applied cached classpaths for " + cacheHits
+                        + "/" + allDiscoveredRoots.size() + " project(s)";
+                logProgress(appliedMsg);
+                sendStatusUpdate(STATUS_IMPORTING, appliedMsg);
+            }
+        }
+
+        return new CachedClasspathApplyResult(projectClasspaths, projectGroovyVersions, projectResolvedStates, cacheHits);
+    }
+
+    private Optional<CachedClasspathCandidate> getCachedClasspathCandidate(
+            ClasspathCache.CacheData cachedData,
+            Path root,
+            Map<Path, ProjectImporter> importerMapLocal) {
+        if (!ClasspathCache.isValidForProject(cachedData, root)) {
+            return Optional.empty();
+        }
+        Optional<List<String>> cached = ClasspathCache.getProjectClasspath(cachedData, root);
+        if (!cached.isPresent()) {
+            return Optional.empty();
+        }
+        List<String> classpath = cached.get();
+        ProjectImporter importer = importerMapLocal.get(root);
+        boolean markResolved = importer == null || importer.shouldMarkClasspathResolved(root, classpath);
+        return Optional.of(new CachedClasspathCandidate(classpath, markResolved));
+    }
+
+    private void compileDiscoveredProjectSources(
+            List<Path> allDiscoveredRoots,
+            Map<ProjectImporter, List<Path>> discoveredByImporter) {
+        if (allDiscoveredRoots.isEmpty()) {
+            return;
+        }
+        for (Map.Entry<ProjectImporter, List<Path>> entry : discoveredByImporter.entrySet()) {
+            ProjectImporter importer = entry.getKey();
+            List<Path> roots = entry.getValue();
+            if (!roots.isEmpty()) {
+                String compileMsg = "Compiling " + importer.getName() + " sources ("
+                        + roots.size() + " project(s))...";
+                logProgress(compileMsg);
+                sendStatusUpdate(STATUS_IMPORTING, compileMsg);
+                compileSourcesSafely(importer, roots);
+            }
+        }
+    }
+
+    private void installResolutionCoordinator(Path workspaceRoot, List<Path> allDiscoveredRoots) {
+        ClasspathResolutionCoordinator coordinator = new ClasspathResolutionCoordinator(
+                groovyServices.getScopeManager(),
+                groovyServices.getCompilationService(),
+                projectImporterMap,
+                executorPools);
+        coordinator.setLanguageClient(client);
+        coordinator.setWorkspaceRoot(workspaceRoot);
+        coordinator.setAllDiscoveredRoots(allDiscoveredRoots);
+        coordinator.setClasspathCacheEnabled(classpathCacheEnabled);
+        coordinator.setBackfillEnabled(backfillSiblingProjects);
+        this.resolutionCoordinator.set(coordinator);
+        groovyServices.setResolutionCoordinator(coordinator);
+    }
+
+    private boolean isImportInterrupted() {
+        if (!Thread.currentThread().isInterrupted()) {
+            return false;
+        }
+        logProgress(PROJECT_IMPORT_CANCELLED);
+        sendStatusUpdate(STATUS_READY, PROJECT_IMPORT_CANCELLED);
+        return true;
+    }
+
+    private static final class CacheBootstrapResult {
+        private final boolean cacheHit;
+        private final List<Path> cachedDiscoveredRoots;
+        private final ClasspathCache.CacheData cachedData;
+
+        private CacheBootstrapResult(boolean cacheHit, List<Path> cachedDiscoveredRoots, ClasspathCache.CacheData cachedData) {
+            this.cacheHit = cacheHit;
+            this.cachedDiscoveredRoots = cachedDiscoveredRoots;
+            this.cachedData = cachedData;
+        }
+    }
+
+    private static final class CachedClasspathApplyResult {
+        private final Map<Path, List<String>> projectClasspaths;
+        private final Map<Path, String> projectGroovyVersions;
+        private final Map<Path, Boolean> projectResolvedStates;
+        private final int cacheHits;
+
+        private CachedClasspathApplyResult(
+                Map<Path, List<String>> projectClasspaths,
+                Map<Path, String> projectGroovyVersions,
+                Map<Path, Boolean> projectResolvedStates,
+                int cacheHits) {
+            this.projectClasspaths = projectClasspaths;
+            this.projectGroovyVersions = projectGroovyVersions;
+            this.projectResolvedStates = projectResolvedStates;
+            this.cacheHits = cacheHits;
+        }
+    }
+
+    private static final class CachedClasspathCandidate {
+        private final List<String> classpath;
+        private final boolean markResolved;
+
+        private CachedClasspathCandidate(List<String> classpath, boolean markResolved) {
+            this.classpath = classpath;
+            this.markResolved = markResolved;
+        }
+    }
+
+    private void collectDiscoveredProjects(Path folderPath, Set<String> enabledNames,
+            List<Path> gradleRoots, List<Path> mavenRoots, String errorMessagePattern) {
+        try {
+            ProjectDiscovery.DiscoveryResult result = ProjectDiscovery.discoverAll(folderPath, enabledNames);
+            gradleRoots.addAll(result.gradleProjects);
+            mavenRoots.addAll(result.mavenProjects);
+        } catch (IOException e) {
+            logger.error(errorMessagePattern, folderPath, e.getMessage(), e);
+        }
+    }
+
+    private void compileSourcesSafely(ProjectImporter importer, List<Path> roots) {
+        try {
+            importer.compileSources(roots);
+        } catch (Exception e) {
+            logger.warn("Source compilation failed for {}: {}", importer.getName(), e.getMessage());
+        }
+    }
+
     @Override
     public CompletableFuture<Object> shutdown() {
-        if (memoryReporterFuture != null) {
-            memoryReporterFuture.cancel(false);
+        Future<?> reporterFuture = memoryReporterFuture.getAndSet(null);
+        if (reporterFuture != null) {
+            reporterFuture.cancel(false);
         }
-        if (importFuture != null) {
-            importFuture.cancel(true);
+        Future<?> importTask = importFuture.get();
+        if (importTask != null) {
+            importTask.cancel(true);
         }
-        if (resolutionCoordinator != null) {
-            resolutionCoordinator.shutdown();
+        ClasspathResolutionCoordinator coordinator = resolutionCoordinator.get();
+        if (coordinator != null) {
+            coordinator.shutdown();
         }
         groovyServices.getScopeManager().stopEvictionScheduler();
         groovyServices.shutdown();
@@ -817,7 +860,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
 
     @Override
     public WorkspaceService getWorkspaceService() {
-        return groovyServices;
+        return (WorkspaceService) getTextDocumentService();
     }
 
     @Override
@@ -850,7 +893,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
      * every 5 seconds via the {@code groovy/memoryUsage} notification.
      */
     private void startMemoryReporter() {
-        memoryReporterFuture = executorPools.getSchedulingPool().scheduleAtFixedRate(() -> {
+        java.util.concurrent.ScheduledFuture<?> reporterFuture = executorPools.getSchedulingPool().scheduleAtFixedRate(() -> {
             try {
                 if (client == null) {
                     return;
@@ -867,6 +910,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                 // Ignore — client may have disconnected
             }
         }, 5, 5, TimeUnit.SECONDS);
+        memoryReporterFuture.set(reporterFuture);
     }
 
     /** Send a progress log message to the client (visible in output channel). */
@@ -874,28 +918,6 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         logger.info(message);
         if (client != null) {
             client.logMessage(new MessageParams(MessageType.Info, message));
-        }
-    }
-
-    /**
-     * Dynamically set the Logback root logger level from a string value.
-     * Accepted values (case-insensitive): ERROR, WARN, INFO, DEBUG, TRACE.
-     * Invalid values are ignored and a warning is logged.
-     */
-    private static void applyLogLevel(String levelName) {
-        try {
-            ch.qos.logback.classic.Level level = ch.qos.logback.classic.Level.toLevel(levelName, null);
-            if (level == null) {
-                logger.warn("Unknown log level '{}', keeping current level", levelName);
-                return;
-            }
-            ch.qos.logback.classic.Logger root = (ch.qos.logback.classic.Logger)
-                    LoggerFactory.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME);
-            ch.qos.logback.classic.Level previous = root.getLevel();
-            root.setLevel(level);
-            logger.info("Log level changed from {} to {}", previous, level);
-        } catch (Exception e) {
-            logger.warn("Failed to set log level to '{}': {}", levelName, e.getMessage());
         }
     }
 }

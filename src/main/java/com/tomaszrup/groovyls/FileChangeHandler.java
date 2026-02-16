@@ -58,6 +58,7 @@ public class FileChangeHandler {
 
 	/** Debounce delay for Java/build-file recompile triggers (milliseconds). */
 	private static final long JAVA_RECOMPILE_DEBOUNCE_MS = 2000;
+	private static final String JAVA_EXTENSION = ".java";
 
 	/**
 	 * Common build output directory names. {@code .java} files under these
@@ -115,173 +116,227 @@ public class FileChangeHandler {
 	 * processes Groovy file changes per-scope.
 	 */
 	public void handleDidChangeWatchedFiles(DidChangeWatchedFilesParams params) {
-		if (logger.isDebugEnabled()) {
-			for (org.eclipse.lsp4j.FileEvent event : params.getChanges()) {
-				logger.debug("watcherTrace eventType={} uri={}", event.getType(), event.getUri());
-			}
-		}
+		logWatchedChanges(params);
 
-		Set<URI> allChangedUris = params.getChanges().stream()
-				.map(fileEvent -> URI.create(fileEvent.getUri()))
-				.collect(Collectors.toSet());
-
-		// Invalidate closed-file cache entries for all changed URIs so that
-		// subsequent getContents() calls read fresh content from disk.
+		Set<URI> allChangedUris = collectChangedUris(params);
 		compilationService.getFileContentsTracker().invalidateClosedFileCache(allChangedUris);
 
-		// Detect Java/build-tool file changes that require recompilation.
+		List<ProjectScope> scopes = scopeManager.getProjectScopes();
+		Map<Path, Map<String, String>> javaImportMovesByProject = detectJavaImportMoves(params.getChanges(), scopes);
+		logDetectedJavaImportMoves(javaImportMovesByProject);
+
+		Set<Path> projectsNeedingRecompile = findProjectsNeedingRecompile(allChangedUris, scopes);
+		handleProjectRecompiles(projectsNeedingRecompile, javaImportMovesByProject);
+
+		refreshJavaSourceIndices(allChangedUris);
+		processScopeChanges(allChangedUris, scopes, projectsNeedingRecompile);
+	}
+
+	private void logWatchedChanges(DidChangeWatchedFilesParams params) {
+		if (!logger.isDebugEnabled()) {
+			return;
+		}
+		for (org.eclipse.lsp4j.FileEvent event : params.getChanges()) {
+			logger.debug("watcherTrace eventType={} uri={}", event.getType(), event.getUri());
+		}
+	}
+
+	private Set<URI> collectChangedUris(DidChangeWatchedFilesParams params) {
+		return params.getChanges().stream()
+				.map(fileEvent -> URI.create(fileEvent.getUri()))
+				.collect(Collectors.toSet());
+	}
+
+	private void logDetectedJavaImportMoves(Map<Path, Map<String, String>> javaImportMovesByProject) {
+		if (!logger.isDebugEnabled() || javaImportMovesByProject.isEmpty()) {
+			return;
+		}
+		for (Map.Entry<Path, Map<String, String>> e : javaImportMovesByProject.entrySet()) {
+			logger.debug("watcherTrace javaMoves projectRoot={} moves={}", e.getKey(), e.getValue());
+		}
+	}
+
+	private Set<Path> findProjectsNeedingRecompile(Set<URI> allChangedUris, List<ProjectScope> scopes) {
 		Set<Path> projectsNeedingRecompile = new LinkedHashSet<>();
-		List<ProjectScope> scopes = scopeManager.getProjectScopes(); // volatile read once
-		Map<Path, Map<String, String>> javaImportMovesByProject =
-				detectJavaImportMoves(params.getChanges(), scopes);
-		if (logger.isDebugEnabled() && !javaImportMovesByProject.isEmpty()) {
-			for (Map.Entry<Path, Map<String, String>> e : javaImportMovesByProject.entrySet()) {
-				logger.debug("watcherTrace javaMoves projectRoot={} moves={}", e.getKey(), e.getValue());
-			}
-		}
 		for (URI changedUri : allChangedUris) {
-			String path = changedUri.getPath();
-			if (path != null && (path.endsWith(".java")
-					|| path.endsWith("build.gradle") || path.endsWith("build.gradle.kts")
-					|| path.endsWith("pom.xml"))) {
+			if (isRecompileTriggerPath(changedUri.getPath())) {
 				Path filePath = Paths.get(changedUri);
-				for (ProjectScope scope : scopes) {
-					if (scope.getProjectRoot() != null && filePath.startsWith(scope.getProjectRoot())) {
-						if (path.endsWith(".java") && isBuildOutputFile(filePath, scope.getProjectRoot())) {
-							logger.debug("Ignoring build-output Java file: {}", filePath);
-							break;
-						}
-						projectsNeedingRecompile.add(scope.getProjectRoot());
-						break;
+				Path projectRoot = findProjectRootForJavaFile(filePath, scopes);
+				if (projectRoot != null) {
+					if (isBuildOutputJavaFile(changedUri.getPath(), filePath, projectRoot)) {
+						logger.debug("Ignoring build-output Java file: {}", filePath);
+					} else {
+						projectsNeedingRecompile.add(projectRoot);
 					}
 				}
 			}
 		}
+		return projectsNeedingRecompile;
+	}
 
-		// Schedule debounced async recompile for affected projects.
-		if (!projectsNeedingRecompile.isEmpty()) {
-			if (javaImportMoveListener != null) {
-				for (Map.Entry<Path, Map<String, String>> entry : javaImportMovesByProject.entrySet()) {
-					if (!entry.getValue().isEmpty()) {
-						javaImportMoveListener.onJavaImportsMoved(entry.getKey(), entry.getValue());
-					}
-				}
-			}
-			for (Path projectRoot : projectsNeedingRecompile) {
-				invalidateProjectClasspathCaches(projectRoot);
+	private boolean isRecompileTriggerPath(String path) {
+		return path != null && (path.endsWith(JAVA_EXTENSION)
+				|| path.endsWith("build.gradle")
+				|| path.endsWith("build.gradle.kts")
+				|| path.endsWith("pom.xml"));
+	}
 
-				// Immediately invalidate classloader + compilation unit to ensure
-				// any stale compiled classes are dropped before the next compile.
-				ProjectScope scope = scopeManager.findProjectScopeByRoot(projectRoot);
-				if (scope != null) {
-					scope.getLock().writeLock().lock();
-					try {
-						scope.getCompilationUnitFactory().invalidateCompilationUnitFull();
-					} finally {
-						scope.getLock().writeLock().unlock();
-					}
-				}
+	private boolean isBuildOutputJavaFile(String uriPath, Path filePath, Path projectRoot) {
+		return uriPath != null && uriPath.endsWith(JAVA_EXTENSION) && isBuildOutputFile(filePath, projectRoot);
+	}
 
-				scheduleJavaRecompile(projectRoot);
+	private void handleProjectRecompiles(Set<Path> projectsNeedingRecompile,
+			Map<Path, Map<String, String>> javaImportMovesByProject) {
+		if (projectsNeedingRecompile.isEmpty()) {
+			return;
+		}
+		notifyImportMoves(javaImportMovesByProject);
+		for (Path projectRoot : projectsNeedingRecompile) {
+			invalidateProjectClasspathCaches(projectRoot);
+			invalidateScopeCompilationUnit(projectRoot);
+			scheduleJavaRecompile(projectRoot);
+		}
+	}
+
+	private void notifyImportMoves(Map<Path, Map<String, String>> javaImportMovesByProject) {
+		if (javaImportMoveListener == null) {
+			return;
+		}
+		for (Map.Entry<Path, Map<String, String>> entry : javaImportMovesByProject.entrySet()) {
+			if (!entry.getValue().isEmpty()) {
+				javaImportMoveListener.onJavaImportsMoved(entry.getKey(), entry.getValue());
 			}
 		}
+	}
 
-		// Refresh Java source index for projects with Java file changes
+	private void invalidateScopeCompilationUnit(Path projectRoot) {
+		ProjectScope scope = scopeManager.findProjectScopeByRoot(projectRoot);
+		if (scope == null) {
+			return;
+		}
+		scope.getLock().writeLock().lock();
+		try {
+			scope.getCompilationUnitFactory().invalidateCompilationUnitFull();
+		} finally {
+			scope.getLock().writeLock().unlock();
+		}
+	}
+
+	private void refreshJavaSourceIndices(Set<URI> allChangedUris) {
 		for (URI changedUri : allChangedUris) {
 			String uriPath = changedUri.getPath();
-			if (uriPath != null && uriPath.endsWith(".java")) {
-				for (ProjectScope scope : scopeManager.getAllScopes()) {
-					if (scope.getProjectRoot() != null && scope.getJavaSourceLocator() != null) {
-						Path filePath = Paths.get(changedUri);
-						if (filePath.startsWith(scope.getProjectRoot())
-								&& !isBuildOutputFile(filePath, scope.getProjectRoot())) {
-							scope.getJavaSourceLocator().refresh();
-							break;
-						}
-					}
-				}
-			}
-		}
-
-		// Process each non-recompile scope independently under its own lock.
-		// Use the SAME scope list captured above to avoid a race where
-		// registerDiscoveredProjects() populates projectScopes between the
-		// isEmpty() check and the iteration, causing all changed URIs to be
-		// assigned to every newly-registered scope.
-		List<ProjectScope> scopesToProcess = scopes.isEmpty()
-				? scopeManager.getAllScopes()
-				: scopes;
-		boolean noProjectScopes = scopes.isEmpty();
-
-		for (ProjectScope scope : scopesToProcess) {
-			if (projectsNeedingRecompile.contains(scope.getProjectRoot())) {
-				continue; // handled by scheduleJavaRecompile
-			}
-			// Skip scopes whose classpath hasn't been resolved yet — compiling
-			// them would produce thousands of false-positive diagnostics.
-			if (!scope.isClasspathResolved() && scope.getProjectRoot() != null) {
-				logger.debug("Skipping watcher-triggered compile for {} — classpath not yet resolved",
-						scope.getProjectRoot());
+			if (uriPath == null || !uriPath.endsWith(JAVA_EXTENSION)) {
 				continue;
 			}
+			refreshJavaSourceIndexForUri(changedUri);
+		}
+	}
 
-			Set<URI> scopeUris;
-			if (noProjectScopes) {
-				scopeUris = allChangedUris;
-			} else {
-				scopeUris = allChangedUris.stream()
-						.filter(uri -> {
-							if (scope.getProjectRoot() == null) return false;
-							Path fp = Paths.get(uri);
-							if (!fp.startsWith(scope.getProjectRoot())) return false;
-							String p = uri.getPath();
-							if (p != null && p.endsWith(".java")
-									&& isBuildOutputFile(fp, scope.getProjectRoot())) {
-								logger.debug("Ignoring build-output file in watched-files processing: {}", fp);
-								return false;
-							}
-							return true;
-						})
-						.collect(Collectors.toSet());
+	private void refreshJavaSourceIndexForUri(URI changedUri) {
+		Path filePath = Paths.get(changedUri);
+		for (ProjectScope scope : scopeManager.getAllScopes()) {
+			Path root = scope.getProjectRoot();
+			if (root == null || scope.getJavaSourceLocator() == null) {
+				continue;
 			}
-			if (!scopeUris.isEmpty()) {
-				MdcProjectContext.setProject(scope.getProjectRoot());
-				scope.getLock().writeLock().lock();
-				try {
-					scope.getCompilationUnitFactory().invalidateFileCache();
-
-					// Handle .groovy file deletions: remove from dependency graph
-					for (URI changedUri : scopeUris) {
-						String uriPath = changedUri.getPath();
-						if (uriPath != null && uriPath.endsWith(".groovy")) {
-							try {
-								if (!Files.exists(Paths.get(changedUri))) {
-									scope.getDependencyGraph().removeFile(changedUri);
-								}
-							} catch (Exception e) {
-								// ignore URIs that can't be converted to Path
-							}
-						}
-					}
-					// If the scope hasn't been compiled yet, do a full compile.
-					// Otherwise, update the compilation unit and recompile.
-					boolean didFullCompile = compilationService.ensureScopeCompiled(scope);
-					if (!didFullCompile) {
-						boolean isSameUnit = compilationService.createOrUpdateCompilationUnit(scope, scopeUris);
-						compilationService.resetChangedFilesForScope(scope);
-						Set<URI> errorURIs = compilationService.compile(scope);
-						if (isSameUnit) {
-							compilationService.visitAST(scope, scopeUris, errorURIs);
-						} else {
-							compilationService.visitAST(scope, java.util.Collections.emptySet(), errorURIs);
-						}
-						compilationService.updateDependencyGraph(scope, scopeUris);
-					}
-				} finally {
-					scope.getLock().writeLock().unlock();
-				}
+			if (filePath.startsWith(root) && !isBuildOutputFile(filePath, root)) {
+				scope.getJavaSourceLocator().refresh();
+				return;
 			}
 		}
+	}
+
+	private void processScopeChanges(Set<URI> allChangedUris, List<ProjectScope> capturedScopes,
+			Set<Path> projectsNeedingRecompile) {
+		List<ProjectScope> scopesToProcess = capturedScopes.isEmpty() ? scopeManager.getAllScopes() : capturedScopes;
+		boolean noProjectScopes = capturedScopes.isEmpty();
+
+		for (ProjectScope scope : scopesToProcess) {
+			if (shouldSkipScopeChangeProcessing(scope, projectsNeedingRecompile)) {
+				continue;
+			}
+			Set<URI> scopeUris = resolveScopeUris(scope, allChangedUris, noProjectScopes);
+			if (!scopeUris.isEmpty()) {
+				processScopeUris(scope, scopeUris);
+			}
+		}
+	}
+
+	private boolean shouldSkipScopeChangeProcessing(ProjectScope scope, Set<Path> projectsNeedingRecompile) {
+		boolean handledByRecompile = projectsNeedingRecompile.contains(scope.getProjectRoot());
+		boolean unresolvedClasspath = !scope.isClasspathResolved() && scope.getProjectRoot() != null;
+		if (unresolvedClasspath) {
+			logger.debug("Skipping watcher-triggered compile for {} — classpath not yet resolved",
+					scope.getProjectRoot());
+		}
+		return handledByRecompile || unresolvedClasspath;
+	}
+
+	private Set<URI> resolveScopeUris(ProjectScope scope, Set<URI> allChangedUris, boolean noProjectScopes) {
+		if (noProjectScopes) {
+			return allChangedUris;
+		}
+		Path projectRoot = scope.getProjectRoot();
+		if (projectRoot == null) {
+			return java.util.Collections.emptySet();
+		}
+		return allChangedUris.stream()
+				.filter(uri -> isUriInsideScope(projectRoot, uri))
+				.collect(Collectors.toSet());
+	}
+
+	private boolean isUriInsideScope(Path projectRoot, URI uri) {
+		Path filePath = Paths.get(uri);
+		if (!filePath.startsWith(projectRoot)) {
+			return false;
+		}
+		String path = uri.getPath();
+		if (path != null && path.endsWith(JAVA_EXTENSION) && isBuildOutputFile(filePath, projectRoot)) {
+			logger.debug("Ignoring build-output file in watched-files processing: {}", filePath);
+			return false;
+		}
+		return true;
+	}
+
+	private void processScopeUris(ProjectScope scope, Set<URI> scopeUris) {
+		MdcProjectContext.setProject(scope.getProjectRoot());
+		scope.getLock().writeLock().lock();
+		try {
+			scope.getCompilationUnitFactory().invalidateFileCache();
+			removeDeletedGroovyFiles(scope, scopeUris);
+			recompileScopeForUris(scope, scopeUris);
+		} finally {
+			scope.getLock().writeLock().unlock();
+		}
+	}
+
+	private void removeDeletedGroovyFiles(ProjectScope scope, Set<URI> scopeUris) {
+		for (URI changedUri : scopeUris) {
+			String uriPath = changedUri.getPath();
+			if (uriPath == null || !uriPath.endsWith(".groovy")) {
+				continue;
+			}
+			try {
+				if (!Files.exists(Paths.get(changedUri))) {
+					scope.getDependencyGraph().removeFile(changedUri);
+				}
+			} catch (Exception e) {
+				// ignore URIs that can't be converted to Path
+			}
+		}
+	}
+
+	private void recompileScopeForUris(ProjectScope scope, Set<URI> scopeUris) {
+		boolean didFullCompile = compilationService.ensureScopeCompiled(scope);
+		if (didFullCompile) {
+			return;
+		}
+		boolean isSameUnit = compilationService.createOrUpdateCompilationUnit(scope, scopeUris);
+		compilationService.resetChangedFilesForScope(scope);
+		Set<URI> errorURIs = compilationService.compile(scope);
+		Set<URI> astUris = isSameUnit ? scopeUris : java.util.Collections.emptySet();
+		compilationService.visitAST(scope, astUris, errorURIs);
+		compilationService.updateDependencyGraph(scope, scopeUris);
 	}
 
 	/**
@@ -315,27 +370,7 @@ public class FileChangeHandler {
 		Map<Path, List<Path>> createdByProject = new HashMap<>();
 
 		for (org.eclipse.lsp4j.FileEvent event : events) {
-			URI uri = URI.create(event.getUri());
-			String uriPath = uri.getPath();
-			if (uriPath == null || !uriPath.endsWith(".java")) {
-				continue;
-			}
-			Path filePath;
-			try {
-				filePath = Paths.get(uri);
-			} catch (Exception e) {
-				continue;
-			}
-			Path projectRoot = findProjectRootForJavaFile(filePath, scopes);
-			if (projectRoot == null || isBuildOutputFile(filePath, projectRoot)) {
-				continue;
-			}
-
-			if (event.getType() == org.eclipse.lsp4j.FileChangeType.Deleted) {
-				deletedByProject.computeIfAbsent(projectRoot, pr -> new ArrayList<>()).add(filePath);
-			} else if (event.getType() == org.eclipse.lsp4j.FileChangeType.Created) {
-				createdByProject.computeIfAbsent(projectRoot, pr -> new ArrayList<>()).add(filePath);
-			}
+			handleJavaMoveEvent(event, scopes, deletedByProject, createdByProject);
 		}
 
 		Map<Path, Map<String, String>> movesByProject = new HashMap<>();
@@ -348,6 +383,42 @@ public class FileChangeHandler {
 			}
 		}
 		return movesByProject;
+	}
+
+	private void handleJavaMoveEvent(
+			org.eclipse.lsp4j.FileEvent event,
+			List<ProjectScope> scopes,
+			Map<Path, List<Path>> deletedByProject,
+			Map<Path, List<Path>> createdByProject) {
+		URI uri = URI.create(event.getUri());
+		String uriPath = uri.getPath();
+		if (uriPath == null || !uriPath.endsWith(JAVA_EXTENSION)) {
+			return;
+		}
+
+		Path filePath = toPathOrNull(uri);
+		if (filePath == null) {
+			return;
+		}
+
+		Path projectRoot = findProjectRootForJavaFile(filePath, scopes);
+		if (projectRoot == null || isBuildOutputFile(filePath, projectRoot)) {
+			return;
+		}
+
+		if (event.getType() == org.eclipse.lsp4j.FileChangeType.Deleted) {
+			deletedByProject.computeIfAbsent(projectRoot, pr -> new ArrayList<>()).add(filePath);
+		} else if (event.getType() == org.eclipse.lsp4j.FileChangeType.Created) {
+			createdByProject.computeIfAbsent(projectRoot, pr -> new ArrayList<>()).add(filePath);
+		}
+	}
+
+	private Path toPathOrNull(URI uri) {
+		try {
+			return Paths.get(uri);
+		} catch (Exception e) {
+			return null;
+		}
 	}
 
 	private Path findProjectRootForJavaFile(Path filePath, List<ProjectScope> scopes) {
@@ -389,37 +460,49 @@ public class FileChangeHandler {
 	private String javaPathToFqcn(Path projectRoot, Path javaFilePath) {
 		try {
 			Path relative = projectRoot.relativize(javaFilePath);
-			int startIndex = -1;
-			for (int i = 0; i < relative.getNameCount(); i++) {
-				if ("java".equals(relative.getName(i).toString())) {
-					startIndex = i + 1;
-					break;
-				}
-			}
+			int startIndex = findJavaSegmentStart(relative);
 			if (startIndex < 0 || startIndex >= relative.getNameCount()) {
 				return null;
 			}
 			StringBuilder fqcn = new StringBuilder();
 			for (int i = startIndex; i < relative.getNameCount(); i++) {
-				String segment = relative.getName(i).toString();
-				if (i == relative.getNameCount() - 1) {
-					if (!segment.endsWith(".java")) {
-						return null;
-					}
-					segment = segment.substring(0, segment.length() - ".java".length());
-				}
-				if (segment.isEmpty()) {
+				String segment = normalizeFqcnSegment(relative.getName(i).toString(),
+						i == relative.getNameCount() - 1);
+				if (segment == null || segment.isEmpty()) {
 					return null;
 				}
-				if (fqcn.length() > 0) {
-					fqcn.append('.');
-				}
-				fqcn.append(segment);
+				appendFqcnSegment(fqcn, segment);
 			}
 			return fqcn.toString();
 		} catch (Exception e) {
 			return null;
 		}
+	}
+
+	private int findJavaSegmentStart(Path relativePath) {
+		for (int i = 0; i < relativePath.getNameCount(); i++) {
+			if ("java".equals(relativePath.getName(i).toString())) {
+				return i + 1;
+			}
+		}
+		return -1;
+	}
+
+	private String normalizeFqcnSegment(String segment, boolean lastSegment) {
+		if (!lastSegment) {
+			return segment;
+		}
+		if (!segment.endsWith(JAVA_EXTENSION)) {
+			return null;
+		}
+		return segment.substring(0, segment.length() - JAVA_EXTENSION.length());
+	}
+
+	private void appendFqcnSegment(StringBuilder fqcn, String segment) {
+		if (fqcn.length() > 0) {
+			fqcn.append('.');
+		}
+		fqcn.append(segment);
 	}
 
 	/**

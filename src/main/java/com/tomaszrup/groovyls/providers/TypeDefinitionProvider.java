@@ -65,7 +65,7 @@ public class TypeDefinitionProvider {
 		this.javaSourceLocator = javaSourceLocator;
 	}
 
-	public CompletableFuture<Either<List<? extends Location>, List<? extends LocationLink>>> provideTypeDefinition(
+	public CompletableFuture<Either<List<Location>, List<LocationLink>>> provideTypeDefinition(
 			TextDocumentIdentifier textDocument, Position position) {
 		if (ast == null) {
 			// this shouldn't happen, but let's avoid an exception if something

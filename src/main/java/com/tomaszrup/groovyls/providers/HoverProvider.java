@@ -177,7 +177,7 @@ public class HoverProvider {
 			if (canonicalNode != null) {
 				classNode = canonicalNode;
 			}
-			return GroovyNodeToStringUtils.classToString(classNode, ast);
+			return GroovyNodeToStringUtils.classToString(classNode);
 		} else if (hoverNode instanceof MethodNode) {
 			MethodNode methodNode = (MethodNode) hoverNode;
 			return GroovyNodeToStringUtils.methodToString(methodNode, ast);

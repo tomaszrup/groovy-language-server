@@ -40,17 +40,28 @@ import org.codehaus.groovy.ast.MethodNode;
  * (called "feature methods").
  */
 public class SpockUtils {
+	private static final String BLOCK_GIVEN = "given";
+	private static final String BLOCK_SETUP = "setup";
+	private static final String BLOCK_WHEN = "when";
+	private static final String BLOCK_THEN = "then";
+	private static final String BLOCK_EXPECT = "expect";
+	private static final String BLOCK_CLEANUP = "cleanup";
+	private static final String BLOCK_WHERE = "where";
+	private static final String BLOCK_AND = "and";
+
+	private SpockUtils() {
+	}
 
     /** Fully qualified name of the Spock base class. */
     public static final String SPOCK_SPECIFICATION_CLASS = "spock.lang.Specification";
 
     /** All recognized Spock block labels. */
     public static final Set<String> SPOCK_BLOCK_LABELS = Collections.unmodifiableSet(new HashSet<>(Arrays.asList(
-            "given", "setup", "when", "then", "expect", "cleanup", "where", "and")));
+        BLOCK_GIVEN, BLOCK_SETUP, BLOCK_WHEN, BLOCK_THEN, BLOCK_EXPECT, BLOCK_CLEANUP, BLOCK_WHERE, BLOCK_AND)));
 
     /** Spock lifecycle method names. */
     public static final Set<String> SPOCK_LIFECYCLE_METHODS = Collections.unmodifiableSet(new HashSet<>(Arrays.asList(
-            "setup", "cleanup", "setupSpec", "cleanupSpec")));
+        BLOCK_SETUP, BLOCK_CLEANUP, "setupSpec", "cleanupSpec")));
 
     /** Commonly used Spock annotations (fully qualified). */
     public static final Set<String> SPOCK_ANNOTATIONS = Collections.unmodifiableSet(new HashSet<>(Arrays.asList(
@@ -77,21 +88,21 @@ public class SpockUtils {
 
     static {
         Map<String, String> map = new LinkedHashMap<>();
-        map.put("given", "**given:** (alias: **setup:**) — Sets up preconditions and test fixtures. "
+        map.put(BLOCK_GIVEN, "**given:** (alias: **setup:**) — Sets up preconditions and test fixtures. "
                 + "This is the first block in a feature method and prepares the environment for the stimulus.");
-        map.put("setup", "**setup:** (alias: **given:**) — Sets up preconditions and test fixtures. "
+        map.put(BLOCK_SETUP, "**setup:** (alias: **given:**) — Sets up preconditions and test fixtures. "
                 + "Equivalent to `given:` and can be used interchangeably.");
-        map.put("when", "**when:** — Performs the action or stimulus being tested. "
+        map.put(BLOCK_WHEN, "**when:** — Performs the action or stimulus being tested. "
                 + "Always paired with a `then:` block. Contains the code that triggers the behavior under test.");
-        map.put("then", "**then:** — Asserts the expected outcome after the `when:` block. "
+        map.put(BLOCK_THEN, "**then:** — Asserts the expected outcome after the `when:` block. "
                 + "Conditions in this block are implicitly treated as assertions (no `assert` keyword needed). "
                 + "May also contain exception conditions (`thrown()`) and mock interactions.");
-        map.put("expect", "**expect:** — Combines stimulus and expected response in a single expression. "
+        map.put(BLOCK_EXPECT, "**expect:** — Combines stimulus and expected response in a single expression. "
                 + "Useful when the stimulus and assertion can be expressed together. "
                 + "Each expression is implicitly treated as an assertion.");
-        map.put("cleanup", "**cleanup:** — Post-conditions and resource cleanup. "
+        map.put(BLOCK_CLEANUP, "**cleanup:** — Post-conditions and resource cleanup. "
                 + "Always runs, even if a previous block threw an exception (similar to `finally`).");
-        map.put("where", "**where:** — Provides data for parameterized (data-driven) tests. "
+        map.put(BLOCK_WHERE, "**where:** — Provides data for parameterized (data-driven) tests. "
                 + "Must be the last block in a feature method.\n\n"
                 + "Supports three data supply styles:\n"
                 + "- **Data tables** — columns separated by `|`, inputs/outputs by `||`\n"
@@ -106,7 +117,7 @@ public class SpockUtils {
                 + "1 | 2 || 3\n"
                 + "4 | 5 || 9\n"
                 + "```");
-        map.put("and", "**and:** — Subdivides any other block for readability. "
+            map.put(BLOCK_AND, "**and:** — Subdivides any other block for readability. "
                 + "Does not change the semantics of the enclosing block but improves documentation.");
         BLOCK_DESCRIPTIONS = Collections.unmodifiableMap(map);
     }
@@ -119,14 +130,14 @@ public class SpockUtils {
 
     static {
         Map<String, List<String>> map = new HashMap<>();
-        map.put("given", Arrays.asList("when", "expect", "and", "cleanup", "where"));
-        map.put("setup", Arrays.asList("when", "expect", "and", "cleanup", "where"));
-        map.put("when", Arrays.asList("then", "and"));
-        map.put("then", Arrays.asList("when", "then", "expect", "cleanup", "where", "and"));
-        map.put("expect", Arrays.asList("when", "then", "cleanup", "where", "and"));
-        map.put("cleanup", Arrays.asList("where"));
-        map.put("where", Collections.emptyList());
-        map.put("and", Arrays.asList("when", "then", "expect", "cleanup", "where", "and"));
+        map.put(BLOCK_GIVEN, Arrays.asList(BLOCK_WHEN, BLOCK_EXPECT, BLOCK_AND, BLOCK_CLEANUP, BLOCK_WHERE));
+        map.put(BLOCK_SETUP, Arrays.asList(BLOCK_WHEN, BLOCK_EXPECT, BLOCK_AND, BLOCK_CLEANUP, BLOCK_WHERE));
+        map.put(BLOCK_WHEN, Arrays.asList(BLOCK_THEN, BLOCK_AND));
+        map.put(BLOCK_THEN, Arrays.asList(BLOCK_WHEN, BLOCK_THEN, BLOCK_EXPECT, BLOCK_CLEANUP, BLOCK_WHERE, BLOCK_AND));
+        map.put(BLOCK_EXPECT, Arrays.asList(BLOCK_WHEN, BLOCK_THEN, BLOCK_CLEANUP, BLOCK_WHERE, BLOCK_AND));
+        map.put(BLOCK_CLEANUP, Arrays.asList(BLOCK_WHERE));
+        map.put(BLOCK_WHERE, Collections.emptyList());
+        map.put(BLOCK_AND, Arrays.asList(BLOCK_WHEN, BLOCK_THEN, BLOCK_EXPECT, BLOCK_CLEANUP, BLOCK_WHERE, BLOCK_AND));
         ALLOWED_SUCCESSORS = Collections.unmodifiableMap(map);
     }
 
@@ -298,10 +309,10 @@ public class SpockUtils {
             return null;
         }
         switch (methodName) {
-            case "setup":
+            case BLOCK_SETUP:
                 return "**Spock Fixture:** `setup()` — Runs before **each** feature method. "
                         + "Use for per-test initialization.";
-            case "cleanup":
+            case BLOCK_CLEANUP:
                 return "**Spock Fixture:** `cleanup()` — Runs after **each** feature method. "
                         + "Use for per-test resource cleanup.";
             case "setupSpec":

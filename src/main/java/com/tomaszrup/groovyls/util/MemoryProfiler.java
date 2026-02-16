@@ -98,7 +98,7 @@ public final class MemoryProfiler {
 	private static final long BYTES_PER_CLASSINFO = 6144;
 
 	/** Base overhead of a ScanResult (internal indexes, ClasspathElement list). */
-	private static final long SCANRESULT_BASE_BYTES = 2 * 1024 * 1024; // 2 MB
+	private static final long SCANRESULT_BASE_BYTES = 2L * 1024 * 1024; // 2 MB
 
 	/**
 	 * Estimated bytes per AST node in the ASTNodeVisitor lookup map.
@@ -119,14 +119,14 @@ public final class MemoryProfiler {
 	 * MethodNode → Statement trees), a ReaderSource, ErrorCollector,
 	 * and CompileUnit metadata.  ~40 KB per source file on average.
 	 */
-	private static final long BYTES_PER_SOURCE_UNIT = 40 * 1024; // 40 KB
+	private static final long BYTES_PER_SOURCE_UNIT = 40L * 1024; // 40 KB
 
 	/**
 	 * Base overhead of a GroovyClassLoader instance.
 	 * Includes: internal class cache, defineClass registry, transformation
 	 * caches, parent classloader overhead, and URLClassPath with JAR handles.
 	 */
-	private static final long CLASSLOADER_BASE_BYTES = 5 * 1024 * 1024; // 5 MB
+	private static final long CLASSLOADER_BASE_BYTES = 5L * 1024 * 1024; // 5 MB
 
 	/** Per-classpath-entry cost in the classloader (URL + JAR file handle). */
 	private static final long BYTES_PER_CLASSPATH_ENTRY = 1024;
@@ -167,157 +167,188 @@ public final class MemoryProfiler {
 		if (!ENABLED || scopes == null || scopes.isEmpty()) {
 			return;
 		}
+		if (!logger.isInfoEnabled()) {
+			return;
+		}
 
 		try {
-			List<ScopeProfile> profiles = new ArrayList<>();
-			int activeCount = 0;
-			int evictedCount = 0;
-
-			for (ProjectScope scope : scopes) {
-				if (scope.isEvicted()) {
-					evictedCount++;
-					continue;
-				}
-				activeCount++;
-				Map<String, Double> breakdown = estimateComponentSizes(scope);
-				double totalMB = breakdown.values().stream().mapToDouble(Double::doubleValue).sum();
-				profiles.add(new ScopeProfile(scope, totalMB, breakdown));
-			}
-
-			// Sort descending by total estimated MB
-			profiles.sort((a, b) -> Double.compare(b.totalMB, a.totalMB));
-
-			// Build log message
+			ProfileAggregation aggregation = profileScopes(scopes);
 			StringBuilder sb = new StringBuilder();
-			sb.append("\n=== Memory Profile: Top 3 projects by RAM ===\n");
-
-			int limit = Math.min(3, profiles.size());
-			for (int i = 0; i < limit; i++) {
-				ScopeProfile p = profiles.get(i);
-				String projectName = p.scope.getProjectRoot() != null
-						? p.scope.getProjectRoot().toString() : "<default>";
-				boolean isSharedScan = p.scope.getClassGraphClasspathFiles() != null;
-				String sharedSuffix = isSharedScan ? " [shared scan]" : "";
-				sb.append(String.format("  %d. %s (%.1f MB)%s%n", i + 1, projectName, p.totalMB, sharedSuffix));
-
-				// Top 3 components for this project
-				List<Map.Entry<String, Double>> sorted = new ArrayList<>(p.breakdown.entrySet());
-				sorted.sort((a, b) -> Double.compare(b.getValue(), a.getValue()));
-				int compLimit = Math.min(3, sorted.size());
-
-				sb.append("       ");
-				for (int j = 0; j < compLimit; j++) {
-					Map.Entry<String, Double> entry = sorted.get(j);
-					if (j > 0) {
-						sb.append(" | ");
-					}
-					sb.append(String.format("%s: %.1f MB", entry.getKey(), entry.getValue()));
-				}
-				sb.append('\n');
-
-				// Per-package breakdown of ScanResult memory
-				Double srSize = p.breakdown.get("ClassGraph ScanResult");
-				if (srSize != null && srSize > 0.0) {
-					List<PackageMemoryEntry> pkgEntries = estimateScanResultByPackage(p.scope);
-					if (!pkgEntries.isEmpty()) {
-						int pkgLimit = Math.min(5, pkgEntries.size());
-						sb.append("       Top packages: ");
-						for (int j = 0; j < pkgLimit; j++) {
-							if (j > 0) {
-								sb.append(" | ");
-							}
-							PackageMemoryEntry pe = pkgEntries.get(j);
-							sb.append(String.format("%s %.1f MB (%d classes)",
-									pe.packagePrefix, pe.estimatedMB, pe.classCount));
-						}
-						sb.append('\n');
-					}
-				}
-			}
-
-			double scopeTotalMB = profiles.stream().mapToDouble(p -> p.totalMB).sum();
-			sb.append(String.format("Per-scope total: %.1f MB (%d active, %d evicted)%n",
-					scopeTotalMB, activeCount, evictedCount));
-
-			// --- Global (process-wide) singletons ---
-			sb.append("--- Global (process-wide) ---\n");
-
-			// SharedClassGraphCache (unique ScanResult footprint, no double-counting)
-			SharedClassGraphCache classGraphCache = SharedClassGraphCache.getInstance();
-			long classGraphBytes = classGraphCache.estimateMemoryBytes();
-			double classGraphMB = classGraphBytes / (1024.0 * 1024.0);
-			sb.append(String.format("  SharedClassGraphCache: %.1f MB (%d entries, %d refs)%n",
-					classGraphMB, classGraphCache.getEntryCount(), classGraphCache.getTotalRefCount()));
-
-			// Per-package breakdown across all cached ScanResults
-			List<PackageMemoryEntry> globalPkgs = classGraphCache.getTopPackagesByMemory(5);
-			if (!globalPkgs.isEmpty()) {
-				sb.append("    Top packages: ");
-				for (int i = 0; i < globalPkgs.size(); i++) {
-					if (i > 0) {
-						sb.append(" | ");
-					}
-					PackageMemoryEntry pe = globalPkgs.get(i);
-					sb.append(String.format("%s %.1f MB (%d classes)",
-							pe.packagePrefix, pe.estimatedMB, pe.classCount));
-				}
-				sb.append('\n');
-			}
-
-			// SharedSourceJarIndex
-			SharedSourceJarIndex sourceJarIndex = SharedSourceJarIndex.getInstance();
-			long sourceJarBytes = sourceJarIndex.estimateMemoryBytes();
-			double sourceJarMB = sourceJarBytes / (1024.0 * 1024.0);
-
-			// JavadocResolver (static cache)
-			long javadocBytes = JavadocResolver.estimateCacheMemoryBytes();
-			double javadocMB = javadocBytes / (1024.0 * 1024.0);
-
-			sb.append(String.format("  SharedSourceJarIndex: %.1f MB | JavadocResolver: %.1f MB%n",
-					sourceJarMB, javadocMB));
-
-			// JavaSourceLocator per-scope caches (aggregate across all scopes)
-			double jslTotalMB = 0;
-			for (ProjectScope scope : scopes) {
-				if (!scope.isEvicted()) {
-					JavaSourceLocator locator = scope.getJavaSourceLocator();
-					if (locator != null) {
-						jslTotalMB += locator.estimateMemoryBytes() / (1024.0 * 1024.0);
-					}
-				}
-			}
-			if (jslTotalMB > 0.05) {
-				sb.append(String.format("  JavaSourceLocator (all scopes): %.1f MB%n", jslTotalMB));
-			}
-
-			double globalTotalMB = classGraphMB + sourceJarMB + javadocMB + jslTotalMB;
-
-			// --- Summary ---
-			sb.append("--- Summary ---\n");
-			double trackedMB = scopeTotalMB + globalTotalMB;
-			sb.append(String.format("  Tracked:   %.1f MB (scopes) + %.1f MB (global) = %.1f MB%n",
-					scopeTotalMB, globalTotalMB, trackedMB));
-
-			Runtime rt = Runtime.getRuntime();
-			long usedBytes = rt.totalMemory() - rt.freeMemory();
-			long usedMB = usedBytes / (1024 * 1024);
-			long maxMB = rt.maxMemory() / (1024 * 1024);
-			int pct = (int) (100.0 * usedBytes / rt.maxMemory());
-			sb.append(String.format("  JVM heap:  %,d / %,d MB (%d %%)%n", usedMB, maxMB, pct));
-
-			double untrackedMB = (usedBytes / (1024.0 * 1024.0)) - trackedMB;
-			if (untrackedMB < 0) untrackedMB = 0;
-			sb.append(String.format("  Untracked: ~%.0f MB (JVM internals, thread stacks, LSP4J, GC overhead)%n",
-					untrackedMB));
-
-			sb.append(String.format("Total tracked: %d scopes (%d active, %d evicted) | JVM heap: %,d / %,d MB%n",
-					scopes.size(), activeCount, evictedCount, usedMB, maxMB));
-
+			appendTopProjectSection(sb, aggregation);
+			GlobalSectionTotals globalTotals = appendGlobalSection(sb, scopes);
+			appendSummarySection(sb, scopes.size(), aggregation, globalTotals);
 			logger.info(sb.toString());
 		} catch (Exception e) {
 			// Profiling must never crash the server
 			logger.debug("Memory profiler failed: {}", e.getMessage(), e);
 		}
+	}
+
+	private static ProfileAggregation profileScopes(List<ProjectScope> scopes) {
+		List<ScopeProfile> profiles = new ArrayList<>();
+		int activeCount = 0;
+		int evictedCount = 0;
+
+		for (ProjectScope scope : scopes) {
+			if (scope.isEvicted()) {
+				evictedCount++;
+			} else {
+				activeCount++;
+				Map<String, Double> breakdown = estimateComponentSizes(scope);
+				double totalMB = breakdown.values().stream().mapToDouble(Double::doubleValue).sum();
+				profiles.add(new ScopeProfile(scope, totalMB, breakdown));
+			}
+		}
+
+		profiles.sort((a, b) -> Double.compare(b.totalMB, a.totalMB));
+		double scopeTotalMB = profiles.stream().mapToDouble(p -> p.totalMB).sum();
+		return new ProfileAggregation(profiles, scopeTotalMB, activeCount, evictedCount);
+	}
+
+	private static void appendTopProjectSection(StringBuilder sb, ProfileAggregation aggregation) {
+		sb.append("\n=== Memory Profile: Top 3 projects by RAM ===\n");
+		appendTopProjects(sb, aggregation.profiles);
+		sb.append(String.format("Per-scope total: %.1f MB (%d active, %d evicted)%n",
+				aggregation.scopeTotalMB, aggregation.activeCount, aggregation.evictedCount));
+	}
+
+	private static void appendTopProjects(StringBuilder sb, List<ScopeProfile> profiles) {
+		int limit = Math.min(3, profiles.size());
+		for (int i = 0; i < limit; i++) {
+			ScopeProfile profile = profiles.get(i);
+			appendTopProjectLine(sb, i, profile);
+			appendTopComponents(sb, profile);
+			appendScopePackageBreakdown(sb, profile);
+		}
+	}
+
+	private static void appendTopProjectLine(StringBuilder sb, int index, ScopeProfile profile) {
+		String projectName = profile.scope.getProjectRoot() != null
+				? profile.scope.getProjectRoot().toString()
+				: "<default>";
+		boolean isSharedScan = profile.scope.getClassGraphClasspathFiles() != null;
+		String sharedSuffix = isSharedScan ? " [shared scan]" : "";
+		sb.append(String.format("  %d. %s (%.1f MB)%s%n", index + 1, projectName, profile.totalMB, sharedSuffix));
+	}
+
+	private static void appendTopComponents(StringBuilder sb, ScopeProfile profile) {
+		List<Map.Entry<String, Double>> sorted = new ArrayList<>(profile.breakdown.entrySet());
+		sorted.sort((a, b) -> Double.compare(b.getValue(), a.getValue()));
+		int compLimit = Math.min(3, sorted.size());
+
+		sb.append("       ");
+		for (int j = 0; j < compLimit; j++) {
+			if (j > 0) {
+				sb.append(" | ");
+			}
+			Map.Entry<String, Double> entry = sorted.get(j);
+			sb.append(String.format("%s: %.1f MB", entry.getKey(), entry.getValue()));
+		}
+		sb.append('\n');
+	}
+
+	private static void appendScopePackageBreakdown(StringBuilder sb, ScopeProfile profile) {
+		Double scanResultSize = profile.breakdown.get("ClassGraph ScanResult");
+		if (scanResultSize == null || scanResultSize <= 0.0) {
+			return;
+		}
+		List<PackageMemoryEntry> pkgEntries = estimateScanResultByPackage(profile.scope);
+		if (pkgEntries.isEmpty()) {
+			return;
+		}
+		int pkgLimit = Math.min(5, pkgEntries.size());
+		sb.append("       Top packages: ");
+		for (int j = 0; j < pkgLimit; j++) {
+			if (j > 0) {
+				sb.append(" | ");
+			}
+			PackageMemoryEntry entry = pkgEntries.get(j);
+			sb.append(String.format("%s %.1f MB (%d classes)",
+					entry.packagePrefix, entry.estimatedMB, entry.classCount));
+		}
+		sb.append('\n');
+	}
+
+	private static GlobalSectionTotals appendGlobalSection(StringBuilder sb, List<ProjectScope> scopes) {
+		sb.append("--- Global (process-wide) ---\n");
+
+		SharedClassGraphCache classGraphCache = SharedClassGraphCache.getInstance();
+		double classGraphMB = bytesToMb(classGraphCache.estimateMemoryBytes());
+		sb.append(String.format("  SharedClassGraphCache: %.1f MB (%d entries, %d refs)%n",
+				classGraphMB, classGraphCache.getEntryCount(), classGraphCache.getTotalRefCount()));
+
+		appendGlobalPackageBreakdown(sb, classGraphCache.getTopPackagesByMemory(5));
+
+		double sourceJarMB = bytesToMb(SharedSourceJarIndex.getInstance().estimateMemoryBytes());
+		double javadocMB = bytesToMb(JavadocResolver.estimateCacheMemoryBytes());
+		sb.append(String.format("  SharedSourceJarIndex: %.1f MB | JavadocResolver: %.1f MB%n",
+				sourceJarMB, javadocMB));
+
+		double jslTotalMB = estimateJavaSourceLocatorTotalMb(scopes);
+		if (jslTotalMB > 0.05) {
+			sb.append(String.format("  JavaSourceLocator (all scopes): %.1f MB%n", jslTotalMB));
+		}
+
+		double globalTotalMB = classGraphMB + sourceJarMB + javadocMB + jslTotalMB;
+		return new GlobalSectionTotals(globalTotalMB);
+	}
+
+	private static void appendGlobalPackageBreakdown(StringBuilder sb, List<PackageMemoryEntry> globalPkgs) {
+		if (globalPkgs.isEmpty()) {
+			return;
+		}
+		sb.append("    Top packages: ");
+		for (int i = 0; i < globalPkgs.size(); i++) {
+			if (i > 0) {
+				sb.append(" | ");
+			}
+			PackageMemoryEntry entry = globalPkgs.get(i);
+			sb.append(String.format("%s %.1f MB (%d classes)",
+					entry.packagePrefix, entry.estimatedMB, entry.classCount));
+		}
+		sb.append('\n');
+	}
+
+	private static double estimateJavaSourceLocatorTotalMb(List<ProjectScope> scopes) {
+		double total = 0;
+		for (ProjectScope scope : scopes) {
+			if (!scope.isEvicted()) {
+				JavaSourceLocator locator = scope.getJavaSourceLocator();
+				if (locator != null) {
+					total += bytesToMb(locator.estimateMemoryBytes());
+				}
+			}
+		}
+		return total;
+	}
+
+	private static void appendSummarySection(StringBuilder sb, int scopeCount,
+			ProfileAggregation aggregation, GlobalSectionTotals globalTotals) {
+		sb.append("--- Summary ---\n");
+		double trackedMB = aggregation.scopeTotalMB + globalTotals.globalTotalMB;
+		sb.append(String.format("  Tracked:   %.1f MB (scopes) + %.1f MB (global) = %.1f MB%n",
+				aggregation.scopeTotalMB, globalTotals.globalTotalMB, trackedMB));
+
+		Runtime rt = Runtime.getRuntime();
+		long usedBytes = rt.totalMemory() - rt.freeMemory();
+		long usedMB = usedBytes / (1024 * 1024);
+		long maxMB = rt.maxMemory() / (1024 * 1024);
+		int pct = (int) (100.0 * usedBytes / rt.maxMemory());
+		sb.append(String.format("  JVM heap:  %,d / %,d MB (%d %%)%n", usedMB, maxMB, pct));
+
+		double untrackedMB = bytesToMb(usedBytes) - trackedMB;
+		if (untrackedMB < 0) {
+			untrackedMB = 0;
+		}
+		sb.append(String.format("  Untracked: ~%.0f MB (JVM internals, thread stacks, LSP4J, GC overhead)%n",
+				untrackedMB));
+
+		sb.append(String.format("Total tracked: %d scopes (%d active, %d evicted) | JVM heap: %,d / %,d MB%n",
+				scopeCount, aggregation.activeCount, aggregation.evictedCount, usedMB, maxMB));
+	}
+
+	private static double bytesToMb(long bytes) {
+		return bytes / (1024.0 * 1024.0);
 	}
 
 	/**
@@ -364,7 +395,7 @@ public final class MemoryProfiler {
 		// strings, ClassGraph internal indexes) + base overhead.
 		try {
 			int classCount = sr.getAllClasses().size();
-			long bytes = SCANRESULT_BASE_BYTES + (long) classCount * BYTES_PER_CLASSINFO;
+			long bytes = SCANRESULT_BASE_BYTES + classCount * BYTES_PER_CLASSINFO;
 			return bytes / (1024.0 * 1024.0);
 		} catch (Exception e) {
 			// ScanResult may be closed
@@ -392,7 +423,7 @@ public final class MemoryProfiler {
 				cpSize += testCp.size();
 			}
 		}
-		long bytes = CLASSLOADER_BASE_BYTES + (long) cpSize * BYTES_PER_CLASSPATH_ENTRY;
+		long bytes = CLASSLOADER_BASE_BYTES + cpSize * BYTES_PER_CLASSPATH_ENTRY;
 		return bytes / (1024.0 * 1024.0);
 	}
 
@@ -412,13 +443,13 @@ public final class MemoryProfiler {
 			// best effort
 		}
 
-		long bytes = (long) totalNodes * BYTES_PER_AST_NODE
-				+ (long) totalClassNodes * BYTES_PER_CLASS_NODE;
+		long bytes = totalNodes * BYTES_PER_AST_NODE
+				+ totalClassNodes * BYTES_PER_CLASS_NODE;
 
 		// Reference index (soft, may be null or reclaimed)
 		Map<?, ?> refIndex = visitor.getReferenceIndex();
 		if (refIndex != null) {
-			bytes += (long) refIndex.size() * BYTES_PER_AST_NODE;
+			bytes += refIndex.size() * BYTES_PER_AST_NODE;
 		}
 
 		return bytes / (1024.0 * 1024.0);
@@ -442,7 +473,7 @@ public final class MemoryProfiler {
 		}
 		// 40 KB per source unit: full AST subtree (ModuleNode → ClassNode →
 		// MethodNode → Statement/Expression trees), ReaderSource, ErrorCollector
-		long bytes = (long) sourceUnitCount * BYTES_PER_SOURCE_UNIT;
+		long bytes = sourceUnitCount * BYTES_PER_SOURCE_UNIT;
 		return bytes / (1024.0 * 1024.0);
 	}
 
@@ -457,7 +488,7 @@ public final class MemoryProfiler {
 				totalDiags += ((List<?>) value).size();
 			}
 		}
-		long bytes = (long) totalDiags * BYTES_PER_DIAGNOSTIC;
+		long bytes = totalDiags * BYTES_PER_DIAGNOSTIC;
 		return bytes / (1024.0 * 1024.0);
 	}
 
@@ -470,7 +501,7 @@ public final class MemoryProfiler {
 		// We estimate based on the size of the forward map (each entry has
 		// URI key + Set<URI> value).
 		int edgeCount = graph.getEdgeCount();
-		long bytes = (long) edgeCount * BYTES_PER_DEP_EDGE;
+		long bytes = edgeCount * BYTES_PER_DEP_EDGE;
 		return bytes / (1024.0 * 1024.0);
 	}
 
@@ -486,12 +517,12 @@ public final class MemoryProfiler {
 		// resolvedClasspathCache
 		List<String> resolvedCp = cuf.getResolvedClasspathCache();
 		if (resolvedCp != null) {
-			bytes += (long) resolvedCp.size() * BYTES_PER_CLASSPATH_CACHE_ENTRY;
+			bytes += resolvedCp.size() * BYTES_PER_CLASSPATH_CACHE_ENTRY;
 		}
 
 		// cachedGroovyFiles
 		int cachedFileCount = cuf.getCachedGroovyFileCount();
-		bytes += (long) cachedFileCount * BYTES_PER_CACHED_FILE;
+		bytes += cachedFileCount * BYTES_PER_CACHED_FILE;
 
 		return bytes / (1024.0 * 1024.0);
 	}
@@ -607,6 +638,28 @@ public final class MemoryProfiler {
 			this.scope = scope;
 			this.totalMB = totalMB;
 			this.breakdown = breakdown;
+		}
+	}
+
+	private static final class ProfileAggregation {
+		final List<ScopeProfile> profiles;
+		final double scopeTotalMB;
+		final int activeCount;
+		final int evictedCount;
+
+		ProfileAggregation(List<ScopeProfile> profiles, double scopeTotalMB, int activeCount, int evictedCount) {
+			this.profiles = profiles;
+			this.scopeTotalMB = scopeTotalMB;
+			this.activeCount = activeCount;
+			this.evictedCount = evictedCount;
+		}
+	}
+
+	private static final class GlobalSectionTotals {
+		final double globalTotalMB;
+
+		GlobalSectionTotals(double globalTotalMB) {
+			this.globalTotalMB = globalTotalMB;
 		}
 	}
 }

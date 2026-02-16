@@ -52,7 +52,7 @@ class GroovyNodeToStringUtilsTests {
 				"package com.example\n" +
 				"class Foo {}\n");
 		ClassNode classNode = findClass(ast, "Foo");
-		String result = GroovyNodeToStringUtils.classToString(classNode, ast);
+		String result = GroovyNodeToStringUtils.classToString(classNode);
 		Assertions.assertTrue(result.contains("package com.example"));
 		Assertions.assertTrue(result.contains("class Foo"));
 	}
@@ -62,7 +62,7 @@ class GroovyNodeToStringUtilsTests {
 		ASTNodeVisitor ast = compileAndVisit(
 				"interface MyInterface {}\n");
 		ClassNode classNode = findClass(ast, "MyInterface");
-		String result = GroovyNodeToStringUtils.classToString(classNode, ast);
+		String result = GroovyNodeToStringUtils.classToString(classNode);
 		Assertions.assertTrue(result.contains("interface MyInterface"));
 	}
 
@@ -71,7 +71,7 @@ class GroovyNodeToStringUtilsTests {
 		ASTNodeVisitor ast = compileAndVisit(
 				"enum Color { RED, GREEN, BLUE }\n");
 		ClassNode classNode = findClass(ast, "Color");
-		String result = GroovyNodeToStringUtils.classToString(classNode, ast);
+		String result = GroovyNodeToStringUtils.classToString(classNode);
 		Assertions.assertTrue(result.contains("enum Color"));
 	}
 
@@ -81,7 +81,7 @@ class GroovyNodeToStringUtilsTests {
 				"class Base {}\n" +
 				"class Child extends Base {}\n");
 		ClassNode classNode = findClass(ast, "Child");
-		String result = GroovyNodeToStringUtils.classToString(classNode, ast);
+		String result = GroovyNodeToStringUtils.classToString(classNode);
 		Assertions.assertTrue(result.contains("class Child"));
 		Assertions.assertTrue(result.contains("extends Base"));
 	}
@@ -92,7 +92,7 @@ class GroovyNodeToStringUtilsTests {
 				"interface Greetable {}\n" +
 				"class Hello implements Greetable {}\n");
 		ClassNode classNode = findClass(ast, "Hello");
-		String result = GroovyNodeToStringUtils.classToString(classNode, ast);
+		String result = GroovyNodeToStringUtils.classToString(classNode);
 		Assertions.assertTrue(result.contains("implements Greetable"));
 	}
 
@@ -101,7 +101,7 @@ class GroovyNodeToStringUtilsTests {
 		ASTNodeVisitor ast = compileAndVisit(
 				"abstract class Base {}\n");
 		ClassNode classNode = findClass(ast, "Base");
-		String result = GroovyNodeToStringUtils.classToString(classNode, ast);
+		String result = GroovyNodeToStringUtils.classToString(classNode);
 		Assertions.assertTrue(result.contains("abstract"));
 		Assertions.assertTrue(result.contains("class Base"));
 	}

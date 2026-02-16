@@ -58,7 +58,7 @@ public class SpockCompletionProvider {
     public List<CompletionItem> provideSpockCompletions(URI uri, Position position, ASTNode offsetNode) {
         List<CompletionItem> items = new ArrayList<>();
 
-        if (ast == null || offsetNode == null) {
+                if (uri == null || position == null || ast == null || offsetNode == null) {
             return items;
         }
 
@@ -331,7 +331,6 @@ public class SpockCompletionProvider {
         spy.setSortText("1_Spy");
         items.add(spy);
 
-        // interaction {}
         CompletionItem interaction = new CompletionItem();
         interaction.setLabel("interaction");
         interaction.setKind(CompletionItemKind.Snippet);
@@ -344,7 +343,6 @@ public class SpockCompletionProvider {
         interaction.setSortText("1_interaction");
         items.add(interaction);
 
-        // with() {}
         CompletionItem with = new CompletionItem();
         with.setLabel("with");
         with.setKind(CompletionItemKind.Method);
@@ -357,7 +355,6 @@ public class SpockCompletionProvider {
         with.setSortText("1_with");
         items.add(with);
 
-        // verifyAll() {}
         CompletionItem verifyAll = new CompletionItem();
         verifyAll.setLabel("verifyAll");
         verifyAll.setKind(CompletionItemKind.Method);

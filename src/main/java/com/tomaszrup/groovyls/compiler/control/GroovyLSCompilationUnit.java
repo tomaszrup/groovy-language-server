@@ -53,7 +53,7 @@ public class GroovyLSCompilationUnit extends CompilationUnit {
 		for (SourceUnit sourceUnit : sourceUnitsToRemove) {
 			if (sourceUnit.getAST() != null) {
 				List<String> sourceUnitClassNames = sourceUnit.getAST().getClasses().stream()
-						.map(classNode -> classNode.getName()).collect(Collectors.toList());
+						.map(org.codehaus.groovy.ast.ClassNode::getName).collect(Collectors.toList());
 				final List<GroovyClass> generatedClasses = getClasses();
 				generatedClasses.removeIf(groovyClass -> sourceUnitClassNames.contains(groovyClass.getName()));
 			}

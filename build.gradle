@@ -72,10 +72,10 @@ tasks.build.dependsOn tasks.shadowJar
 // Smoke-test the shadow JAR to catch class-stripping issues that unit tests
 // (which run against the full classpath) cannot detect.
 task shadowJarSmokeTest(type: JavaExec) {
-  dependsOn shadowJar
+  dependsOn shadowJar, testClasses
   description = 'Verifies the shadow JAR can create a Groovy CompilationUnit and compile to SEMANTIC_ANALYSIS'
-  classpath = files(shadowJar.archiveFile)
-  mainClass = 'ShadowJarSmokeTest'
+  classpath = files(sourceSets.test.output.classesDirs, sourceSets.test.output.resourcesDir, shadowJar.archiveFile)
+  mainClass = 'com.tomaszrup.groovyls.ShadowJarSmokeTest'
   jvmArgs = ['-Dsource.encoding=UTF-8']
 }
 tasks.build.dependsOn shadowJarSmokeTest

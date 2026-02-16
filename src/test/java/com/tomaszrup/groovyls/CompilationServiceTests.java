@@ -110,7 +110,7 @@ class CompilationServiceTests {
 
 	@Test
 	void testSetLanguageClientDoesNotThrow() {
-		compilationService.setLanguageClient(null);
+		Assertions.assertDoesNotThrow(() -> compilationService.setLanguageClient(null));
 	}
 
 	// --- ensureScopeCompiled ---
@@ -161,10 +161,11 @@ class CompilationServiceTests {
 		// projectRoot == null → the classPath guard is skipped, compilation runs
 		// on the default factory's compilation unit (which may produce nothing
 		// useful, but it should not crash)
-		compilationService.ensureScopeCompiled(scope);
+		Assertions.assertDoesNotThrow(() -> compilationService.ensureScopeCompiled(scope));
 		// Expected: either compiles or returns false, but must not throw
 		// (the null projectRoot path may fail in factory.create, so we just
 		// verify no uncaught exception)
+		Assertions.assertFalse(scope.isCompilationFailed());
 	}
 
 	// --- createOrUpdateCompilationUnit ---
@@ -206,7 +207,7 @@ class CompilationServiceTests {
 		scope.setCompilationUnit(null);
 
 		// Should handle null compilationUnit gracefully
-		compilationService.compile(scope);
+		Assertions.assertDoesNotThrow(() -> compilationService.compile(scope));
 	}
 
 	@Test
@@ -345,7 +346,7 @@ class CompilationServiceTests {
 		scope.setCompilationUnit(null);
 
 		// Should handle null gracefully
-		compilationService.visitAST(scope);
+		Assertions.assertDoesNotThrow(() -> compilationService.visitAST(scope));
 	}
 
 	// --- compileAndVisitAST ---
@@ -656,7 +657,8 @@ class CompilationServiceTests {
 		fileContentsTracker.setContents(testUri, "class Valid {}");
 
 		// Should not throw
-		compilationService.syntaxCheckSingleFile(testUri);
+		Assertions.assertDoesNotThrow(() -> compilationService.syntaxCheckSingleFile(testUri));
+		Assertions.assertNotNull(fileContentsTracker.getContents(testUri));
 	}
 
 	@Test
@@ -665,14 +667,16 @@ class CompilationServiceTests {
 		fileContentsTracker.setContents(testUri, "class { broken");
 
 		// Should not throw even with syntax errors
-		compilationService.syntaxCheckSingleFile(testUri);
+		Assertions.assertDoesNotThrow(() -> compilationService.syntaxCheckSingleFile(testUri));
+		Assertions.assertNotNull(fileContentsTracker.getContents(testUri));
 	}
 
 	@Test
 	void testSyntaxCheckSingleFileNullContents() {
 		URI testUri = URI.create("file:///test/Unknown.groovy");
 		// No contents set — should return early
-		compilationService.syntaxCheckSingleFile(testUri);
+		Assertions.assertDoesNotThrow(() -> compilationService.syntaxCheckSingleFile(testUri));
+		Assertions.assertNull(fileContentsTracker.getContents(testUri));
 	}
 
 	// --- recompileForClasspathChange ---
@@ -706,7 +710,8 @@ class CompilationServiceTests {
 		compilationService.ensureScopeCompiled(scope);
 
 		// Should not throw
-		compilationService.recompileAfterJavaChange(scope);
+		Assertions.assertDoesNotThrow(() -> compilationService.recompileAfterJavaChange(scope));
+		Assertions.assertTrue(scope.isCompiled());
 	}
 
 	// --- Full compilation flow ---
@@ -750,6 +755,7 @@ class CompilationServiceTests {
 
 		@Override
 		public void telemetryEvent(Object object) {
+			// Intentionally ignored in tests; this client only captures messages/diagnostics.
 		}
 
 		@Override
@@ -770,6 +776,7 @@ class CompilationServiceTests {
 
 		@Override
 		public void logMessage(MessageParams message) {
+			// Intentionally ignored in tests; assertions use captured diagnostics/messages only.
 		}
 	}
 }

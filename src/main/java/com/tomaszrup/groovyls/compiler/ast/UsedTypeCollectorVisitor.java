@@ -75,9 +75,9 @@ class UsedTypeCollectorVisitor extends ClassCodeVisitorSupport {
 	@Override
 	public void visitVariableExpression(VariableExpression expression) {
 		if (expression.getAccessedVariable() != null) {
-			addClassName(expression.getAccessedVariable().getOriginType());
+			addClassName(expression.getAccessedVariable().getType());
 		}
-		addClassName(expression.getOriginType());
+		addClassName(expression.getType());
 		// Also collect the variable name itself — needed for static field imports
 		// (e.g., import static java.lang.Math.PI → variable "PI")
 		usedNames.add(expression.getName());
@@ -87,7 +87,7 @@ class UsedTypeCollectorVisitor extends ClassCodeVisitorSupport {
 	@Override
 	public void visitDeclarationExpression(DeclarationExpression expression) {
 		if (expression.getLeftExpression() instanceof VariableExpression) {
-			addClassName(((VariableExpression) expression.getLeftExpression()).getOriginType());
+			addClassName(((VariableExpression) expression.getLeftExpression()).getType());
 		}
 		super.visitDeclarationExpression(expression);
 	}
@@ -100,8 +100,20 @@ class UsedTypeCollectorVisitor extends ClassCodeVisitorSupport {
 
 	@Override
 	public void visitForLoop(ForStatement forLoop) {
-		addClassName(forLoop.getVariableType());
+		addClassName(resolveForLoopVariableType(forLoop));
 		super.visitForLoop(forLoop);
+	}
+
+	private ClassNode resolveForLoopVariableType(ForStatement forLoop) {
+		if (forLoop == null) {
+			return null;
+		}
+		try {
+			Object variableType = forLoop.getClass().getMethod("getVariableType").invoke(forLoop);
+			return variableType instanceof ClassNode ? (ClassNode) variableType : null;
+		} catch (ReflectiveOperationException | RuntimeException ignored) {
+			return null;
+		}
 	}
 
 	@Override

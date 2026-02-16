@@ -60,33 +60,7 @@ public final class GroovyVersionDetector {
         List<String> classifierCandidates = new ArrayList<>();
 
         for (String entry : classpathEntries) {
-            String fileName = toFileName(entry);
-            if (fileName == null || !fileName.endsWith(".jar")) {
-                continue;
-            }
-            String base = fileName.substring(0, fileName.length() - 4);
-
-            Optional<String> classifierVersion = extractGroovyClassifierVersion(base);
-            classifierVersion.ifPresent(classifierCandidates::add);
-
-            if (!base.startsWith("groovy-")) {
-                continue;
-            }
-            if (base.endsWith("-sources") || base.endsWith("-javadoc") || base.endsWith("-tests")) {
-                continue;
-            }
-
-            Optional<String> maybeVersion = extractTrailingVersion(base);
-            if (maybeVersion.isEmpty()) {
-                continue;
-            }
-
-            String version = maybeVersion.get();
-            if (base.startsWith("groovy-all-") || base.matches("groovy-\\d+.*")) {
-                coreCandidates.add(version);
-            } else {
-                moduleCandidates.add(version);
-            }
+            addCandidates(entry, coreCandidates, moduleCandidates, classifierCandidates);
         }
 
         List<String> all;
@@ -98,6 +72,46 @@ public final class GroovyVersionDetector {
             all = classifierCandidates;
         }
         return all.stream().max(new VersionComparator());
+    }
+
+    private static void addCandidates(
+            String classpathEntry,
+            List<String> coreCandidates,
+            List<String> moduleCandidates,
+            List<String> classifierCandidates) {
+        String fileName = toFileName(classpathEntry);
+        if (fileName == null || !fileName.endsWith(".jar")) {
+            return;
+        }
+
+        String base = fileName.substring(0, fileName.length() - 4);
+        extractGroovyClassifierVersion(base).ifPresent(classifierCandidates::add);
+
+        boolean isGroovyModule = base.startsWith("groovy-");
+        boolean isSourceLikeArtifact = base.endsWith("-sources") || base.endsWith("-javadoc") || base.endsWith("-tests");
+        if (isGroovyModule && !isSourceLikeArtifact) {
+            extractTrailingVersion(base).ifPresent(version -> addVersionCandidate(base, version, coreCandidates, moduleCandidates));
+        }
+    }
+
+    private static void addVersionCandidate(
+            String base,
+            String version,
+            List<String> coreCandidates,
+            List<String> moduleCandidates) {
+        if (base.startsWith("groovy-all-") || isCoreGroovyArtifact(base)) {
+            coreCandidates.add(version);
+        } else {
+            moduleCandidates.add(version);
+        }
+    }
+
+    private static boolean isCoreGroovyArtifact(String base) {
+        String prefix = "groovy-";
+        if (!base.startsWith(prefix) || base.length() <= prefix.length()) {
+            return false;
+        }
+        return Character.isDigit(base.charAt(prefix.length()));
     }
 
     /**

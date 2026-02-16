@@ -82,7 +82,7 @@ class GradleProjectImporterPerformanceTests {
         if (sharedLibDir != null && Files.exists(sharedLibDir)) {
             Files.walk(sharedLibDir)
                     .sorted(Comparator.reverseOrder())
-                    .forEach(p -> { try { Files.deleteIfExists(p); } catch (IOException ignored) {} });
+                    .forEach(GradleProjectImporterPerformanceTests::deletePathQuietly);
         }
     }
 
@@ -99,7 +99,7 @@ class GradleProjectImporterPerformanceTests {
         if (tempDir != null && Files.exists(tempDir)) {
             Files.walk(tempDir)
                     .sorted(Comparator.reverseOrder())
-                    .forEach(p -> { try { Files.deleteIfExists(p); } catch (IOException ignored) {} });
+                    .forEach(GradleProjectImporterPerformanceTests::deletePathQuietly);
         }
     }
 
@@ -319,7 +319,6 @@ class GradleProjectImporterPerformanceTests {
     @Test
     void testMultipleIndependentGradleRoots() throws IOException {
         // Create MODULE_COUNT independent projects (each with its own settings.gradle)
-        List<Path> projectRoots = new ArrayList<>();
         for (int i = 0; i < MODULE_COUNT; i++) {
             Path project = workspaceRoot.resolve("independent-" + i);
             Files.createDirectories(project.resolve("src/main/java"));
@@ -327,7 +326,6 @@ class GradleProjectImporterPerformanceTests {
                     "plugins { id 'java' }\n");
             Files.writeString(project.resolve("settings.gradle"),
                     "rootProject.name = 'independent-" + i + "'\n");
-            projectRoots.add(project);
         }
 
         long start = System.nanoTime();
@@ -424,6 +422,14 @@ class GradleProjectImporterPerformanceTests {
 
         assertTrue(totalMs < 60_000,
                 "End-to-end simulation took " + totalMs + "ms, expected < 60s");
+    }
+
+    private static void deletePathQuietly(Path path) {
+        try {
+            Files.deleteIfExists(path);
+        } catch (IOException ignored) {
+            // best-effort cleanup for temporary test files
+        }
     }
 
     /**

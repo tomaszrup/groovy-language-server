@@ -24,7 +24,6 @@ import java.lang.ref.SoftReference;
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -32,6 +31,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.ArrayDeque;
 import java.util.Deque;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.codehaus.groovy.ast.ASTNode;
 import org.codehaus.groovy.ast.AnnotatedNode;
@@ -97,15 +97,10 @@ import org.codehaus.groovy.ast.stmt.WhileStatement;
 import org.codehaus.groovy.classgen.BytecodeExpression;
 import org.codehaus.groovy.control.CompilationUnit;
 import org.codehaus.groovy.control.SourceUnit;
-import org.eclipse.lsp4j.Position;
-import org.eclipse.lsp4j.Range;
-
-import com.tomaszrup.groovyls.util.GroovyLanguageServerUtils;
-import com.tomaszrup.lsp.utils.Positions;
-import com.tomaszrup.lsp.utils.Ranges;
 
 public class ASTNodeVisitor extends ClassCodeVisitorSupport {
-	private class ASTLookupKey {
+
+	static class ASTLookupKey {
 		public ASTLookupKey(ASTNode node) {
 			this.node = node;
 		}
@@ -129,9 +124,25 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
-	private class ASTNodeLookupData {
-		public ASTNode parent;
-		public URI uri;
+	static class ASTNodeLookupData {
+		private ASTNode parent;
+		private URI uri;
+
+		public ASTNode getParent() {
+			return parent;
+		}
+
+		public URI getUri() {
+			return uri;
+		}
+
+		public void setParent(ASTNode parent) {
+			this.parent = parent;
+		}
+
+		public void setUri(URI uri) {
+			this.uri = uri;
+		}
 	}
 
 	private SourceUnit sourceUnit;
@@ -141,18 +152,20 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		return sourceUnit;
 	}
 
-	private Deque<ASTNode> stack = new ArrayDeque<>();
-	private Map<URI, List<ASTNode>> nodesByURI = new HashMap<>();
-	private Map<URI, List<ClassNode>> classNodesByURI = new HashMap<>();
-	private Map<String, ClassNode> classNodesByName = new HashMap<>();
-	private Map<ASTLookupKey, ASTNodeLookupData> lookup = new HashMap<>();
+	Deque<ASTNode> stack = new ArrayDeque<>();
+	Map<URI, List<ASTNode>> nodesByURI = new HashMap<>();
+	Map<URI, List<ClassNode>> classNodesByURI = new HashMap<>();
+	Map<String, ClassNode> classNodesByName = new HashMap<>();
+	Map<ASTLookupKey, ASTNodeLookupData> lookup = new HashMap<>();
 
 	/**
 	 * Tracks fully-qualified class names referenced by each source file
 	 * (via imports, superclass, and interface declarations). Used to build
 	 * the inter-file dependency graph for incremental compilation.
 	 */
-	private Map<URI, Set<String>> dependenciesByURI = new HashMap<>();
+	Map<URI, Set<String>> dependenciesByURI = new HashMap<>();
+
+	private final ASTNodeIndex index = new ASTNodeIndex(this);
 
 	/**
 	 * Lazily-built reverse index: definition node → list of referencing nodes.
@@ -161,7 +174,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 	 * {@link #getReferenceIndex()} access.  Automatically invalidated when the
 	 * visitor is replaced (copy-on-write).
 	 */
-	private volatile SoftReference<Map<ASTNode, List<ASTNode>>> referenceIndexRef;
+	private final AtomicReference<SoftReference<Map<ASTNode, List<ASTNode>>>> referenceIndexRef = new AtomicReference<>();
 
 	/**
 	 * Returns the lazily-built reference index, or {@code null} if it hasn't
@@ -170,7 +183,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 	 * this returns {@code null}.
 	 */
 	public Map<ASTNode, List<ASTNode>> getReferenceIndex() {
-		SoftReference<Map<ASTNode, List<ASTNode>>> ref = referenceIndexRef;
+		SoftReference<Map<ASTNode, List<ASTNode>>> ref = referenceIndexRef.get();
 		return ref != null ? ref.get() : null;
 	}
 
@@ -180,7 +193,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 	 * in a {@link SoftReference} to allow GC reclamation under memory pressure.
 	 */
 	public void setReferenceIndex(Map<ASTNode, List<ASTNode>> index) {
-		this.referenceIndexRef = (index != null) ? new SoftReference<>(index) : null;
+		this.referenceIndexRef.set((index != null) ? new SoftReference<>(index) : null);
 	}
 
 	/**
@@ -188,7 +201,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 	 * lazily rebuilt on the next {@code getReferences()} call.
 	 */
 	public void clearReferenceIndex() {
-		this.referenceIndexRef = null;
+		this.referenceIndexRef.set(null);
 	}
 
 	private void pushASTNode(ASTNode node) {
@@ -202,9 +215,9 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 			nodesByURI.get(uri).add(node);
 
 			ASTNodeLookupData data = new ASTNodeLookupData();
-			data.uri = uri;
+			data.setUri(uri);
 			if (!stack.isEmpty()) {
-				data.parent = stack.peekLast();
+				data.setParent(stack.peekLast());
 			}
 			lookup.put(new ASTLookupKey(node), data);
 		}
@@ -217,127 +230,39 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 	}
 
 	public List<ClassNode> getClassNodes() {
-		List<ClassNode> result = new ArrayList<>();
-		for (List<ClassNode> nodes : classNodesByURI.values()) {
-			result.addAll(nodes);
-		}
-		return result;
+		return index.getClassNodes();
 	}
 
-	/**
-	 * Returns the class nodes defined in the given source file.
-	 *
-	 * @param uri the source file URI
-	 * @return the list of class nodes, or an empty list if none
-	 */
 	public List<ClassNode> getClassNodes(URI uri) {
-		List<ClassNode> nodes = classNodesByURI.get(uri);
-		return nodes != null ? nodes : Collections.emptyList();
+		return index.getClassNodes(uri);
 	}
 
-	/**
-	 * Looks up a class node by its fully-qualified name in O(1) time.
-	 * Returns {@code null} if no class with that name is in the AST.
-	 */
 	public ClassNode getClassNodeByName(String name) {
-		return classNodesByName.get(name);
+		return index.getClassNodeByName(name);
 	}
 
 	public List<ASTNode> getNodes() {
-		List<ASTNode> result = new ArrayList<>();
-		for (List<ASTNode> nodes : nodesByURI.values()) {
-			result.addAll(nodes);
-		}
-		return result;
+		return index.getNodes();
 	}
 
 	public List<ASTNode> getNodes(URI uri) {
-		List<ASTNode> nodes = nodesByURI.get(uri);
-		if (nodes == null) {
-			return Collections.emptyList();
-		}
-		return nodes;
+		return index.getNodes(uri);
 	}
 
 	public ASTNode getNodeAtLineAndColumn(URI uri, int line, int column) {
-		Position position = new Position(line, column);
-		List<ASTNode> nodes = nodesByURI.get(uri);
-		if (nodes == null) {
-			return null;
-		}
-
-		ASTNode best = null;
-		Range bestRange = null;
-
-		for (ASTNode node : nodes) {
-			if (node.getLineNumber() == -1) {
-				continue;
-			}
-			Range range = GroovyLanguageServerUtils.astNodeToRange(node);
-			if (range == null || !Ranges.contains(range, position)) {
-				continue;
-			}
-
-			if (best == null) {
-				best = node;
-				bestRange = range;
-				continue;
-			}
-
-			// Prefer later start (more specific/inner node)
-			int startCmp = Positions.COMPARATOR.compare(range.getStart(), bestRange.getStart());
-			if (startCmp > 0) {
-				best = node;
-				bestRange = range;
-			} else if (startCmp == 0) {
-				// Same start — prefer earlier end (tighter range)
-				int endCmp = Positions.COMPARATOR.compare(range.getEnd(), bestRange.getEnd());
-				if (endCmp < 0) {
-					best = node;
-					bestRange = range;
-				} else if (endCmp == 0) {
-					// Identical range — prefer child over parent
-					// Exception: ClassNode vs ConstructorNode — keep ClassNode
-					if (contains(best, node)
-							&& !(best instanceof ClassNode && node instanceof ConstructorNode)) {
-						best = node;
-						bestRange = range;
-					}
-				}
-			}
-		}
-
-		return best;
+		return index.getNodeAtLineAndColumn(uri, line, column);
 	}
 
 	public ASTNode getParent(ASTNode child) {
-		if (child == null) {
-			return null;
-		}
-		ASTNodeLookupData data = lookup.get(new ASTLookupKey(child));
-		if (data == null) {
-			return null;
-		}
-		return data.parent;
+		return index.getParent(child);
 	}
 
 	public boolean contains(ASTNode ancestor, ASTNode descendant) {
-		ASTNode current = getParent(descendant);
-		while (current != null) {
-			if (current.equals(ancestor)) {
-				return true;
-			}
-			current = getParent(current);
-		}
-		return false;
+		return index.contains(ancestor, descendant);
 	}
 
 	public URI getURI(ASTNode node) {
-		ASTNodeLookupData data = lookup.get(new ASTLookupKey(node));
-		if (data == null) {
-			return null;
-		}
-		return data.uri;
+		return index.getURI(node);
 	}
 
 	public void visitCompilationUnit(CompilationUnit unit) {
@@ -347,9 +272,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		lookup.clear();
 		dependenciesByURI.clear();
 		clearReferenceIndex();
-		unit.iterator().forEachRemaining(sourceUnit -> {
-			visitSourceUnit(sourceUnit);
-		});
+		unit.iterator().forEachRemaining(this::visitSourceUnit);
 	}
 
 	public void visitCompilationUnit(CompilationUnit unit, Collection<URI> uris) {
@@ -357,9 +280,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 			// clear all old nodes so that they may be replaced
 			List<ASTNode> nodes = nodesByURI.remove(uri);
 			if (nodes != null) {
-				nodes.forEach(node -> {
-					lookup.remove(new ASTLookupKey(node));
-				});
+				nodes.forEach(node -> lookup.remove(new ASTLookupKey(node)));
 			}
 			List<ClassNode> oldClassNodes = classNodesByURI.remove(uri);
 			if (oldClassNodes != null) {
@@ -367,144 +288,25 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 			}
 			dependenciesByURI.remove(uri);
 		});
-		unit.iterator().forEachRemaining(sourceUnit -> {
-			URI uri = sourceUnit.getSource().getURI();
+		unit.iterator().forEachRemaining(currentSourceUnit -> {
+			URI uri = currentSourceUnit.getSource().getURI();
 			if (!uris.contains(uri)) {
 				return;
 			}
-			visitSourceUnit(sourceUnit);
+			visitSourceUnit(currentSourceUnit);
 		});
 	}
 
-	/**
-	 * Returns the number of AST nodes recorded for the given source file.
-	 *
-	 * @param uri the source file URI
-	 * @return the node count, or 0 if no data for that URI
-	 */
 	public int getNodeCount(URI uri) {
-		List<ASTNode> nodes = nodesByURI.get(uri);
-		return nodes != null ? nodes.size() : 0;
+		return index.getNodeCount(uri);
 	}
 
-	/**
-	 * Restores AST data for a specific URI from a previous (last-known-good)
-	 * visitor into this visitor. This is used to preserve semantic token data
-	 * when a recompilation produces a degraded AST due to syntax errors.
-	 *
-	 * <p>Any existing data for the URI in this visitor is replaced.</p>
-	 *
-	 * @param uri      the source file URI to restore
-	 * @param previous the previous visitor containing good data for the URI
-	 */
 	public void restoreFromPrevious(URI uri, ASTNodeVisitor previous) {
-		if (previous == null || uri == null) {
-			return;
-		}
-
-		// Restore nodes
-		List<ASTNode> prevNodes = previous.nodesByURI.get(uri);
-		if (prevNodes != null) {
-			nodesByURI.put(uri, prevNodes);
-		}
-
-		// Restore class nodes
-		List<ClassNode> prevClassNodes = previous.classNodesByURI.get(uri);
-		if (prevClassNodes != null) {
-			// Remove any class names from the new compilation for this URI
-			List<ClassNode> currentClassNodes = classNodesByURI.get(uri);
-			if (currentClassNodes != null) {
-				for (ClassNode cn : currentClassNodes) {
-					classNodesByName.remove(cn.getName());
-				}
-			}
-			classNodesByURI.put(uri, prevClassNodes);
-			// Restore class names from previous
-			for (ClassNode cn : prevClassNodes) {
-				classNodesByName.put(cn.getName(), cn);
-			}
-		}
-
-		// Restore dependencies
-		Set<String> prevDeps = previous.dependenciesByURI.get(uri);
-		if (prevDeps != null) {
-			dependenciesByURI.put(uri, prevDeps);
-		}
-
-		// Restore lookup entries for the URI
-		// First remove any new lookup entries for this URI
-		lookup.entrySet().removeIf(entry -> uri.equals(entry.getValue().uri));
-		// Then copy from previous
-		for (Map.Entry<ASTLookupKey, ASTNodeLookupData> entry : previous.lookup.entrySet()) {
-			if (uri.equals(entry.getValue().uri)) {
-				lookup.put(entry.getKey(), entry.getValue());
-			}
-		}
+		index.restoreFromPrevious(uri, previous);
 	}
 
-	/**
-	 * Creates a new {@code ASTNodeVisitor} that is a copy-on-write snapshot
-	 * of this visitor. Data for URIs in {@code excludedURIs} is omitted from
-	 * the copy (those URIs are about to be re-visited from fresh compilation
-	 * output). The original visitor is <em>not</em> mutated, so concurrent
-	 * readers can safely use it while the new visitor is being populated.
-	 *
-	 * <p>The returned visitor shares the same AST node object references as
-	 * the original, but the container maps are independent copies.</p>
-	 *
-	 * @param excludedURIs URIs whose data should be excluded from the snapshot
-	 * @return a new {@code ASTNodeVisitor} pre-populated with data for all
-	 *         URIs <em>except</em> those in {@code excludedURIs}
-	 */
 	public ASTNodeVisitor createSnapshotExcluding(Collection<URI> excludedURIs) {
-		ASTNodeVisitor copy = new ASTNodeVisitor();
-		Set<URI> excluded = excludedURIs instanceof Set
-				? (Set<URI>) excludedURIs
-				: new HashSet<>(excludedURIs);
-
-		// Share list/set references for non-excluded URIs (shallow copy).
-		// Wrapped in unmodifiable views to prevent accidental mutation — the
-		// original visitor may still be held by other threads.
-		for (Map.Entry<URI, List<ASTNode>> entry : nodesByURI.entrySet()) {
-			if (!excluded.contains(entry.getKey())) {
-				copy.nodesByURI.put(entry.getKey(), Collections.unmodifiableList(entry.getValue()));
-			}
-		}
-		for (Map.Entry<URI, List<ClassNode>> entry : classNodesByURI.entrySet()) {
-			if (!excluded.contains(entry.getKey())) {
-				copy.classNodesByURI.put(entry.getKey(), Collections.unmodifiableList(entry.getValue()));
-			}
-		}
-		for (Map.Entry<URI, Set<String>> entry : dependenciesByURI.entrySet()) {
-			if (!excluded.contains(entry.getKey())) {
-				copy.dependenciesByURI.put(entry.getKey(), Collections.unmodifiableSet(entry.getValue()));
-			}
-		}
-
-		// Copy classNodesByName — skip names belonging to excluded URIs
-		Set<String> excludedClassNames = new HashSet<>();
-		for (URI uri : excluded) {
-			List<ClassNode> classNodes = classNodesByURI.get(uri);
-			if (classNodes != null) {
-				for (ClassNode cn : classNodes) {
-					excludedClassNames.add(cn.getName());
-				}
-			}
-		}
-		for (Map.Entry<String, ClassNode> entry : classNodesByName.entrySet()) {
-			if (!excludedClassNames.contains(entry.getKey())) {
-				copy.classNodesByName.put(entry.getKey(), entry.getValue());
-			}
-		}
-
-		// Copy lookup — skip entries belonging to excluded URIs
-		for (Map.Entry<ASTLookupKey, ASTNodeLookupData> entry : lookup.entrySet()) {
-			if (!excluded.contains(entry.getValue().uri)) {
-				copy.lookup.put(entry.getKey(), entry.getValue());
-			}
-		}
-
-		return copy;
+		return ASTNodeIndex.createSnapshotExcluding(this, excludedURIs);
 	}
 
 	public void visitSourceUnit(SourceUnit unit) {
@@ -525,9 +327,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 	public void visitModule(ModuleNode node) {
 		pushASTNode(node);
 		try {
-			node.getClasses().forEach(classInUnit -> {
-				visitClass(classInUnit);
-			});
+			node.getClasses().forEach(this::visitClass);
 		} finally {
 			popASTNode();
 		}
@@ -535,44 +335,38 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 
 	// GroovyClassVisitor
 
+	@Override
 	public void visitClass(ClassNode node) {
 		URI uri = sourceUnit.getSource().getURI();
 		classNodesByURI.get(uri).add(node);
 		classNodesByName.put(node.getName(), node);
+		Set<String> deps = dependenciesByURI.get(uri);
 		pushASTNode(node);
 		try {
-			ClassNode unresolvedSuperClass = node.getUnresolvedSuperClass();
-			if (unresolvedSuperClass != null && unresolvedSuperClass.getLineNumber() != -1) {
-				pushASTNode(unresolvedSuperClass);
-				// Track superclass as a dependency
-				String superName = unresolvedSuperClass.getName();
-				if (superName != null && !superName.startsWith("java.") && !superName.startsWith("groovy.")) {
-					Set<String> deps = dependenciesByURI.get(uri);
-					if (deps != null) {
-						deps.add(superName);
-					}
-				}
-				popASTNode();
-			}
+			trackNamedClassNodeDependency(node.getUnresolvedSuperClass(), deps);
 			for (ClassNode unresolvedInterface : node.getUnresolvedInterfaces()) {
-				if (unresolvedInterface.getLineNumber() == -1) {
-					continue;
-				}
-				pushASTNode(unresolvedInterface);
-				// Track interface as a dependency
-				String ifaceName = unresolvedInterface.getName();
-				if (ifaceName != null && !ifaceName.startsWith("java.") && !ifaceName.startsWith("groovy.")) {
-					Set<String> deps = dependenciesByURI.get(uri);
-					if (deps != null) {
-						deps.add(ifaceName);
-					}
-				}
-				popASTNode();
+				trackNamedClassNodeDependency(unresolvedInterface, deps);
 			}
 			super.visitClass(node);
 		} finally {
 			popASTNode();
 		}
+	}
+
+	private void trackNamedClassNodeDependency(ClassNode classNode, Set<String> deps) {
+		if (classNode == null || classNode.getLineNumber() == -1) {
+			return;
+		}
+		pushASTNode(classNode);
+		try {
+			addDependency(deps, classNode.getName());
+		} finally {
+			popASTNode();
+		}
+	}
+
+	private void addDependency(Set<String> deps, String className) {
+		index.addDependency(deps, className);
 	}
 
 	@Override
@@ -591,71 +385,47 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 
 	@Override
 	public void visitImports(ModuleNode node) {
-		if (node != null) {
-			URI uri = sourceUnit.getSource().getURI();
-			Set<String> deps = dependenciesByURI.get(uri);
+		if (node == null) {
+			return;
+		}
+		URI uri = sourceUnit.getSource().getURI();
+		Set<String> deps = dependenciesByURI.get(uri);
 
-			for (ImportNode importNode : node.getImports()) {
-				pushASTNode(importNode);
-				visitAnnotations(importNode);
-				importNode.visit(this);
-				// Track regular import as a dependency
-				if (deps != null && importNode.getClassName() != null) {
-					String className = importNode.getClassName();
-					if (!className.startsWith("java.") && !className.startsWith("groovy.")) {
-						deps.add(className);
-					}
-				}
-				popASTNode();
-			}
-			for (ImportNode importStarNode : node.getStarImports()) {
-				pushASTNode(importStarNode);
-				visitAnnotations(importStarNode);
-				importStarNode.visit(this);
-				// Track star import — resolve conservatively against all known classes
-				if (deps != null) {
-					String packageName = importStarNode.getPackageName();
-					if (packageName != null && !packageName.startsWith("java.") && !packageName.startsWith("groovy.")) {
-						// Mark as depending on all classes in this package
-						for (Map.Entry<String, ClassNode> entry : classNodesByName.entrySet()) {
-							String fqn = entry.getKey();
-							if (fqn.startsWith(packageName)) {
-								deps.add(fqn);
-							}
-						}
-					}
-				}
-				popASTNode();
-			}
-			for (ImportNode importStaticNode : node.getStaticImports().values()) {
-				pushASTNode(importStaticNode);
-				visitAnnotations(importStaticNode);
-				importStaticNode.visit(this);
-				// Track static import as a dependency
-				if (deps != null && importStaticNode.getClassName() != null) {
-					String className = importStaticNode.getClassName();
-					if (!className.startsWith("java.") && !className.startsWith("groovy.")) {
-						deps.add(className);
-					}
-				}
-				popASTNode();
-			}
-			for (ImportNode importStaticStarNode : node.getStaticStarImports().values()) {
-				pushASTNode(importStaticStarNode);
-				visitAnnotations(importStaticStarNode);
-				importStaticStarNode.visit(this);
-				// Track static star import as a dependency
-				if (deps != null && importStaticStarNode.getClassName() != null) {
-					String className = importStaticStarNode.getClassName();
-					if (!className.startsWith("java.") && !className.startsWith("groovy.")) {
-						deps.add(className);
-					}
-				}
-				popASTNode();
-			}
+		processDirectImports(node.getImports(), deps);
+		processStarImports(node.getStarImports(), deps);
+		processDirectImports(node.getStaticImports().values(), deps);
+		processDirectImports(node.getStaticStarImports().values(), deps);
+	}
+
+	private void processDirectImports(Iterable<ImportNode> imports, Set<String> deps) {
+		for (ImportNode importNode : imports) {
+			visitImportNode(importNode);
+			addDependency(deps, importNode.getClassName());
 		}
 	}
 
+	private void processStarImports(Iterable<ImportNode> imports, Set<String> deps) {
+		for (ImportNode importNode : imports) {
+			visitImportNode(importNode);
+			addStarImportDependencies(deps, importNode.getPackageName());
+		}
+	}
+
+	private void visitImportNode(ImportNode importNode) {
+		pushASTNode(importNode);
+		try {
+			visitAnnotations(importNode);
+			importNode.visit(this);
+		} finally {
+			popASTNode();
+		}
+	}
+
+	private void addStarImportDependencies(Set<String> deps, String packageName) {
+		index.addStarImportDependencies(deps, packageName);
+	}
+
+	@Override
 	public void visitConstructor(ConstructorNode node) {
 		pushASTNode(node);
 		try {
@@ -668,6 +438,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitMethod(MethodNode node) {
 		pushASTNode(node);
 		try {
@@ -682,12 +453,10 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 
 	protected void visitParameter(Parameter node) {
 		pushASTNode(node);
-		try {
-		} finally {
-			popASTNode();
-		}
+		popASTNode();
 	}
 
+	@Override
 	public void visitField(FieldNode node) {
 		pushASTNode(node);
 		try {
@@ -697,6 +466,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitProperty(PropertyNode node) {
 		pushASTNode(node);
 		try {
@@ -708,6 +478,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 
 	// GroovyCodeVisitor
 
+	@Override
 	public void visitBlockStatement(BlockStatement node) {
 		pushASTNode(node);
 		try {
@@ -717,6 +488,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitForLoop(ForStatement node) {
 		pushASTNode(node);
 		try {
@@ -726,6 +498,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitWhileLoop(WhileStatement node) {
 		pushASTNode(node);
 		try {
@@ -735,6 +508,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitDoWhileLoop(DoWhileStatement node) {
 		pushASTNode(node);
 		try {
@@ -744,6 +518,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitIfElse(IfStatement node) {
 		pushASTNode(node);
 		try {
@@ -753,6 +528,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitExpressionStatement(ExpressionStatement node) {
 		pushASTNode(node);
 		try {
@@ -762,6 +538,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitReturnStatement(ReturnStatement node) {
 		pushASTNode(node);
 		try {
@@ -771,6 +548,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitAssertStatement(AssertStatement node) {
 		pushASTNode(node);
 		try {
@@ -780,6 +558,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitTryCatchFinally(TryCatchStatement node) {
 		pushASTNode(node);
 		try {
@@ -789,6 +568,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitEmptyStatement(EmptyStatement node) {
 		pushASTNode(node);
 		try {
@@ -798,6 +578,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitSwitch(SwitchStatement node) {
 		pushASTNode(node);
 		try {
@@ -807,6 +588,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitCaseStatement(CaseStatement node) {
 		pushASTNode(node);
 		try {
@@ -816,6 +598,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitBreakStatement(BreakStatement node) {
 		pushASTNode(node);
 		try {
@@ -825,6 +608,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitContinueStatement(ContinueStatement node) {
 		pushASTNode(node);
 		try {
@@ -834,6 +618,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitSynchronizedStatement(SynchronizedStatement node) {
 		pushASTNode(node);
 		try {
@@ -843,6 +628,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitThrowStatement(ThrowStatement node) {
 		pushASTNode(node);
 		try {
@@ -852,6 +638,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitMethodCallExpression(MethodCallExpression node) {
 		pushASTNode(node);
 		try {
@@ -861,6 +648,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitStaticMethodCallExpression(StaticMethodCallExpression node) {
 		pushASTNode(node);
 		try {
@@ -870,6 +658,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitConstructorCallExpression(ConstructorCallExpression node) {
 		pushASTNode(node);
 		try {
@@ -879,6 +668,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitBinaryExpression(BinaryExpression node) {
 		pushASTNode(node);
 		try {
@@ -888,6 +678,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitTernaryExpression(TernaryExpression node) {
 		pushASTNode(node);
 		try {
@@ -897,6 +688,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitShortTernaryExpression(ElvisOperatorExpression node) {
 		pushASTNode(node);
 		try {
@@ -906,6 +698,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitPostfixExpression(PostfixExpression node) {
 		pushASTNode(node);
 		try {
@@ -915,6 +708,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitPrefixExpression(PrefixExpression node) {
 		pushASTNode(node);
 		try {
@@ -924,6 +718,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitBooleanExpression(BooleanExpression node) {
 		pushASTNode(node);
 		try {
@@ -933,6 +728,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitNotExpression(NotExpression node) {
 		pushASTNode(node);
 		try {
@@ -942,6 +738,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitClosureExpression(ClosureExpression node) {
 		pushASTNode(node);
 		try {
@@ -951,6 +748,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitTupleExpression(TupleExpression node) {
 		pushASTNode(node);
 		try {
@@ -960,6 +758,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitListExpression(ListExpression node) {
 		pushASTNode(node);
 		try {
@@ -969,6 +768,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitArrayExpression(ArrayExpression node) {
 		pushASTNode(node);
 		try {
@@ -978,6 +778,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitMapExpression(MapExpression node) {
 		pushASTNode(node);
 		try {
@@ -987,6 +788,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitMapEntryExpression(MapEntryExpression node) {
 		pushASTNode(node);
 		try {
@@ -996,6 +798,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitRangeExpression(RangeExpression node) {
 		pushASTNode(node);
 		try {
@@ -1005,6 +808,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitSpreadExpression(SpreadExpression node) {
 		pushASTNode(node);
 		try {
@@ -1014,6 +818,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitSpreadMapExpression(SpreadMapExpression node) {
 		pushASTNode(node);
 		try {
@@ -1023,6 +828,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitMethodPointerExpression(MethodPointerExpression node) {
 		pushASTNode(node);
 		try {
@@ -1032,6 +838,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitUnaryMinusExpression(UnaryMinusExpression node) {
 		pushASTNode(node);
 		try {
@@ -1041,6 +848,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitUnaryPlusExpression(UnaryPlusExpression node) {
 		pushASTNode(node);
 		try {
@@ -1050,6 +858,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitBitwiseNegationExpression(BitwiseNegationExpression node) {
 		pushASTNode(node);
 		try {
@@ -1059,6 +868,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitCastExpression(CastExpression node) {
 		pushASTNode(node);
 		try {
@@ -1068,6 +878,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitConstantExpression(ConstantExpression node) {
 		pushASTNode(node);
 		try {
@@ -1077,6 +888,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitClassExpression(ClassExpression node) {
 		pushASTNode(node);
 		try {
@@ -1086,6 +898,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitVariableExpression(VariableExpression node) {
 		pushASTNode(node);
 		try {
@@ -1095,16 +908,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
-	// this calls visitBinaryExpression()
-	// public void visitDeclarationExpression(DeclarationExpression node) {
-	// pushASTNode(node);
-	// try {
-	// super.visitDeclarationExpression(node);
-	// } finally {
-	// popASTNode();
-	// }
-	// }
-
+	@Override
 	public void visitPropertyExpression(PropertyExpression node) {
 		pushASTNode(node);
 		try {
@@ -1114,6 +918,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitAttributeExpression(AttributeExpression node) {
 		pushASTNode(node);
 		try {
@@ -1123,6 +928,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitFieldExpression(FieldExpression node) {
 		pushASTNode(node);
 		try {
@@ -1132,6 +938,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitGStringExpression(GStringExpression node) {
 		pushASTNode(node);
 		try {
@@ -1141,6 +948,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitCatchStatement(CatchStatement node) {
 		pushASTNode(node);
 		try {
@@ -1150,16 +958,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
-	// this calls visitTupleListExpression()
-	// public void visitArgumentlistExpression(ArgumentListExpression node) {
-	// pushASTNode(node);
-	// try {
-	// super.visitArgumentlistExpression(node);
-	// } finally {
-	// popASTNode();
-	// }
-	// }
-
+	@Override
 	public void visitClosureListExpression(ClosureListExpression node) {
 		pushASTNode(node);
 		try {
@@ -1169,6 +968,7 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 		}
 	}
 
+	@Override
 	public void visitBytecodeExpression(BytecodeExpression node) {
 		pushASTNode(node);
 		try {
@@ -1180,44 +980,11 @@ public class ASTNodeVisitor extends ClassCodeVisitorSupport {
 
 	// --- Dependency tracking ---
 
-	/**
-	 * Returns the raw dependency map: source URI → set of fully-qualified
-	 * class names that the source references (via imports, superclass, or
-	 * interface declarations).
-	 */
 	public Map<URI, Set<String>> getDependenciesByURI() {
-		return dependenciesByURI;
+		return index.getDependenciesByURI();
 	}
 
-	/**
-	 * Resolves class-name dependencies to source URIs using the current
-	 * {@link #classNodesByName} mapping.  Only dependencies on classes
-	 * that exist in the current compilation are resolved — references to
-	 * external (classpath) classes are silently dropped since they don't
-	 * belong to the source dependency graph.
-	 *
-	 * @param fileURI the source file whose dependencies to resolve
-	 * @return the set of source URIs that {@code fileURI} depends on,
-	 *         or an empty set if no dependencies were recorded
-	 */
 	public Set<URI> resolveSourceDependencies(URI fileURI) {
-		Set<String> classNames = dependenciesByURI.get(fileURI);
-		if (classNames == null || classNames.isEmpty()) {
-			return Collections.emptySet();
-		}
-		Set<URI> result = new HashSet<>();
-		for (String className : classNames) {
-			ClassNode classNode = classNodesByName.get(className);
-			if (classNode != null && classNode.getModule() != null
-					&& classNode.getModule().getContext() != null
-					&& classNode.getModule().getContext().getSource() != null) {
-				URI depURI = classNode.getModule().getContext().getSource().getURI();
-				// Don't add self-dependency
-				if (!depURI.equals(fileURI)) {
-					result.add(depURI);
-				}
-			}
-		}
-		return result;
+		return index.resolveSourceDependencies(fileURI);
 	}
 }

@@ -89,39 +89,19 @@ class DocumentResolverServiceTests {
 	// --- resolveCompletionItem: null label ---
 
 	@Test
-	void testResolveCompletionItemEmptyLabel() {
-		CompletionItem item = new CompletionItem("");
-		item.setKind(CompletionItemKind.Method);
+	void testResolveCompletionItemInvalidOrUnresolvableInput() {
+		CompletionItem first = new CompletionItem("");
+		first.setKind(CompletionItemKind.Method);
+		CompletionItem second = new CompletionItem("something");
+		second.setKind(null);
+		CompletionItem third = new CompletionItem("unknownMethod");
+		third.setKind(CompletionItemKind.Method);
 
-		CompletionItem result = resolverService.resolveCompletionItem(item);
-		Assertions.assertSame(item, result);
-		// Empty label won't match anything — no documentation set
-		Assertions.assertNull(result.getDocumentation());
-	}
-
-	// --- resolveCompletionItem: null kind ---
-
-	@Test
-	void testResolveCompletionItemNullKind() {
-		CompletionItem item = new CompletionItem("something");
-		item.setKind(null);
-
-		CompletionItem result = resolverService.resolveCompletionItem(item);
-		Assertions.assertSame(item, result);
-	}
-
-	// --- resolveCompletionItem: no visitor available ---
-
-	@Test
-	void testResolveCompletionItemNoVisitor() {
-		CompletionItem item = new CompletionItem("unknownMethod");
-		item.setKind(CompletionItemKind.Method);
-
-		// Default scope has no AST visitor
-		CompletionItem result = resolverService.resolveCompletionItem(item);
-		Assertions.assertSame(item, result);
-		// No documentation found
-		Assertions.assertNull(result.getDocumentation());
+		for (CompletionItem item : Arrays.asList(first, second, third)) {
+			CompletionItem result = resolverService.resolveCompletionItem(item);
+			Assertions.assertSame(item, result);
+			Assertions.assertNull(result.getDocumentation());
+		}
 	}
 
 	// --- resolveCompletionItem: with data (JsonObject) ---
@@ -270,4 +250,5 @@ class DocumentResolverServiceTests {
 		CompletionItem result = resolverService.resolveCompletionItem(item);
 		Assertions.assertSame(item, result);
 	}
+
 }

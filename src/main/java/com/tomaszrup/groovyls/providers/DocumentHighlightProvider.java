@@ -22,6 +22,7 @@ package com.tomaszrup.groovyls.providers;
 import java.net.URI;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 
@@ -43,7 +44,7 @@ public class DocumentHighlightProvider {
         this.ast = ast;
     }
 
-    public CompletableFuture<List<? extends DocumentHighlight>> provideDocumentHighlights(
+    public CompletableFuture<List<DocumentHighlight>> provideDocumentHighlights(
             TextDocumentIdentifier textDocument, Position position) {
         if (ast == null) {
             return CompletableFuture.completedFuture(Collections.emptyList());
@@ -75,7 +76,7 @@ public class DocumentHighlightProvider {
                             : DocumentHighlightKind.Read;
                     return new DocumentHighlight(range, kind);
                 })
-                .filter(highlight -> highlight != null)
+                .filter(Objects::nonNull)
                 .collect(Collectors.toList());
 
         return CompletableFuture.completedFuture(highlights);

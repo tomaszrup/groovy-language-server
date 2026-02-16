@@ -115,8 +115,8 @@ class ProjectScopeTests {
 		ProjectScope scope = new ProjectScope(PROJECT_ROOT, factory);
 
 		List<String> classpath = Arrays.asList("/lib/dep1.jar", "/lib/dep2.jar");
-		scope.updateSourceLocatorClasspath(classpath);
-		// Should not throw
+		Assertions.assertDoesNotThrow(() -> scope.updateSourceLocatorClasspath(classpath));
+		Assertions.assertNotNull(scope);
 	}
 
 	@Test
@@ -124,8 +124,8 @@ class ProjectScopeTests {
 		CompilationUnitFactory factory = new CompilationUnitFactory();
 		ProjectScope scope = new ProjectScope(PROJECT_ROOT, factory);
 
-		// Null classpath should be a no-op
-		scope.updateSourceLocatorClasspath(null);
+		Assertions.assertDoesNotThrow(() -> scope.updateSourceLocatorClasspath(null));
+		Assertions.assertNotNull(scope);
 	}
 
 	@Test
@@ -133,8 +133,8 @@ class ProjectScopeTests {
 		CompilationUnitFactory factory = new CompilationUnitFactory();
 		ProjectScope scope = new ProjectScope(PROJECT_ROOT, factory);
 
-		// Empty list should be a no-op
-		scope.updateSourceLocatorClasspath(Collections.emptyList());
+		Assertions.assertDoesNotThrow(() -> scope.updateSourceLocatorClasspath(Collections.emptyList()));
+		Assertions.assertNotNull(scope);
 	}
 
 	// --- Mutable state ---
@@ -163,19 +163,24 @@ class ProjectScopeTests {
 	void testReadWriteLockAccessible() {
 		CompilationUnitFactory factory = new CompilationUnitFactory();
 		ProjectScope scope = new ProjectScope(PROJECT_ROOT, factory);
+		boolean readLocked = false;
+		boolean writeLocked = false;
 
 		scope.getLock().readLock().lock();
 		try {
-			// Should be able to acquire read lock
+			readLocked = true;
 		} finally {
 			scope.getLock().readLock().unlock();
 		}
 
 		scope.getLock().writeLock().lock();
 		try {
-			// Should be able to acquire write lock
+			writeLocked = true;
 		} finally {
 			scope.getLock().writeLock().unlock();
 		}
+
+		Assertions.assertTrue(readLocked);
+		Assertions.assertTrue(writeLocked);
 	}
 }

@@ -210,57 +210,21 @@ class GroovydocUtilsTests {
 	// ------------------------------------------------------------------
 
 	@Test
-	void testHtmlCodeTag() {
-		String doc = "/**\n * Use <code>getValue()</code> to read.\n */";
-		String result = GroovydocUtils.groovydocToMarkdownDescription(makeGroovydoc(doc));
-		Assertions.assertNotNull(result);
-		Assertions.assertTrue(result.contains("`getValue()`"),
-				"<code> should convert to backticks, got: " + result);
-	}
+	void testHtmlAndInlineTagConversions() {
+		String[][] cases = new String[][] {
+				{"/**\n * Use <code>getValue()</code> to read.\n */", "`getValue()`", "<code> should convert to backticks"},
+				{"/**\n * This is <em>important</em>.\n */", "_important_", "<em> should convert to underscores"},
+				{"/**\n * This is <strong>bold</strong>.\n */", "**bold**", "<strong> should convert to double asterisks"},
+				{"/**\n * Example:\n * <pre>code here</pre>\n */", "```", "<pre> should convert to code fence"},
+				{"/**\n * Use {@code myVar} properly.\n */", "`myVar`", "{@code} should convert to backticks"},
+				{"/**\n * See {@link java.util.Map} for details.\n */", "`java.util.Map`", "{@link} should convert to backticks"},
+		};
 
-	@Test
-	void testHtmlEmTag() {
-		String doc = "/**\n * This is <em>important</em>.\n */";
-		String result = GroovydocUtils.groovydocToMarkdownDescription(makeGroovydoc(doc));
-		Assertions.assertNotNull(result);
-		Assertions.assertTrue(result.contains("_important_"),
-				"<em> should convert to underscores, got: " + result);
-	}
-
-	@Test
-	void testHtmlStrongTag() {
-		String doc = "/**\n * This is <strong>bold</strong>.\n */";
-		String result = GroovydocUtils.groovydocToMarkdownDescription(makeGroovydoc(doc));
-		Assertions.assertNotNull(result);
-		Assertions.assertTrue(result.contains("**bold**"),
-				"<strong> should convert to double asterisks, got: " + result);
-	}
-
-	@Test
-	void testHtmlPreTag() {
-		String doc = "/**\n * Example:\n * <pre>code here</pre>\n */";
-		String result = GroovydocUtils.groovydocToMarkdownDescription(makeGroovydoc(doc));
-		Assertions.assertNotNull(result);
-		Assertions.assertTrue(result.contains("```"),
-				"<pre> should convert to code fence, got: " + result);
-	}
-
-	@Test
-	void testInlineCodeTag() {
-		String doc = "/**\n * Use {@code myVar} properly.\n */";
-		String result = GroovydocUtils.groovydocToMarkdownDescription(makeGroovydoc(doc));
-		Assertions.assertNotNull(result);
-		Assertions.assertTrue(result.contains("`myVar`"),
-				"{@code} should convert to backticks, got: " + result);
-	}
-
-	@Test
-	void testInlineLinkTag() {
-		String doc = "/**\n * See {@link java.util.Map} for details.\n */";
-		String result = GroovydocUtils.groovydocToMarkdownDescription(makeGroovydoc(doc));
-		Assertions.assertNotNull(result);
-		Assertions.assertTrue(result.contains("`java.util.Map`"),
-				"{@link} should convert to backticks, got: " + result);
+		for (String[] testCase : cases) {
+			String result = GroovydocUtils.groovydocToMarkdownDescription(makeGroovydoc(testCase[0]));
+			Assertions.assertNotNull(result);
+			Assertions.assertTrue(result.contains(testCase[1]), testCase[2] + ", got: " + result);
+		}
 	}
 
 	// ------------------------------------------------------------------
@@ -289,4 +253,5 @@ class GroovydocUtilsTests {
 		Assertions.assertTrue(result.contains("2.0"), "@since present");
 		Assertions.assertTrue(result.contains("java.lang.Math"), "@see present");
 	}
+
 }

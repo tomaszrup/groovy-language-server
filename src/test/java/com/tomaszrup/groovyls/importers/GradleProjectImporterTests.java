@@ -34,6 +34,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
+@SuppressWarnings("all")
 class GradleProjectImporterTests {
 
     private GradleProjectImporter importer;

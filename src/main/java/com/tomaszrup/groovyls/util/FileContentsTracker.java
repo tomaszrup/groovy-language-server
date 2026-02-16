@@ -27,7 +27,6 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
@@ -43,12 +42,16 @@ import com.tomaszrup.lsp.utils.Positions;
 /**
  * Thread-safe tracker for open document contents and change notifications.
  *
- * <p>Uses {@link ConcurrentHashMap} internally so that multiple per-project
- * locks can safely read/write concurrently without a single global lock.</p>
+ * <p>
+ * Uses {@link ConcurrentHashMap} internally so that multiple per-project
+ * locks can safely read/write concurrently without a single global lock.
+ * </p>
  *
- * <p>For files that are <b>not open</b> in the editor, a TTL-based cache
+ * <p>
+ * For files that are <b>not open</b> in the editor, a TTL-based cache
  * avoids repeated blocking {@link Files#readString} calls on the LSP thread.
- * The default TTL is {@value #CLOSED_FILE_CACHE_TTL_MS} ms.</p>
+ * The default TTL is {@value #CLOSED_FILE_CACHE_TTL_MS} ms.
+ * </p>
  */
 public class FileContentsTracker {
 
@@ -112,7 +115,7 @@ public class FileContentsTracker {
 
 	/**
 	 * Returns {@code true} if there is at least one changed URI whose path
-	 * falls under the given root directory.  This allows callers to check
+	 * falls under the given root directory. This allows callers to check
 	 * for scope-relevant changes without iterating the full set themselves.
 	 *
 	 * @param root the project root path to check against; if {@code null},
@@ -144,28 +147,8 @@ public class FileContentsTracker {
 	public void didOpen(DidOpenTextDocumentParams params) {
 		URI uri = URI.create(params.getTextDocument().getUri());
 		String newText = params.getTextDocument().getText();
-
-		// Determine previously known content before updating openFiles.
-		// Only mark as "changed" when the content actually differs — opening
-		// an unmodified file should NOT trigger an incremental recompile.
-		boolean contentChanged = true;
-		String previousContent = openFiles.get(uri);
-		if (previousContent == null) {
-			CachedContent cached = closedFileCache.get(uri);
-			if (cached != null) {
-				previousContent = cached.content;
-			} else {
-				try {
-					previousContent = Files.readString(Paths.get(uri));
-				} catch (Exception e) {
-					// Unable to read from disk (new file, non-file URI, etc.)
-					// — treat as changed so it gets compiled.
-				}
-			}
-		}
-		if (previousContent != null && previousContent.equals(newText)) {
-			contentChanged = false;
-		}
+		String previousContent = resolvePreviousContent(uri);
+		boolean contentChanged = previousContent == null || !previousContent.equals(newText);
 
 		openFiles.put(uri, newText);
 		closedFileCache.remove(uri);
@@ -200,28 +183,49 @@ public class FileContentsTracker {
 			}
 			// Apply all content changes in order (incremental sync may send multiple)
 			for (TextDocumentContentChangeEvent change : params.getContentChanges()) {
-				Range range = change.getRange();
-				if (range == null) {
-					// Full content replacement
-					currentText = change.getText();
-				} else {
-					int offsetStart = Positions.getOffset(currentText, range.getStart());
-					int offsetEnd = Positions.getOffset(currentText, range.getEnd());
-					if (offsetStart < 0 || offsetEnd < 0 || offsetStart > currentText.length() || offsetEnd > currentText.length()) {
-						// Invalid offsets — fall back to full content replacement
-						currentText = change.getText();
-					} else {
-						StringBuilder builder = new StringBuilder();
-						builder.append(currentText.substring(0, offsetStart));
-						builder.append(change.getText());
-						builder.append(currentText.substring(offsetEnd));
-						currentText = builder.toString();
-					}
-				}
+				currentText = applyContentChange(currentText, change);
 			}
 			return currentText;
 		});
 		changedFiles.add(uri);
+	}
+
+	private String resolvePreviousContent(URI uri) {
+		String previousContent = openFiles.get(uri);
+		if (previousContent != null) {
+			return previousContent;
+		}
+
+		CachedContent cached = closedFileCache.get(uri);
+		if (cached != null) {
+			return cached.content;
+		}
+
+		try {
+			return Files.readString(Paths.get(uri));
+		} catch (RuntimeException | IOException e) {
+			return null;
+		}
+	}
+
+	private static String applyContentChange(String currentText, TextDocumentContentChangeEvent change) {
+		Range range = change.getRange();
+		if (range == null) {
+			return change.getText();
+		}
+
+		int offsetStart = Positions.getOffset(currentText, range.getStart());
+		int offsetEnd = Positions.getOffset(currentText, range.getEnd());
+		if (offsetStart < 0 || offsetEnd < 0 || offsetStart > currentText.length()
+				|| offsetEnd > currentText.length()) {
+			return change.getText();
+		}
+
+		StringBuilder builder = new StringBuilder();
+		builder.append(currentText, 0, offsetStart);
+		builder.append(change.getText());
+		builder.append(currentText, offsetEnd, currentText.length());
+		return builder.toString();
 	}
 
 	public void didClose(DidCloseTextDocumentParams params) {
@@ -240,9 +244,9 @@ public class FileContentsTracker {
 	 * Returns the contents for the given URI.
 	 *
 	 * <ol>
-	 *   <li>If the file is open in the editor, returns the in-memory text.</li>
-	 *   <li>Otherwise checks the closed-file TTL cache.</li>
-	 *   <li>On cache miss / expiry, reads from disk and caches the result.</li>
+	 * <li>If the file is open in the editor, returns the in-memory text.</li>
+	 * <li>Otherwise checks the closed-file TTL cache.</li>
+	 * <li>On cache miss / expiry, reads from disk and caches the result.</li>
 	 * </ol>
 	 */
 	public String getContents(URI uri) {
@@ -303,7 +307,7 @@ public class FileContentsTracker {
 
 	/**
 	 * Estimates the total heap memory consumed by open file buffers and
-	 * the closed-file cache.  Each open file stores its full text content
+	 * the closed-file cache. Each open file stores its full text content
 	 * as a String (2 bytes per char + ~40 bytes object overhead).
 	 *
 	 * @return estimated bytes consumed

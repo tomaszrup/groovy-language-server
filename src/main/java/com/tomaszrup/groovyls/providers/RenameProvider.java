@@ -128,55 +128,11 @@ public class RenameProvider {
 		Position start = range.getStart();
 
 		if (node instanceof ClassNode) {
-			ClassNode classNode = (ClassNode) node;
-			String className = classNode.getNameWithoutPackage();
-			int dollarIndex = className.indexOf('$');
-			if (dollarIndex != -1) {
-				className = className.substring(dollarIndex + 1);
-			}
-			// For ClassNode, get the first line from file contents since the AST range spans multiple lines
-			String firstLine = getFirstLineOfNode(documentURI, start.getLine());
-			if (firstLine == null) {
-				return null;
-			}
-			Pattern classPattern = Pattern.compile("(class\\s+)" + className + "\\b");
-			Matcher classMatcher = classPattern.matcher(firstLine);
-			if (!classMatcher.find()) {
-				return null;
-			}
-			String prefix = classMatcher.group(1);
-			int nameStart = prefix.length() + classMatcher.start();
-			return new Range(
-					new Position(start.getLine(), nameStart),
-					new Position(start.getLine(), classMatcher.end()));
+			return getClassNodeNameRange((ClassNode) node, documentURI, start.getLine());
 		} else if (node instanceof MethodNode) {
-			MethodNode methodNode = (MethodNode) node;
-			String firstLine = getFirstLineOfNode(documentURI, start.getLine());
-			if (firstLine == null) {
-				return null;
-			}
-			Pattern methodPattern = Pattern.compile("\\b" + methodNode.getName() + "\\b(?=\\s*\\()");
-			Matcher methodMatcher = methodPattern.matcher(firstLine);
-			if (!methodMatcher.find()) {
-				return null;
-			}
-			return new Range(
-					new Position(start.getLine(), methodMatcher.start()),
-					new Position(start.getLine(), methodMatcher.end()));
+			return getMethodNodeNameRange((MethodNode) node, documentURI, start.getLine());
 		} else if (node instanceof PropertyNode) {
-			PropertyNode propNode = (PropertyNode) node;
-			String contents = getPartialNodeText(documentURI, node);
-			if (contents == null) {
-				return null;
-			}
-			Pattern propPattern = Pattern.compile("\\b" + propNode.getName() + "\\b");
-			Matcher propMatcher = propPattern.matcher(contents);
-			if (!propMatcher.find()) {
-				return null;
-			}
-			return new Range(
-					new Position(start.getLine(), start.getCharacter() + propMatcher.start()),
-					new Position(start.getLine(), start.getCharacter() + propMatcher.end()));
+			return getPropertyNodeNameRange((PropertyNode) node, documentURI, start);
 		}
 		// For ConstantExpression and VariableExpression, the AST range is the name range
 		Position end = range.getEnd();
@@ -221,66 +177,11 @@ public class RenameProvider {
 		}
 
 		List<ASTNode> references = GroovyASTUtils.getReferences(offsetNode, ast);
-		references.forEach(node -> {
-			URI uri = ast.getURI(node);
-			if (uri == null) {
-				uri = documentURI;
-			}
+		references.forEach(node -> applyRenameForReference(node, documentURI, newName, textEditChanges, documentChanges));
 
-			String contents = getPartialNodeText(uri, node);
-			if (contents == null) {
-				// can't find the text? skip it
-				return;
-			}
-			Range range = GroovyLanguageServerUtils.astNodeToRange(node);
-			if (range == null) {
-				// can't find the range? skip it
-				return;
-			}
-			Position start = range.getStart();
-			Position end = range.getEnd();
-			end.setLine(start.getLine());
-			end.setCharacter(start.getCharacter() + contents.length());
-
-			TextEdit textEdit = null;
-			if (node instanceof ClassNode) {
-				ClassNode classNode = (ClassNode) node;
-				textEdit = createTextEditToRenameClassNode(classNode, newName, contents, range);
-				if (textEdit != null && ast.getParent(classNode) == null) {
-					String newURI = uri.toString();
-					int slashIndex = newURI.lastIndexOf("/");
-					int dotIndex = newURI.lastIndexOf(".");
-					newURI = newURI.substring(0, slashIndex + 1) + newName + newURI.substring(dotIndex);
-
-					RenameFile renameFile = new RenameFile();
-					renameFile.setOldUri(uri.toString());
-					renameFile.setNewUri(newURI);
-					documentChanges.add(Either.forRight(renameFile));
-				}
-			} else if (node instanceof MethodNode) {
-				MethodNode methodNode = (MethodNode) node;
-				textEdit = createTextEditToRenameMethodNode(methodNode, newName, contents, range);
-			} else if (node instanceof PropertyNode) {
-				PropertyNode propNode = (PropertyNode) node;
-				textEdit = createTextEditToRenamePropertyNode(propNode, newName, contents, range);
-			} else if (node instanceof ConstantExpression || node instanceof VariableExpression) {
-				textEdit = new TextEdit();
-				textEdit.setNewText(newName);
-				textEdit.setRange(range);
-			}
-			if (textEdit == null) {
-				return;
-			}
-
-			if (!textEditChanges.containsKey(uri.toString())) {
-				textEditChanges.put(uri.toString(), new ArrayList<>());
-			}
-			List<TextEdit> textEdits = textEditChanges.get(uri.toString());
-			textEdits.add(textEdit);
-		});
-
-		for (String uri : textEditChanges.keySet()) {
-			List<TextEdit> textEdits = textEditChanges.get(uri);
+		for (Map.Entry<String, List<TextEdit>> entry : textEditChanges.entrySet()) {
+			String uri = entry.getKey();
+			List<TextEdit> textEdits = entry.getValue();
 
 			VersionedTextDocumentIdentifier versionedIdentifier = new VersionedTextDocumentIdentifier(uri, null);
 			TextDocumentEdit textDocumentEdit = new TextDocumentEdit(versionedIdentifier, textEdits);
@@ -288,6 +189,122 @@ public class RenameProvider {
 		}
 
 		return CompletableFuture.completedFuture(workspaceEdit);
+	}
+
+	private Range getClassNodeNameRange(ClassNode classNode, URI documentURI, int line) {
+		String className = classNode.getNameWithoutPackage();
+		int dollarIndex = className.indexOf('$');
+		if (dollarIndex != -1) {
+			className = className.substring(dollarIndex + 1);
+		}
+		String firstLine = getFirstLineOfNode(documentURI, line);
+		if (firstLine == null) {
+			return null;
+		}
+		Pattern classPattern = Pattern.compile("(class\\s+)" + className + "\\b");
+		Matcher classMatcher = classPattern.matcher(firstLine);
+		if (!classMatcher.find()) {
+			return null;
+		}
+		String prefix = classMatcher.group(1);
+		int nameStart = prefix.length() + classMatcher.start();
+		return new Range(new Position(line, nameStart), new Position(line, classMatcher.end()));
+	}
+
+	private Range getMethodNodeNameRange(MethodNode methodNode, URI documentURI, int line) {
+		String firstLine = getFirstLineOfNode(documentURI, line);
+		if (firstLine == null) {
+			return null;
+		}
+		Pattern methodPattern = Pattern.compile("\\b" + methodNode.getName() + "\\b(?=\\s*\\()");
+		Matcher methodMatcher = methodPattern.matcher(firstLine);
+		if (!methodMatcher.find()) {
+			return null;
+		}
+		return new Range(new Position(line, methodMatcher.start()), new Position(line, methodMatcher.end()));
+	}
+
+	private Range getPropertyNodeNameRange(PropertyNode propNode, URI documentURI, Position start) {
+		String contents = getPartialNodeText(documentURI, propNode);
+		if (contents == null) {
+			return null;
+		}
+		Pattern propPattern = Pattern.compile("\\b" + propNode.getName() + "\\b");
+		Matcher propMatcher = propPattern.matcher(contents);
+		if (!propMatcher.find()) {
+			return null;
+		}
+		return new Range(
+				new Position(start.getLine(), start.getCharacter() + propMatcher.start()),
+				new Position(start.getLine(), start.getCharacter() + propMatcher.end()));
+	}
+
+	private void applyRenameForReference(ASTNode node, URI documentURI, String newName,
+			Map<String, List<TextEdit>> textEditChanges,
+			List<Either<TextDocumentEdit, ResourceOperation>> documentChanges) {
+		URI uri = ast.getURI(node);
+		if (uri == null) {
+			uri = documentURI;
+		}
+
+		String contents = getPartialNodeText(uri, node);
+		Range range = GroovyLanguageServerUtils.astNodeToRange(node);
+		if (contents == null || range == null) {
+			return;
+		}
+
+		Position start = range.getStart();
+		Position end = range.getEnd();
+		end.setLine(start.getLine());
+		end.setCharacter(start.getCharacter() + contents.length());
+
+		TextEdit textEdit = createTextEditForNode(node, newName, contents, range, uri, documentChanges);
+		if (textEdit == null) {
+			return;
+		}
+		addTextEdit(textEditChanges, uri.toString(), textEdit);
+	}
+
+	private TextEdit createTextEditForNode(ASTNode node, String newName, String contents, Range range, URI uri,
+			List<Either<TextDocumentEdit, ResourceOperation>> documentChanges) {
+		if (node instanceof ClassNode) {
+			ClassNode classNode = (ClassNode) node;
+			TextEdit textEdit = createTextEditToRenameClassNode(classNode, newName, contents, range);
+			if (textEdit != null && ast.getParent(classNode) == null) {
+				addRenameFileOperation(uri, newName, documentChanges);
+			}
+			return textEdit;
+		}
+		if (node instanceof MethodNode) {
+			return createTextEditToRenameMethodNode((MethodNode) node, newName, contents, range);
+		}
+		if (node instanceof PropertyNode) {
+			return createTextEditToRenamePropertyNode((PropertyNode) node, newName, contents, range);
+		}
+		if (node instanceof ConstantExpression || node instanceof VariableExpression) {
+			TextEdit textEdit = new TextEdit();
+			textEdit.setNewText(newName);
+			textEdit.setRange(range);
+			return textEdit;
+		}
+		return null;
+	}
+
+	private void addRenameFileOperation(URI uri, String newName,
+			List<Either<TextDocumentEdit, ResourceOperation>> documentChanges) {
+		String newURI = uri.toString();
+		int slashIndex = newURI.lastIndexOf("/");
+		int dotIndex = newURI.lastIndexOf(".");
+		newURI = newURI.substring(0, slashIndex + 1) + newName + newURI.substring(dotIndex);
+
+		RenameFile renameFile = new RenameFile();
+		renameFile.setOldUri(uri.toString());
+		renameFile.setNewUri(newURI);
+		documentChanges.add(Either.forRight(renameFile));
+	}
+
+	private void addTextEdit(Map<String, List<TextEdit>> textEditChanges, String uri, TextEdit textEdit) {
+		textEditChanges.computeIfAbsent(uri, key -> new ArrayList<>()).add(textEdit);
 	}
 
 	private String getPartialNodeText(URI uri, ASTNode node) {

@@ -87,27 +87,8 @@ public class InlayHintProvider {
         List<InlayHint> hints = new ArrayList<>();
 
         for (ASTNode node : nodes) {
-            if (node.getLineNumber() == -1) {
-                continue;
-            }
-            Range nodeRange = GroovyLanguageServerUtils.astNodeToRange(node);
-            if (nodeRange == null) {
-                continue;
-            }
-            // Skip nodes outside the visible range
-            if (!rangesOverlap(visibleRange, nodeRange)) {
-                continue;
-            }
-
-            if (node instanceof DeclarationExpression) {
-                InlayHint typeHint = createTypeHint((DeclarationExpression) node);
-                if (typeHint != null) {
-                    hints.add(typeHint);
-                }
-            } else if (node instanceof MethodCallExpression) {
-                hints.addAll(createParameterHints((MethodCallExpression) node));
-            } else if (node instanceof ConstructorCallExpression) {
-                hints.addAll(createConstructorParameterHints((ConstructorCallExpression) node));
+            if (isNodeVisible(node, visibleRange)) {
+                addHintsForNode(node, hints);
             }
         }
 
@@ -204,30 +185,9 @@ public class InlayHintProvider {
         for (int i = 0; i < count; i++) {
             Expression arg = args.get(i);
             Parameter param = params[i];
-
-            // Skip if the argument is a closure (too noisy)
-            if (arg instanceof ClosureExpression) {
-                continue;
-            }
-
             String paramName = param.getName();
-
-            // Skip if the argument text already matches the parameter name
-            // (e.g., passing a variable with the same name as the parameter)
-            if (arg instanceof VariableExpression) {
-                VariableExpression varExpr = (VariableExpression) arg;
-                if (varExpr.getName().equals(paramName)) {
-                    continue;
-                }
-            }
-
-            // Skip single-parameter calls with obvious semantics
-            if (params.length == 1 && isObviousSingleParam(paramName)) {
-                continue;
-            }
-
             Range argRange = GroovyLanguageServerUtils.astNodeToRange(arg);
-            if (argRange == null) {
+            if (shouldSkipParameterHint(arg, paramName, params.length, argRange)) {
                 continue;
             }
 
@@ -242,6 +202,40 @@ public class InlayHintProvider {
         }
 
         return hints;
+    }
+
+    private void addHintsForNode(ASTNode node, List<InlayHint> hints) {
+        if (node instanceof DeclarationExpression) {
+            InlayHint typeHint = createTypeHint((DeclarationExpression) node);
+            if (typeHint != null) {
+                hints.add(typeHint);
+            }
+        } else if (node instanceof MethodCallExpression) {
+            hints.addAll(createParameterHints((MethodCallExpression) node));
+        } else if (node instanceof ConstructorCallExpression) {
+            hints.addAll(createConstructorParameterHints((ConstructorCallExpression) node));
+        }
+    }
+
+    private boolean isNodeVisible(ASTNode node, Range visibleRange) {
+        if (node.getLineNumber() == -1) {
+            return false;
+        }
+        Range nodeRange = GroovyLanguageServerUtils.astNodeToRange(node);
+        return nodeRange != null && rangesOverlap(visibleRange, nodeRange);
+    }
+
+    private boolean shouldSkipParameterHint(Expression arg, String paramName, int parameterCount, Range argRange) {
+        if (argRange == null || arg instanceof ClosureExpression) {
+            return true;
+        }
+        if (arg instanceof VariableExpression) {
+            VariableExpression varExpr = (VariableExpression) arg;
+            if (varExpr.getName().equals(paramName)) {
+                return true;
+            }
+        }
+        return parameterCount == 1 && isObviousSingleParam(paramName);
     }
 
     /**
@@ -274,10 +268,7 @@ public class InlayHintProvider {
         if (comparePositions(a.getEnd(), b.getStart()) < 0) {
             return false;
         }
-        if (comparePositions(b.getEnd(), a.getStart()) < 0) {
-            return false;
-        }
-        return true;
+        return comparePositions(b.getEnd(), a.getStart()) >= 0;
     }
 
     private int comparePositions(Position a, Position b) {

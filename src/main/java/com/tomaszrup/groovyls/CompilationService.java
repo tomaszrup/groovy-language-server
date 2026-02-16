@@ -21,7 +21,6 @@
 package com.tomaszrup.groovyls;
 
 import java.net.URI;
-import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.Comparator;
 import java.util.Collections;
@@ -31,8 +30,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Semaphore;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.codehaus.groovy.control.CompilationFailedException;
 import org.codehaus.groovy.control.CompilerConfiguration;
@@ -56,7 +54,6 @@ import com.tomaszrup.groovyls.compiler.DiagnosticHandler;
 import com.tomaszrup.groovyls.compiler.ast.ASTNodeVisitor;
 import com.tomaszrup.groovyls.compiler.control.GroovyLSCompilationUnit;
 import com.tomaszrup.groovyls.util.FileContentsTracker;
-import com.tomaszrup.groovyls.util.GroovyVersionDetector;
 import com.tomaszrup.groovyls.util.GroovyLanguageServerUtils;
 import com.tomaszrup.groovyls.util.MdcProjectContext;
 import org.slf4j.Logger;
@@ -70,27 +67,6 @@ import org.slf4j.LoggerFactory;
 public class CompilationService {
 	private static final Logger logger = LoggerFactory.getLogger(CompilationService.class);
 	private static final String VERSION_GUARD_DIAGNOSTIC_SOURCE = "groovy-language-server";
-	private static final Pattern IMPLICATION_OPERATOR_PATTERN = Pattern.compile("==>");
-	private static final Pattern INSTANCEOF_PATTERN_VARIABLE_PATTERN =
-			Pattern.compile("\\binstanceof\\s+[A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)*(?:<[^>]+>)?\\s+[A-Za-z_$][\\w$]*\\b");
-	private static final Pattern VAR_MULTI_ASSIGNMENT_PATTERN =
-			Pattern.compile("\\bvar\\s*\\(\\s*[^)]*\\)");
-	private static final Pattern FOR_LOOP_INDEX_VARIABLE_PATTERN =
-			Pattern.compile("\\bfor\\s*\\(\\s*[^,\\)]+,\\s*[^\\)]*\\bin\\b[^\\)]*\\)");
-	private static final Pattern UNDERSCORE_PLACEHOLDER_LAMBDA_PATTERN =
-			Pattern.compile("\\(\\s*[^)]*\\b_\\b[^)]*\\)\\s*->");
-	private static final Pattern UNDERSCORE_PLACEHOLDER_CLOSURE_PATTERN =
-			Pattern.compile("\\{[^\\n\\r{}]*\\b_\\b[^\\n\\r{}]*->");
-	private static final Pattern MULTIDIMENSIONAL_ARRAY_JAVA_LITERAL_PATTERN =
-			Pattern.compile("\\bnew\\s+[A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)*\\s*\\[\\s*]\\s*\\[\\s*]\\s*\\{\\s*\\{");
-	private static final java.util.List<GuardedSyntaxFeature> GROOVY5_SYNTAX_FEATURES = java.util.List.of(
-			new GuardedSyntaxFeature(IMPLICATION_OPERATOR_PATTERN, "implication operator (==>)"),
-			new GuardedSyntaxFeature(INSTANCEOF_PATTERN_VARIABLE_PATTERN, "instanceof pattern variable"),
-			new GuardedSyntaxFeature(VAR_MULTI_ASSIGNMENT_PATTERN, "var with multi-assignment"),
-			new GuardedSyntaxFeature(FOR_LOOP_INDEX_VARIABLE_PATTERN, "for-loop index variable declaration"),
-			new GuardedSyntaxFeature(UNDERSCORE_PLACEHOLDER_LAMBDA_PATTERN, "underscore placeholder parameters in lambdas"),
-			new GuardedSyntaxFeature(UNDERSCORE_PLACEHOLDER_CLOSURE_PATTERN, "underscore placeholder parameters in closures"),
-			new GuardedSyntaxFeature(MULTIDIMENSIONAL_ARRAY_JAVA_LITERAL_PATTERN, "Java-style multidimensional array literals"));
 
 	/**
 	 * Maximum number of simultaneously changed files for which incremental
@@ -107,21 +83,23 @@ public class CompilationService {
 	private final CompilationOrchestrator compilationOrchestrator = new CompilationOrchestrator();
 	private final DiagnosticHandler diagnosticHandler = new DiagnosticHandler();
 	private final FileContentsTracker fileContentsTracker;
-	private volatile LanguageClient languageClient;
+	private final GroovyVersionSyntaxGuard syntaxGuard;
+	private final AtomicReference<LanguageClient> languageClient = new AtomicReference<>();
 
 	/**
 	 * Global semaphore that caps concurrent compilations across all thread
 	 * pools (import, background, LSP).  May be {@code null} for tests that
 	 * don't inject an {@link ExecutorPools} instance.
 	 */
-	private volatile Semaphore compilationPermits;
+	private final AtomicReference<Semaphore> compilationPermits = new AtomicReference<>();
 
 	public CompilationService(FileContentsTracker fileContentsTracker) {
 		this.fileContentsTracker = fileContentsTracker;
+		this.syntaxGuard = new GroovyVersionSyntaxGuard(fileContentsTracker);
 	}
 
 	public void setLanguageClient(LanguageClient client) {
-		this.languageClient = client;
+		this.languageClient.set(client);
 	}
 
 	/**
@@ -130,7 +108,7 @@ public class CompilationService {
 	 * starting compilation and release it in a {@code finally} block.
 	 */
 	public void setCompilationPermits(Semaphore permits) {
-		this.compilationPermits = permits;
+		this.compilationPermits.set(permits);
 	}
 
 	public FileContentsTracker getFileContentsTracker() {
@@ -223,7 +201,7 @@ public class CompilationService {
 	 */
 	public Set<URI> compile(ProjectScope scope) {
 		MdcProjectContext.setProject(scope.getProjectRoot());
-		Semaphore permits = compilationPermits;
+		Semaphore permits = compilationPermits.get();
 		if (permits != null) {
 			try {
 				permits.acquire();
@@ -239,9 +217,9 @@ public class CompilationService {
 			if (collector != null) {
 				DiagnosticHandler.DiagnosticResult result = diagnosticHandler.handleErrorCollector(
 						scope.getCompilationUnit(), collector, scope.getProjectRoot(), scope.getPrevDiagnosticsByFile());
-				result = mergeGroovyVersionSyntaxDiagnostics(scope, scope.getCompilationUnit(), result);
+				result = syntaxGuard.mergeGroovyVersionSyntaxDiagnostics(scope, scope.getCompilationUnit(), result);
 				scope.setPrevDiagnosticsByFile(result.getDiagnosticsByFile());
-				LanguageClient client = languageClient;
+				LanguageClient client = languageClient.get();
 				if (client != null) {
 					publishDiagnosticsBatch(client, result.getDiagnosticsToPublish());
 				}
@@ -356,94 +334,102 @@ public class CompilationService {
 	 */
 	public boolean ensureScopeCompiled(ProjectScope scope, URI triggerURI,
 			java.util.concurrent.ExecutorService backgroundCompiler) {
-		if (scope.isCompiled()) {
-			return false;
-		}
-		// If a previous compilation failed with OOM, don't retry endlessly.
-		// The user needs to increase heap or reduce scope count.
-		if (scope.isCompilationFailed()) {
-			logger.debug("Skipping compilation of {} — previously failed with OOM", scope.getProjectRoot());
-			return false;
-		}
-		// Guard: do not compile a scope whose classpath hasn't been resolved
-		// yet — this would produce thousands of false-positive diagnostics.
-		if (!scope.isClasspathResolved() && scope.getProjectRoot() != null) {
-			logger.debug("Skipping compilation of {} — classpath not yet resolved", scope.getProjectRoot());
+		if (shouldSkipCompilation(scope)) {
 			return false;
 		}
 
-		// --- Staged compilation: fast single-file first, full compile later ---
-		// Only use staged path when we have a trigger file AND a background pool.
-		if (triggerURI != null && backgroundCompiler != null) {
-			long stageStart = System.currentTimeMillis();
-
-			// Phase A: compile just the opened file with the project's classpath
-			Set<URI> singleFile = Set.of(triggerURI);
-			GroovyLSCompilationUnit incrementalUnit = scope.getCompilationUnitFactory()
-					.createIncremental(scope.getProjectRoot(), fileContentsTracker, singleFile);
-
-			if (incrementalUnit != null) {
-				// Ensure the classloader is set for the scope (needed later)
-				if (scope.getClassLoader() == null) {
-					scope.setClassLoader(incrementalUnit.getClassLoader());
-				}
-
-				ErrorCollector collector = compilationOrchestrator.compileIncremental(
-						incrementalUnit, scope.getProjectRoot());
-				ASTNodeVisitor visitor = compilationOrchestrator.visitAST(incrementalUnit);
-				if (visitor != null) {
-					scope.setAstVisitor(visitor);
-				}
-
-				// Publish diagnostics for the single file immediately
-				if (collector != null) {
-					DiagnosticHandler.DiagnosticResult result = diagnosticHandler.handleErrorCollector(
-							incrementalUnit, collector, scope.getProjectRoot(),
-							scope.getPrevDiagnosticsByFile());
-					result = mergeGroovyVersionSyntaxDiagnostics(scope, incrementalUnit, result);
-					scope.setPrevDiagnosticsByFile(result.getDiagnosticsByFile());
-					LanguageClient client = languageClient;
-					if (client != null) {
-						publishDiagnosticsBatch(client, result.getDiagnosticsToPublish());
-					}
-				}
-
-				long stageElapsed = System.currentTimeMillis() - stageStart;
-				logger.info("Staged Phase A for {} completed in {}ms (single-file diagnostic)",
-						scope.getProjectRoot(), stageElapsed);
-
-				// Mark as compiled so semantic tokens requests don't trigger
-				// redundant compilation while Phase B is running in background.
-				// Phase A provides a partial but usable AST for immediate feedback.
-				scope.setCompiled(true);
-			}
-
-			// Phase B: schedule full compilation in the background
-			backgroundCompiler.submit(() -> {
-				scope.getLock().writeLock().lock();
-				try {
-					// Guard: another Phase B (or standard full compilation) may
-					// have completed while this task was queued.  This prevents
-					// N open tabs from causing N full compilations of the same
-					// project during startup.  Check fullyCompiled instead of
-					// compiled so Phase B runs even though Phase A set compiled=true.
-					if (scope.isFullyCompiled()) {
-						logger.debug("Phase B skipped for {} — already fully compiled",
-								scope.getProjectRoot());
-						return;
-					}
-					doFullCompilation(scope);
-				} finally {
-					scope.getLock().writeLock().unlock();
-				}
-			});
-
+		if (canUseStagedCompilation(triggerURI, backgroundCompiler)) {
+			runStagedCompilation(scope, triggerURI, backgroundCompiler);
 			return true;
 		}
 
 		// --- Standard full compilation path ---
 		doFullCompilation(scope);
 		return true;
+	}
+
+	private boolean shouldSkipCompilation(ProjectScope scope) {
+		if (scope.isCompiled()) {
+			return true;
+		}
+		if (scope.isCompilationFailed()) {
+			logger.debug("Skipping compilation of {} — previously failed with OOM", scope.getProjectRoot());
+			return true;
+		}
+		if (!scope.isClasspathResolved() && scope.getProjectRoot() != null) {
+			logger.debug("Skipping compilation of {} — classpath not yet resolved", scope.getProjectRoot());
+			return true;
+		}
+		return false;
+	}
+
+	private boolean canUseStagedCompilation(URI triggerURI, java.util.concurrent.ExecutorService backgroundCompiler) {
+		return triggerURI != null && backgroundCompiler != null;
+	}
+
+	private void runStagedCompilation(ProjectScope scope, URI triggerURI,
+			java.util.concurrent.ExecutorService backgroundCompiler) {
+		long stageStart = System.currentTimeMillis();
+		performStagedPhaseA(scope, triggerURI, stageStart);
+		scheduleStagedPhaseB(scope, backgroundCompiler);
+	}
+
+	private void performStagedPhaseA(ProjectScope scope, URI triggerURI, long stageStart) {
+		Set<URI> singleFile = Set.of(triggerURI);
+		GroovyLSCompilationUnit incrementalUnit = scope.getCompilationUnitFactory()
+				.createIncremental(scope.getProjectRoot(), fileContentsTracker, singleFile);
+		if (incrementalUnit == null) {
+			return;
+		}
+
+		if (scope.getClassLoader() == null) {
+			scope.setClassLoader(incrementalUnit.getClassLoader());
+		}
+
+		ErrorCollector collector = compilationOrchestrator.compileIncremental(
+				incrementalUnit, scope.getProjectRoot());
+		ASTNodeVisitor visitor = compilationOrchestrator.visitAST(incrementalUnit);
+		if (visitor != null) {
+			scope.setAstVisitor(visitor);
+		}
+
+		publishPhaseADiagnostics(scope, incrementalUnit, collector);
+
+		long stageElapsed = System.currentTimeMillis() - stageStart;
+		logger.info("Staged Phase A for {} completed in {}ms (single-file diagnostic)",
+				scope.getProjectRoot(), stageElapsed);
+		scope.setCompiled(true);
+	}
+
+	private void publishPhaseADiagnostics(ProjectScope scope, GroovyLSCompilationUnit incrementalUnit,
+			ErrorCollector collector) {
+		if (collector == null) {
+			return;
+		}
+		DiagnosticHandler.DiagnosticResult result = diagnosticHandler.handleErrorCollector(
+				incrementalUnit, collector, scope.getProjectRoot(),
+				scope.getPrevDiagnosticsByFile());
+		result = syntaxGuard.mergeGroovyVersionSyntaxDiagnostics(scope, incrementalUnit, result);
+		scope.setPrevDiagnosticsByFile(result.getDiagnosticsByFile());
+		LanguageClient client = languageClient.get();
+		if (client != null) {
+			publishDiagnosticsBatch(client, result.getDiagnosticsToPublish());
+		}
+	}
+
+	private void scheduleStagedPhaseB(ProjectScope scope, java.util.concurrent.ExecutorService backgroundCompiler) {
+		backgroundCompiler.submit(() -> {
+			scope.getLock().writeLock().lock();
+			try {
+				if (scope.isFullyCompiled()) {
+					logger.debug("Phase B skipped for {} — already fully compiled", scope.getProjectRoot());
+					return;
+				}
+				doFullCompilation(scope);
+			} finally {
+				scope.getLock().writeLock().unlock();
+			}
+		});
 	}
 
 	/**
@@ -476,7 +462,6 @@ public class CompilationService {
 			logger.debug("Full compilation LinkageError details", e);
 		} catch (VirtualMachineError e) {
 			handleCompilationOOM(scope, e, "doFullCompilation");
-			return; // setCompiled(true) still runs via finally below
 		} finally {
 			// Always mark as compiled to prevent infinite retry loops.
 			// Even after OOM, retrying immediately would just OOM again.
@@ -492,9 +477,9 @@ public class CompilationService {
 		long fullElapsed = System.currentTimeMillis() - fullStart;
 		logger.info("Full compilation of {} completed in {}ms", scope.getProjectRoot(), fullElapsed);
 		// Refresh semantic tokens after full compilation replaces the AST
-		LanguageClient client = languageClient;
-		if (client instanceof com.tomaszrup.groovyls.GroovyLanguageClient) {
-			((com.tomaszrup.groovyls.GroovyLanguageClient) client).refreshSemanticTokens();
+		LanguageClient client = languageClient.get();
+		if (client instanceof GroovyLanguageClient) {
+			GroovyLanguageClient.class.cast(client).refreshSemanticTokens();
 		}
 	}
 
@@ -507,6 +492,9 @@ public class CompilationService {
 	 */
 	public ProjectScope ensureCompiledForContext(URI uri, ProjectScopeManager scopeManager,
 			java.util.concurrent.ExecutorService backgroundCompiler) {
+		if (backgroundCompiler != null && logger.isTraceEnabled()) {
+			logger.trace("ensureCompiledForContext background compiler available for {}", uri);
+		}
 		ProjectScope scope = scopeManager.findProjectScope(uri);
 		if (scope == null) {
 			logger.warn("ensureCompiledForContext uri={} projectRoot=null (no matching scope)", uri);
@@ -522,44 +510,56 @@ public class CompilationService {
 		// Set MDC project context for all log messages during this request
 		MdcProjectContext.setProject(scope.getProjectRoot());
 
-		if (!scope.isCompiled() || scope.getAstVisitor() == null) {
-			scope.getLock().writeLock().lock();
-			try {
-				ensureScopeCompiled(scope);
-				if (scope.getAstVisitor() == null) {
-					return scope;
-				}
-				if (fileContentsTracker.hasChangedURIsUnder(scope.getProjectRoot())) {
-					compileAndVisitAST(scope, uri);
-				}
-			} catch (LinkageError e) {
-				logger.warn("Classpath linkage error in ensureCompiledForContext for {}: {}",
-						uri, e.toString());
-				logger.debug("ensureCompiledForContext LinkageError details", e);
-			} catch (VirtualMachineError e) {
-				handleCompilationOOM(scope, e, "ensureCompiledForContext");
-			} finally {
-				scope.getLock().writeLock().unlock();
-			}
-		} else if (fileContentsTracker.hasChangedURIsUnder(scope.getProjectRoot())) {
-			// Compile synchronously so callers always see up-to-date AST state
-			scope.getLock().writeLock().lock();
-			try {
-				if (fileContentsTracker.hasChangedURIsUnder(scope.getProjectRoot())) {
-					compileAndVisitAST(scope, uri);
-				}
-			} catch (LinkageError e) {
-				logger.warn("Classpath linkage error in ensureCompiledForContext (recompile) for {}: {}",
-						uri, e.toString());
-				logger.debug("ensureCompiledForContext recompile LinkageError details", e);
-			} catch (VirtualMachineError e) {
-				handleCompilationOOM(scope, e, "ensureCompiledForContext recompile");
-			} finally {
-				scope.getLock().writeLock().unlock();
-			}
+		if (requiresInitialCompilation(scope)) {
+			compileInitialScopeForContext(scope, uri);
+		} else if (hasScopeChanges(scope)) {
+			recompileChangedScopeForContext(scope, uri);
 		}
 
 		return scope;
+	}
+
+	private boolean requiresInitialCompilation(ProjectScope scope) {
+		return !scope.isCompiled() || scope.getAstVisitor() == null;
+	}
+
+	private boolean hasScopeChanges(ProjectScope scope) {
+		return fileContentsTracker.hasChangedURIsUnder(scope.getProjectRoot());
+	}
+
+	private void compileInitialScopeForContext(ProjectScope scope, URI uri) {
+		scope.getLock().writeLock().lock();
+		try {
+			ensureScopeCompiled(scope);
+			if (scope.getAstVisitor() != null && hasScopeChanges(scope)) {
+				compileAndVisitAST(scope, uri);
+			}
+		} catch (LinkageError e) {
+			logger.warn("Classpath linkage error in ensureCompiledForContext for {}: {}",
+					uri, e.toString());
+			logger.debug("ensureCompiledForContext LinkageError details", e);
+		} catch (VirtualMachineError e) {
+			handleCompilationOOM(scope, e, "ensureCompiledForContext");
+		} finally {
+			scope.getLock().writeLock().unlock();
+		}
+	}
+
+	private void recompileChangedScopeForContext(ProjectScope scope, URI uri) {
+		scope.getLock().writeLock().lock();
+		try {
+			if (hasScopeChanges(scope)) {
+				compileAndVisitAST(scope, uri);
+			}
+		} catch (LinkageError e) {
+			logger.warn("Classpath linkage error in ensureCompiledForContext (recompile) for {}: {}",
+					uri, e.toString());
+			logger.debug("ensureCompiledForContext recompile LinkageError details", e);
+		} catch (VirtualMachineError e) {
+			handleCompilationOOM(scope, e, "ensureCompiledForContext recompile");
+		} finally {
+			scope.getLock().writeLock().unlock();
+		}
 	}
 
 	protected void recompileIfContextChanged(ProjectScope scope, URI newContext) {
@@ -675,9 +675,9 @@ public class CompilationService {
 		if (collector != null) {
 			DiagnosticHandler.DiagnosticResult result = diagnosticHandler.handleErrorCollector(
 					incrementalUnit, collector, scope.getProjectRoot(), scope.getPrevDiagnosticsByFile());
-			result = mergeGroovyVersionSyntaxDiagnostics(scope, incrementalUnit, result);
+			result = syntaxGuard.mergeGroovyVersionSyntaxDiagnostics(scope, incrementalUnit, result);
 			scope.setPrevDiagnosticsByFile(result.getDiagnosticsByFile());
-			LanguageClient client = languageClient;
+			LanguageClient client = languageClient.get();
 			if (client != null) {
 				publishDiagnosticsBatch(client, result.getDiagnosticsToPublish());
 			}
@@ -776,7 +776,7 @@ public class CompilationService {
 	 */
 	public String injectCompletionPlaceholder(ProjectScope scope, URI uri, Position position) {
 		String originalSource = compilationOrchestrator.injectCompletionPlaceholder(
-				scope.getAstVisitor(), fileContentsTracker, uri, position);
+				fileContentsTracker, uri, position);
 		if (originalSource != null) {
 			compileAndVisitAST(scope, uri);
 		}
@@ -819,7 +819,8 @@ public class CompilationService {
 		// restoreDocumentSource() above already calls forceChanged(uri),
 		// so the next ensureCompiledForContext / compileAndVisitAST
 		// invocation will detect the dirty flag and recompile then.
-		logger.debug("Deferred recompile after restoring document source for {}", uri);
+		logger.debug("Deferred recompile after restoring document source for {} in scope {}",
+				uri, scope != null ? scope.getProjectRoot() : null);
 	}
 
 	/**
@@ -835,25 +836,29 @@ public class CompilationService {
 			CompilerConfiguration config = new CompilerConfiguration();
 			GroovyLSCompilationUnit unit = new GroovyLSCompilationUnit(config);
 			unit.addSource(uri.toString(), source);
-			try {
-				unit.compile(Phases.CONVERSION);
-			} catch (CompilationFailedException e) {
-				// Expected for code with syntax errors
-			} catch (Exception e) {
-				logger.debug("Syntax check failed for {}: {}", uri, e.getMessage());
-			}
+			compileSyntaxUnit(uri, unit);
 
 			ErrorCollector collector = unit.getErrorCollector();
 			if (collector != null) {
 				DiagnosticHandler.DiagnosticResult result = diagnosticHandler.handleErrorCollector(
 						unit, collector, null, null);
-				LanguageClient client = languageClient;
+				LanguageClient client = languageClient.get();
 				if (client != null) {
 					publishDiagnosticsBatch(client, result.getDiagnosticsToPublish());
 				}
 			}
 		} catch (Exception e) {
 			logger.debug("Syntax-only check failed for {}: {}", uri, e.getMessage());
+		}
+	}
+
+	private void compileSyntaxUnit(URI uri, GroovyLSCompilationUnit unit) {
+		try {
+			unit.compile(Phases.CONVERSION);
+		} catch (CompilationFailedException e) {
+			// Expected for code with syntax errors.
+		} catch (Exception e) {
+			logger.debug("Syntax check failed for {}: {}", uri, e.getMessage());
 		}
 	}
 
@@ -865,201 +870,6 @@ public class CompilationService {
 				.sorted(Comparator.comparing(PublishDiagnosticsParams::getUri, Comparator.nullsFirst(String::compareTo)))
 				.map(this::normalizeDiagnosticsForPublishedDocument)
 				.forEach(client::publishDiagnostics);
-	}
-
-	private DiagnosticHandler.DiagnosticResult mergeGroovyVersionSyntaxDiagnostics(
-			ProjectScope scope,
-			GroovyLSCompilationUnit compilationUnit,
-			DiagnosticHandler.DiagnosticResult baseResult) {
-		if (scope == null || baseResult == null) {
-			return baseResult;
-		}
-
-		String detectedVersion = scope.getDetectedGroovyVersion();
-		Integer projectMajor = GroovyVersionDetector.major(detectedVersion).orElse(null);
-		if (projectMajor == null || projectMajor >= 5) {
-			if (logger.isDebugEnabled()) {
-				logger.debug(
-						"Groovy 5 syntax guard inactive for scope {} (detectedVersion={}, major={})",
-						scope.getProjectRoot(),
-						detectedVersion,
-						projectMajor);
-			}
-			return baseResult;
-		}
-		if (logger.isDebugEnabled()) {
-			logger.debug(
-					"Groovy 5 syntax guard active for scope {} (detectedVersion={}, major={}, guardedFeatures={})",
-					scope.getProjectRoot(),
-					detectedVersion,
-					projectMajor,
-					GROOVY5_SYNTAX_FEATURES.size());
-		}
-
-		Map<URI, List<Diagnostic>> mergedDiagnosticsByFile = new HashMap<>();
-		if (baseResult.getDiagnosticsByFile() != null) {
-			for (Map.Entry<URI, List<Diagnostic>> entry : baseResult.getDiagnosticsByFile().entrySet()) {
-				mergedDiagnosticsByFile.put(entry.getKey(), new java.util.ArrayList<>(entry.getValue()));
-			}
-		}
-
-		Map<URI, List<Diagnostic>> versionDiagnostics = collectGroovy5SyntaxDiagnostics(
-				compilationUnit, projectMajor, detectedVersion);
-		for (Map.Entry<URI, List<Diagnostic>> entry : versionDiagnostics.entrySet()) {
-			mergedDiagnosticsByFile
-					.computeIfAbsent(entry.getKey(), key -> new java.util.ArrayList<>())
-					.addAll(entry.getValue());
-		}
-
-		deduplicateDiagnostics(mergedDiagnosticsByFile);
-
-		Set<PublishDiagnosticsParams> diagnosticsToPublish = new HashSet<>();
-		for (Map.Entry<URI, List<Diagnostic>> entry : mergedDiagnosticsByFile.entrySet()) {
-			diagnosticsToPublish.add(new PublishDiagnosticsParams(entry.getKey().toString(), entry.getValue()));
-		}
-
-		Map<URI, List<Diagnostic>> previousDiagnosticsByFile = scope.getPrevDiagnosticsByFile();
-		if (previousDiagnosticsByFile != null) {
-			for (URI uri : previousDiagnosticsByFile.keySet()) {
-				if (!mergedDiagnosticsByFile.containsKey(uri)) {
-					diagnosticsToPublish.add(new PublishDiagnosticsParams(uri.toString(), new java.util.ArrayList<>()));
-				}
-			}
-		}
-
-		return new DiagnosticHandler.DiagnosticResult(diagnosticsToPublish, mergedDiagnosticsByFile);
-	}
-
-	private Map<URI, List<Diagnostic>> collectGroovy5SyntaxDiagnostics(
-			GroovyLSCompilationUnit compilationUnit,
-			int projectMajor,
-			String projectVersion) {
-		Map<URI, List<Diagnostic>> diagnosticsByFile = new HashMap<>();
-		if (compilationUnit == null || compilationUnit.getAST() == null || compilationUnit.getAST().getModules() == null) {
-			return diagnosticsByFile;
-		}
-
-		for (org.codehaus.groovy.ast.ModuleNode module : compilationUnit.getAST().getModules()) {
-			if (module == null || module.getContext() == null) {
-				continue;
-			}
-			org.codehaus.groovy.control.SourceUnit sourceUnit = module.getContext();
-			URI uri = GroovyLanguageServerUtils.sourceLocatorToUri(sourceUnit.getName());
-			if (uri == null) {
-				continue;
-			}
-
-			String source = fileContentsTracker.getContents(uri);
-			if (source == null && "file".equalsIgnoreCase(uri.getScheme())) {
-				try {
-					source = Files.readString(Paths.get(uri));
-				} catch (Exception ignored) {
-					source = null;
-				}
-			}
-			if (source == null || source.isEmpty()) {
-				continue;
-			}
-
-			List<Diagnostic> fileDiagnostics = new java.util.ArrayList<>();
-			for (GuardedSyntaxFeature feature : GROOVY5_SYNTAX_FEATURES) {
-				fileDiagnostics.addAll(createFeatureDiagnostics(
-						source,
-						feature.pattern,
-						feature.featureName,
-						projectMajor,
-						projectVersion));
-			}
-
-			if (!fileDiagnostics.isEmpty()) {
-				diagnosticsByFile.put(uri, fileDiagnostics);
-			}
-		}
-
-		return diagnosticsByFile;
-	}
-
-	private List<Diagnostic> createFeatureDiagnostics(
-			String source,
-			Pattern featurePattern,
-			String featureName,
-			int projectMajor,
-			String projectVersion) {
-		List<Diagnostic> diagnostics = new java.util.ArrayList<>();
-		Matcher matcher = featurePattern.matcher(source);
-		int[] lineStartOffsets = computeLineStartOffsets(source);
-		while (matcher.find()) {
-			int startOffset = matcher.start();
-			int endOffset = matcher.end();
-			Range range = new Range(
-					offsetToPosition(startOffset, source, lineStartOffsets),
-					offsetToPosition(endOffset, source, lineStartOffsets));
-
-			Diagnostic diagnostic = new Diagnostic();
-			diagnostic.setRange(range);
-			diagnostic.setSeverity(org.eclipse.lsp4j.DiagnosticSeverity.Error);
-			diagnostic.setSource(VERSION_GUARD_DIAGNOSTIC_SOURCE);
-			diagnostic.setMessage(String.format(
-					"%s require Groovy 5+, but this project resolves Groovy %s (major %d).",
-					featureName,
-					projectVersion != null ? projectVersion : Integer.toString(projectMajor),
-					projectMajor));
-			diagnostics.add(diagnostic);
-		}
-		return diagnostics;
-	}
-
-	private int[] computeLineStartOffsets(String source) {
-		java.util.ArrayList<Integer> starts = new java.util.ArrayList<>();
-		starts.add(0);
-		for (int i = 0; i < source.length(); i++) {
-			if (source.charAt(i) == '\n') {
-				starts.add(i + 1);
-			}
-		}
-		int[] result = new int[starts.size()];
-		for (int i = 0; i < starts.size(); i++) {
-			result[i] = starts.get(i);
-		}
-		return result;
-	}
-
-	private Position offsetToPosition(int offset, String source, int[] lineStartOffsets) {
-		int safeOffset = Math.max(0, Math.min(offset, source.length()));
-		int idx = java.util.Arrays.binarySearch(lineStartOffsets, safeOffset);
-		if (idx < 0) {
-			idx = -idx - 2;
-		}
-		if (idx < 0) {
-			idx = 0;
-		}
-		int lineStart = lineStartOffsets[idx];
-		int character = Math.max(0, safeOffset - lineStart);
-		return new Position(idx, character);
-	}
-
-	private void deduplicateDiagnostics(Map<URI, List<Diagnostic>> diagnosticsByFile) {
-		for (Map.Entry<URI, List<Diagnostic>> entry : diagnosticsByFile.entrySet()) {
-			List<Diagnostic> unique = new java.util.ArrayList<>();
-			Set<String> seen = new HashSet<>();
-			for (Diagnostic diagnostic : entry.getValue()) {
-				String key = diagnostic.getRange() + "|" + diagnostic.getMessage() + "|" + diagnostic.getSeverity();
-				if (seen.add(key)) {
-					unique.add(diagnostic);
-				}
-			}
-			entry.setValue(unique);
-		}
-	}
-
-	private static final class GuardedSyntaxFeature {
-		private final Pattern pattern;
-		private final String featureName;
-
-		private GuardedSyntaxFeature(Pattern pattern, String featureName) {
-			this.pattern = pattern;
-			this.featureName = featureName;
-		}
 	}
 
 	private PublishDiagnosticsParams normalizeDiagnosticsForPublishedDocument(PublishDiagnosticsParams params) {
@@ -1186,16 +996,10 @@ public class CompilationService {
 	 * </ol>
 	 */
 	private void handleCompilationOOM(ProjectScope scope, VirtualMachineError e, String context) {
+		String errorMessage = e.toString();
 		logger.error("{}: {} for scope {} — marking as failed. "
 				+ "Consider increasing -Xmx via groovy.java.vmargs setting.",
-				context, e.toString(), scope.getProjectRoot());
-
-		// Attempt to reclaim memory (soft references, finalizable objects)
-		try {
-			System.gc();
-		} catch (Throwable ignored) {
-			// Best effort
-		}
+				context, errorMessage, scope.getProjectRoot());
 
 		scope.setCompilationFailed(true);
 		scope.setCompiled(true); // prevent retry loops
@@ -1204,7 +1008,7 @@ public class CompilationService {
 		publishOOMDiagnostic(scope, e);
 
 		// Show a prominent notification with actionable fix guidance
-		showOOMNotification(scope, e);
+		showOOMNotification(scope);
 
 		logMemoryStats();
 	}
@@ -1214,7 +1018,7 @@ public class CompilationService {
 	 * so the user sees actionable feedback instead of silent failure.
 	 */
 	private void publishOOMDiagnostic(ProjectScope scope, VirtualMachineError e) {
-		LanguageClient client = languageClient;
+		LanguageClient client = languageClient.get();
 		if (client == null || scope.getProjectRoot() == null) {
 			return;
 		}
@@ -1225,7 +1029,7 @@ public class CompilationService {
 			diag.setRange(new org.eclipse.lsp4j.Range(
 					new Position(0, 0), new Position(0, 0)));
 			diag.setSeverity(org.eclipse.lsp4j.DiagnosticSeverity.Error);
-			diag.setSource("groovy-language-server");
+			diag.setSource(VERSION_GUARD_DIAGNOSTIC_SOURCE);
 			Runtime rt = Runtime.getRuntime();
 			long usedMB = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024);
 			long maxMB = rt.maxMemory() / (1024 * 1024);
@@ -1236,10 +1040,10 @@ public class CompilationService {
 			PublishDiagnosticsParams params = new PublishDiagnosticsParams(
 					buildFileURI.toString(), List.of(diag));
 			client.publishDiagnostics(params);
-		} catch (Throwable t) {
+		} catch (Exception ex) {
 			// If we're so low on memory we can't even publish diagnostics,
 			// just log and move on.
-			logger.debug("Failed to publish OOM diagnostic: {}", t.getMessage());
+			logger.debug("Failed to publish OOM diagnostic: {}", ex.getMessage());
 		}
 	}
 
@@ -1259,8 +1063,8 @@ public class CompilationService {
 	 * guidance on how to fix OOM errors. This is more prominent than the
 	 * synthetic diagnostic and provides an actionable fix.
 	 */
-	private void showOOMNotification(ProjectScope scope, VirtualMachineError e) {
-		LanguageClient client = languageClient;
+	private void showOOMNotification(ProjectScope scope) {
+		LanguageClient client = languageClient.get();
 		if (client == null) {
 			return;
 		}
@@ -1277,8 +1081,8 @@ public class CompilationService {
 					+ "\"groovy.java.vmargs\": \"-Xmx%dm\"",
 					projectName, usedMB, maxMB, suggestedMB);
 			client.showMessage(new MessageParams(MessageType.Error, message));
-		} catch (Throwable t) {
-			logger.debug("Failed to show OOM notification: {}", t.getMessage());
+		} catch (Exception ex) {
+			logger.debug("Failed to show OOM notification: {}", ex.getMessage());
 		}
 	}
 }

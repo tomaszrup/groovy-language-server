@@ -2,12 +2,12 @@ package com.tomaszrup.groovyls.providers;
 
 import java.net.URI;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.HashMap;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.regex.Matcher;
@@ -36,369 +36,364 @@ import com.tomaszrup.groovyls.util.FileContentsTracker;
 import com.tomaszrup.groovyls.util.JavaSourceLocator;
 
 public class CodeActionProvider {
-	private static final Pattern PATTERN_UNABLE_TO_RESOLVE_CLASS = Pattern
-			.compile("unable to resolve class (\\w+)");
-	private static final String UNUSED_IMPORT_MESSAGE = "Unused import";
-	private static final int IMPORT_PRIORITY_LOCATOR_PROJECT = 0;
-	private static final int IMPORT_PRIORITY_AST = 1;
-	private static final int IMPORT_PRIORITY_LOCATOR_OTHER = 2;
-	private static final int IMPORT_PRIORITY_CLASSPATH = 3;
+    private static final Pattern PATTERN_UNABLE_TO_RESOLVE_CLASS = Pattern
+            .compile("unable to resolve class (\\w+)");
+    private static final String UNUSED_IMPORT_MESSAGE = "Unused import";
+    private static final String PACKAGE_PREFIX = "package ";
+    private static final int IMPORT_PRIORITY_LOCATOR_PROJECT = 0;
+    private static final int IMPORT_PRIORITY_AST = 1;
+    private static final int IMPORT_PRIORITY_LOCATOR_OTHER = 2;
+    private static final int IMPORT_PRIORITY_CLASSPATH = 3;
 
-	private ASTNodeVisitor ast;
-	private ClasspathSymbolIndex classpathSymbolIndex;
-	/**
-	 * When non-null, the scan result is a shared superset and should be
-	 * filtered to only include classes from these classpath files.
-	 */
-	private java.util.Set<String> classpathSymbolClasspathElements;
-	private FileContentsTracker fileContentsTracker;
-	private JavaSourceLocator javaSourceLocator;
+    private ASTNodeVisitor ast;
+    private ClasspathSymbolIndex classpathSymbolIndex;
+    private Set<String> classpathSymbolClasspathElements;
+    private FileContentsTracker fileContentsTracker;
+    private JavaSourceLocator javaSourceLocator;
 
-	public CodeActionProvider(ASTNodeVisitor ast, ClasspathSymbolIndex classpathSymbolIndex,
-			FileContentsTracker fileContentsTracker) {
-		this(ast, classpathSymbolIndex, null, fileContentsTracker, null);
-	}
+    public CodeActionProvider(ASTNodeVisitor ast, ClasspathSymbolIndex classpathSymbolIndex,
+            FileContentsTracker fileContentsTracker) {
+        this(ast, classpathSymbolIndex, null, fileContentsTracker, null);
+    }
 
-	public CodeActionProvider(ASTNodeVisitor ast, ClasspathSymbolIndex classpathSymbolIndex,
-			java.util.Set<String> classpathSymbolClasspathElements,
-			FileContentsTracker fileContentsTracker) {
-		this(ast, classpathSymbolIndex, classpathSymbolClasspathElements, fileContentsTracker, null);
-	}
+    public CodeActionProvider(ASTNodeVisitor ast, ClasspathSymbolIndex classpathSymbolIndex,
+            Set<String> classpathSymbolClasspathElements,
+            FileContentsTracker fileContentsTracker) {
+        this(ast, classpathSymbolIndex, classpathSymbolClasspathElements, fileContentsTracker, null);
+    }
 
-	public CodeActionProvider(ASTNodeVisitor ast, ClasspathSymbolIndex classpathSymbolIndex,
-			java.util.Set<String> classpathSymbolClasspathElements,
-			FileContentsTracker fileContentsTracker,
-			JavaSourceLocator javaSourceLocator) {
-		this.ast = ast;
-		this.classpathSymbolIndex = classpathSymbolIndex;
-		this.classpathSymbolClasspathElements = classpathSymbolClasspathElements;
-		this.fileContentsTracker = fileContentsTracker;
-		this.javaSourceLocator = javaSourceLocator;
-	}
+    public CodeActionProvider(ASTNodeVisitor ast, ClasspathSymbolIndex classpathSymbolIndex,
+            Set<String> classpathSymbolClasspathElements,
+            FileContentsTracker fileContentsTracker,
+            JavaSourceLocator javaSourceLocator) {
+        this.ast = ast;
+        this.classpathSymbolIndex = classpathSymbolIndex;
+        this.classpathSymbolClasspathElements = classpathSymbolClasspathElements;
+        this.fileContentsTracker = fileContentsTracker;
+        this.javaSourceLocator = javaSourceLocator;
+    }
 
-	/**
-	 * Returns classes from the scan result, filtered by the scope's
-	 * classpath files if this is a shared superset scan.
-	 */
-	private List<ClasspathSymbolIndex.Symbol> getFilteredClasses() {
-		if (classpathSymbolIndex == null) {
-			return Collections.emptyList();
-		}
-		return classpathSymbolIndex.getSymbols(classpathSymbolClasspathElements);
-	}
+    private List<ClasspathSymbolIndex.Symbol> getFilteredClasses() {
+        if (classpathSymbolIndex == null) {
+            return Collections.emptyList();
+        }
+        return classpathSymbolIndex.getSymbols(classpathSymbolClasspathElements);
+    }
 
-	public CompletableFuture<List<Either<Command, CodeAction>>> provideCodeActions(CodeActionParams params) {
-		URI uri = URI.create(params.getTextDocument().getUri());
-		List<Either<Command, CodeAction>> codeActions = new ArrayList<>();
+    public CompletableFuture<List<Either<Command, CodeAction>>> provideCodeActions(CodeActionParams params) {
+        URI uri = URI.create(params.getTextDocument().getUri());
+        List<Either<Command, CodeAction>> codeActions = new ArrayList<>();
 
-		// Diagnostic-based quick fixes
-		if (params.getContext() != null && params.getContext().getDiagnostics() != null) {
-			List<Diagnostic> unusedImportDiagnostics = new ArrayList<>();
+        addDiagnosticBasedActions(params, uri, codeActions);
+        addGeneratedAndRefactorActions(params, codeActions);
 
-			for (Diagnostic diagnostic : params.getContext().getDiagnostics()) {
-				String message = diagnostic.getMessage();
-				if (message == null) {
-					continue;
-				}
+        return CompletableFuture.completedFuture(codeActions);
+    }
 
-				// Add Import quick fix
-				Matcher matcher = PATTERN_UNABLE_TO_RESOLVE_CLASS.matcher(message);
-				if (matcher.find()) {
-					String unresolvedClassName = matcher.group(1);
-					List<CodeAction> importActions = createImportActions(uri, unresolvedClassName, diagnostic);
-					for (CodeAction action : importActions) {
-						codeActions.add(Either.forRight(action));
-					}
-				}
+    private void addDiagnosticBasedActions(CodeActionParams params, URI uri,
+            List<Either<Command, CodeAction>> codeActions) {
+        if (params.getContext() == null || params.getContext().getDiagnostics() == null) {
+            return;
+        }
 
-				// Remove Unused Import quick fix
-				if (UNUSED_IMPORT_MESSAGE.equals(message)) {
-					unusedImportDiagnostics.add(diagnostic);
-					CodeAction removeOne = createRemoveUnusedImportAction(uri, diagnostic);
-					if (removeOne != null) {
-						codeActions.add(Either.forRight(removeOne));
-					}
-				}
-			}
+        List<Diagnostic> unusedImportDiagnostics = new ArrayList<>();
+        for (Diagnostic diagnostic : params.getContext().getDiagnostics()) {
+            processDiagnostic(uri, codeActions, unusedImportDiagnostics, diagnostic);
+        }
 
-			// "Remove all unused imports" when there are multiple
-			if (unusedImportDiagnostics.size() > 1) {
-				CodeAction removeAll = createRemoveAllUnusedImportsAction(uri, unusedImportDiagnostics);
-				if (removeAll != null) {
-					codeActions.add(Either.forRight(removeAll));
-				}
-			}
-		}
+        if (unusedImportDiagnostics.size() > 1) {
+            CodeAction removeAll = createRemoveAllUnusedImportsAction(uri, unusedImportDiagnostics);
+            if (removeAll != null) {
+                codeActions.add(Either.forRight(removeAll));
+            }
+        }
+    }
 
-		// Organize / Remove Unused Imports
-		OrganizeImportsAction organizeImportsAction = new OrganizeImportsAction(ast);
-		for (CodeAction action : organizeImportsAction.provideCodeActions(params)) {
-			codeActions.add(Either.forRight(action));
-		}
+    private void processDiagnostic(URI uri, List<Either<Command, CodeAction>> codeActions,
+            List<Diagnostic> unusedImportDiagnostics, Diagnostic diagnostic) {
+        String message = diagnostic.getMessage();
+        if (message == null) {
+            return;
+        }
 
-		// Implement Interface Methods
-		ImplementInterfaceMethodsAction implementMethodsAction = new ImplementInterfaceMethodsAction(ast);
-		for (CodeAction action : implementMethodsAction.provideCodeActions(params)) {
-			codeActions.add(Either.forRight(action));
-		}
+        addMissingImportActions(uri, codeActions, diagnostic, message);
+        if (UNUSED_IMPORT_MESSAGE.equals(message)) {
+            unusedImportDiagnostics.add(diagnostic);
+            CodeAction removeOne = createRemoveUnusedImportAction(uri, diagnostic);
+            if (removeOne != null) {
+                codeActions.add(Either.forRight(removeOne));
+            }
+        }
+    }
 
-		// Generate Constructor
-		GenerateConstructorAction generateConstructorAction = new GenerateConstructorAction(ast);
-		for (CodeAction action : generateConstructorAction.provideCodeActions(params)) {
-			codeActions.add(Either.forRight(action));
-		}
+    private void addMissingImportActions(URI uri, List<Either<Command, CodeAction>> codeActions,
+            Diagnostic diagnostic, String message) {
+        Matcher matcher = PATTERN_UNABLE_TO_RESOLVE_CLASS.matcher(message);
+        if (!matcher.find()) {
+            return;
+        }
 
-		// Generate Getter/Setter
-		GenerateGetterSetterAction generateGetterSetterAction = new GenerateGetterSetterAction(ast);
-		for (CodeAction action : generateGetterSetterAction.provideCodeActions(params)) {
-			codeActions.add(Either.forRight(action));
-		}
+        String unresolvedClassName = matcher.group(1);
+        for (CodeAction action : createImportActions(uri, unresolvedClassName, diagnostic)) {
+            codeActions.add(Either.forRight(action));
+        }
+    }
 
-		// Generate toString(), equals(), hashCode()
-		GenerateMethodsAction generateMethodsAction = new GenerateMethodsAction(ast);
-		for (CodeAction action : generateMethodsAction.provideCodeActions(params)) {
-			codeActions.add(Either.forRight(action));
-		}
+    private void addGeneratedAndRefactorActions(CodeActionParams params,
+            List<Either<Command, CodeAction>> codeActions) {
+        addActions(codeActions, new OrganizeImportsAction(ast).provideCodeActions(params));
+        addActions(codeActions, new ImplementInterfaceMethodsAction(ast).provideCodeActions(params));
+        addActions(codeActions, new GenerateConstructorAction(ast).provideCodeActions(params));
+        addActions(codeActions, new GenerateGetterSetterAction(ast).provideCodeActions(params));
+        addActions(codeActions, new GenerateMethodsAction(ast).provideCodeActions(params));
+        addActions(codeActions, new AddOverrideAction(ast, fileContentsTracker).provideCodeActions(params));
+    }
 
-		// Add @Override
-		AddOverrideAction addOverrideAction = new AddOverrideAction(ast, fileContentsTracker);
-		for (CodeAction action : addOverrideAction.provideCodeActions(params)) {
-			codeActions.add(Either.forRight(action));
-		}
+    private void addActions(List<Either<Command, CodeAction>> codeActions, List<CodeAction> actions) {
+        for (CodeAction action : actions) {
+            codeActions.add(Either.forRight(action));
+        }
+    }
 
-		return CompletableFuture.completedFuture(codeActions);
-	}
+    private List<CodeAction> createImportActions(URI uri, String unresolvedClassName, Diagnostic diagnostic) {
+        List<CodeAction> actions = new ArrayList<>();
+        Set<String> seenFqcns = new LinkedHashSet<>();
+        Map<String, Integer> candidatePriorities = new HashMap<>();
+        String currentPackage = extractCurrentPackage(uri);
 
-	private List<CodeAction> createImportActions(URI uri, String unresolvedClassName, Diagnostic diagnostic) {
-		List<CodeAction> actions = new ArrayList<>();
-		Set<String> seenFqcns = new LinkedHashSet<>();
-		Map<String, Integer> candidatePriorities = new HashMap<>();
-		String currentPackage = extractCurrentPackage(uri);
+        addLocatorCandidates(unresolvedClassName, currentPackage, seenFqcns, candidatePriorities);
+        addClasspathCandidates(unresolvedClassName, currentPackage, seenFqcns, candidatePriorities);
+        addAstCandidates(unresolvedClassName, currentPackage, seenFqcns, candidatePriorities);
 
-		// Prefer live source-locator results first; these reflect source moves
-		// even when classpath indexes are stale.
-		if (javaSourceLocator != null) {
-			for (String fullyQualifiedName : javaSourceLocator.findClassNamesBySimpleName(unresolvedClassName)) {
-				if (!shouldOfferImport(fullyQualifiedName, currentPackage) || !seenFqcns.add(fullyQualifiedName)) {
-					continue;
-				}
-				int priority = javaSourceLocator.hasProjectSource(fullyQualifiedName)
-						? IMPORT_PRIORITY_LOCATOR_PROJECT
-						: IMPORT_PRIORITY_LOCATOR_OTHER;
-				candidatePriorities.put(fullyQualifiedName, priority);
-			}
-		}
+        candidatePriorities.entrySet().stream()
+                .sorted(Comparator
+                        .comparingInt(Map.Entry<String, Integer>::getValue)
+                        .thenComparing(Map.Entry::getKey))
+                .forEach(entry -> {
+                    CodeAction action = createAddImportAction(uri, entry.getKey(), diagnostic);
+                    if (action != null) {
+                        actions.add(action);
+                    }
+                });
 
-		// Search in classpath via ClassGraph
-		if (classpathSymbolIndex != null) {
-			List<ClasspathSymbolIndex.Symbol> allClasses = getFilteredClasses();
-			for (ClasspathSymbolIndex.Symbol classSymbol : allClasses) {
-				if (classSymbol.getSimpleName().equals(unresolvedClassName)) {
-					String fullyQualifiedName = classSymbol.getName();
-					if (!shouldOfferImport(fullyQualifiedName, currentPackage)
-							|| !seenFqcns.add(fullyQualifiedName)) {
-						continue;
-					}
-					candidatePriorities.put(fullyQualifiedName, IMPORT_PRIORITY_CLASSPATH);
-				}
-			}
-		}
+        return actions;
+    }
 
-		// Also search in AST (project's own classes)
-		if (ast != null) {
-			ast.getClassNodes().stream()
-					.filter(classNode -> classNode.getNameWithoutPackage().equals(unresolvedClassName))
-					.filter(classNode -> classNode.getPackageName() != null
-							&& classNode.getPackageName().length() > 0)
-					.forEach(classNode -> {
-						String fullyQualifiedName = classNode.getName();
-						if (shouldOfferImport(fullyQualifiedName, currentPackage)
-								&& seenFqcns.add(fullyQualifiedName)) {
-							candidatePriorities.put(fullyQualifiedName, IMPORT_PRIORITY_AST);
-						}
-					});
-		}
+    private void addLocatorCandidates(String unresolvedClassName, String currentPackage, Set<String> seenFqcns,
+            Map<String, Integer> candidatePriorities) {
+        if (javaSourceLocator == null) {
+            return;
+        }
 
-		candidatePriorities.entrySet().stream()
-				.sorted(Comparator
-						.comparingInt((Map.Entry<String, Integer> e) -> e.getValue())
-						.thenComparing(Map.Entry::getKey))
-				.forEach(entry -> {
-					CodeAction action = createAddImportAction(uri, entry.getKey(), diagnostic);
-					if (action != null) {
-						actions.add(action);
-					}
-				});
+        for (String fullyQualifiedName : javaSourceLocator.findClassNamesBySimpleName(unresolvedClassName)) {
+            if (!shouldAddImportCandidate(fullyQualifiedName, currentPackage, seenFqcns)) {
+                continue;
+            }
+            int priority = javaSourceLocator.hasProjectSource(fullyQualifiedName)
+                    ? IMPORT_PRIORITY_LOCATOR_PROJECT
+                    : IMPORT_PRIORITY_LOCATOR_OTHER;
+            candidatePriorities.put(fullyQualifiedName, priority);
+        }
+    }
 
-		return actions;
-	}
+    private void addClasspathCandidates(String unresolvedClassName, String currentPackage, Set<String> seenFqcns,
+            Map<String, Integer> candidatePriorities) {
+        if (classpathSymbolIndex == null) {
+            return;
+        }
 
-	private boolean shouldOfferImport(String fullyQualifiedName, String currentPackage) {
-		if (fullyQualifiedName == null || fullyQualifiedName.isEmpty()) {
-			return false;
-		}
-		if (currentPackage == null || currentPackage.isEmpty()) {
-			return true;
-		}
-		int lastDot = fullyQualifiedName.lastIndexOf('.');
-		if (lastDot < 0) {
-			return true;
-		}
-		String candidatePackage = fullyQualifiedName.substring(0, lastDot);
-		return !currentPackage.equals(candidatePackage);
-	}
+        for (ClasspathSymbolIndex.Symbol classSymbol : getFilteredClasses()) {
+            if (classSymbol.getSimpleName().equals(unresolvedClassName)) {
+                String fullyQualifiedName = classSymbol.getName();
+                if (shouldAddImportCandidate(fullyQualifiedName, currentPackage, seenFqcns)) {
+                    candidatePriorities.put(fullyQualifiedName, IMPORT_PRIORITY_CLASSPATH);
+                }
+            }
+        }
+    }
 
-	private String extractCurrentPackage(URI uri) {
-		if (fileContentsTracker == null || uri == null) {
-			return null;
-		}
-		String content = fileContentsTracker.getContents(uri);
-		if (content == null || content.isEmpty()) {
-			return null;
-		}
-		for (String rawLine : content.split("\\R", -1)) {
-			String line = rawLine.trim();
-			if (line.isEmpty() || line.startsWith("//") || line.startsWith("/*") || line.startsWith("*")) {
-				continue;
-			}
-			if (line.startsWith("package ")) {
-				String pkg = line.substring("package ".length()).trim();
-				if (pkg.endsWith(";")) {
-					pkg = pkg.substring(0, pkg.length() - 1).trim();
-				}
-				return pkg;
-			}
-			break;
-		}
-		return null;
-	}
+    private void addAstCandidates(String unresolvedClassName, String currentPackage, Set<String> seenFqcns,
+            Map<String, Integer> candidatePriorities) {
+        if (ast == null) {
+            return;
+        }
 
-	private CodeAction createAddImportAction(URI uri, String fullyQualifiedName, Diagnostic diagnostic) {
-		String importStatement = "import " + fullyQualifiedName + "\n";
-		int insertLine = findImportInsertionLine(uri);
+        ast.getClassNodes().stream()
+                .filter(classNode -> classNode.getNameWithoutPackage().equals(unresolvedClassName))
+                .filter(classNode -> classNode.getPackageName() != null && !classNode.getPackageName().isEmpty())
+                .forEach(classNode -> {
+                    String fullyQualifiedName = classNode.getName();
+                    if (shouldAddImportCandidate(fullyQualifiedName, currentPackage, seenFqcns)) {
+                        candidatePriorities.put(fullyQualifiedName, IMPORT_PRIORITY_AST);
+                    }
+                });
+    }
 
-		TextEdit textEdit = new TextEdit(
-				new Range(new Position(insertLine, 0), new Position(insertLine, 0)),
-				importStatement);
+    private boolean shouldAddImportCandidate(String fullyQualifiedName, String currentPackage,
+            Set<String> seenFqcns) {
+        return shouldOfferImport(fullyQualifiedName, currentPackage) && seenFqcns.add(fullyQualifiedName);
+    }
 
-		WorkspaceEdit workspaceEdit = new WorkspaceEdit();
-		workspaceEdit.setChanges(Collections.singletonMap(uri.toString(), Collections.singletonList(textEdit)));
+    private boolean shouldOfferImport(String fullyQualifiedName, String currentPackage) {
+        if (fullyQualifiedName == null || fullyQualifiedName.isEmpty()) {
+            return false;
+        }
+        if (currentPackage == null || currentPackage.isEmpty()) {
+            return true;
+        }
 
-		CodeAction codeAction = new CodeAction("Add import: " + fullyQualifiedName);
-		codeAction.setKind(CodeActionKind.QuickFix);
-		codeAction.setEdit(workspaceEdit);
-		codeAction.setDiagnostics(Collections.singletonList(diagnostic));
+        int lastDot = fullyQualifiedName.lastIndexOf('.');
+        if (lastDot < 0) {
+            return true;
+        }
 
-		return codeAction;
-	}
+        String candidatePackage = fullyQualifiedName.substring(0, lastDot);
+        return !currentPackage.equals(candidatePackage);
+    }
 
-	/**
-	 * Creates a QuickFix to remove a single unused import line.
-	 */
-	private CodeAction createRemoveUnusedImportAction(URI uri, Diagnostic diagnostic) {
-		Range range = diagnostic.getRange();
-		if (range == null) {
-			return null;
-		}
+    private String extractCurrentPackage(URI uri) {
+        if (fileContentsTracker == null || uri == null) {
+            return null;
+        }
 
-		// Delete the entire import line (from start of line to start of next line)
-		TextEdit textEdit = new TextEdit(
-				new Range(new Position(range.getStart().getLine(), 0),
-						new Position(range.getEnd().getLine() + 1, 0)),
-				"");
+        String content = fileContentsTracker.getContents(uri);
+        if (content == null || content.isEmpty()) {
+            return null;
+        }
 
-		WorkspaceEdit workspaceEdit = new WorkspaceEdit();
-		workspaceEdit.setChanges(Collections.singletonMap(uri.toString(), Collections.singletonList(textEdit)));
+        for (String rawLine : content.split("\\R", -1)) {
+            String line = rawLine.trim();
+            if (!isSkippableLeadingLine(line)) {
+                if (line.startsWith(PACKAGE_PREFIX)) {
+                    return sanitizePackageName(line.substring(PACKAGE_PREFIX.length()).trim());
+                }
+                return null;
+            }
+        }
 
-		CodeAction action = new CodeAction("Remove unused import");
-		action.setKind(CodeActionKind.QuickFix);
-		action.setEdit(workspaceEdit);
-		action.setDiagnostics(Collections.singletonList(diagnostic));
-		action.setIsPreferred(true);
-		return action;
-	}
+        return null;
+    }
 
-	/**
-	 * Creates a QuickFix to remove all unused imports at once.
-	 */
-	private CodeAction createRemoveAllUnusedImportsAction(URI uri, List<Diagnostic> diagnostics) {
-		List<int[]> ranges = new ArrayList<>();
-		for (Diagnostic diagnostic : diagnostics) {
-			Range range = diagnostic.getRange();
-			if (range == null) {
-				continue;
-			}
-			ranges.add(new int[] { range.getStart().getLine(), range.getEnd().getLine() + 1 });
-		}
+    private boolean isSkippableLeadingLine(String line) {
+        return line.isEmpty() || line.startsWith("//") || line.startsWith("/*") || line.startsWith("*");
+    }
 
-		if (ranges.isEmpty()) {
-			return null;
-		}
+    private String sanitizePackageName(String packageDeclaration) {
+        String pkg = packageDeclaration;
+        if (pkg.endsWith(";")) {
+            pkg = pkg.substring(0, pkg.length() - 1).trim();
+        }
+        return pkg;
+    }
 
-		// Sort by start line and merge overlapping/adjacent ranges
-		ranges.sort((a, b) -> Integer.compare(a[0], b[0]));
-		List<int[]> merged = new ArrayList<>();
-		merged.add(ranges.get(0));
-		for (int i = 1; i < ranges.size(); i++) {
-			int[] last = merged.get(merged.size() - 1);
-			int[] cur = ranges.get(i);
-			if (cur[0] <= last[1]) {
-				last[1] = Math.max(last[1], cur[1]);
-			} else {
-				merged.add(cur);
-			}
-		}
+    private CodeAction createAddImportAction(URI uri, String fullyQualifiedName, Diagnostic diagnostic) {
+        String importStatement = "import " + fullyQualifiedName + "\n";
+        int insertLine = findImportInsertionLine(uri);
 
-		List<TextEdit> edits = new ArrayList<>();
-		for (int[] r : merged) {
-			edits.add(new TextEdit(
-					new Range(new Position(r[0], 0), new Position(r[1], 0)),
-					""));
-		}
+        TextEdit textEdit = new TextEdit(
+                new Range(new Position(insertLine, 0), new Position(insertLine, 0)),
+                importStatement);
 
-		WorkspaceEdit workspaceEdit = new WorkspaceEdit();
-		workspaceEdit.setChanges(Collections.singletonMap(uri.toString(), edits));
+        WorkspaceEdit workspaceEdit = new WorkspaceEdit();
+        workspaceEdit.setChanges(Collections.singletonMap(uri.toString(), Collections.singletonList(textEdit)));
 
-		CodeAction action = new CodeAction("Remove all unused imports");
-		action.setKind(CodeActionKind.QuickFix);
-		action.setEdit(workspaceEdit);
-		action.setDiagnostics(diagnostics);
-		return action;
-	}
+        CodeAction codeAction = new CodeAction("Add import: " + fullyQualifiedName);
+        codeAction.setKind(CodeActionKind.QuickFix);
+        codeAction.setEdit(workspaceEdit);
+        codeAction.setDiagnostics(Collections.singletonList(diagnostic));
+        return codeAction;
+    }
 
-	/**
-	 * Finds the line where a new import statement should be inserted.
-	 * It inserts after existing import statements, or after the package statement,
-	 * or at the top of the file.
-	 */
-	private int findImportInsertionLine(URI uri) {
-		String contents = fileContentsTracker.getContents(uri);
-		if (contents == null) {
-			return 0;
-		}
+    private CodeAction createRemoveUnusedImportAction(URI uri, Diagnostic diagnostic) {
+        Range range = diagnostic.getRange();
+        if (range == null) {
+            return null;
+        }
 
-		String[] lines = contents.split("\n", -1);
-		int lastImportLine = -1;
-		int packageLine = -1;
+        TextEdit textEdit = new TextEdit(
+                new Range(new Position(range.getStart().getLine(), 0),
+                        new Position(range.getEnd().getLine() + 1, 0)),
+                "");
 
-		for (int i = 0; i < lines.length; i++) {
-			String trimmed = lines[i].trim();
-			if (trimmed.startsWith("import ")) {
-				lastImportLine = i;
-			} else if (trimmed.startsWith("package ")) {
-				packageLine = i;
-			}
-		}
+        WorkspaceEdit workspaceEdit = new WorkspaceEdit();
+        workspaceEdit.setChanges(Collections.singletonMap(uri.toString(), Collections.singletonList(textEdit)));
 
-		if (lastImportLine >= 0) {
-			// Insert after the last import
-			return lastImportLine + 1;
-		} else if (packageLine >= 0) {
-			// Insert after the package statement (with a blank line)
-			return packageLine + 1;
-		}
+        CodeAction action = new CodeAction("Remove unused import");
+        action.setKind(CodeActionKind.QuickFix);
+        action.setEdit(workspaceEdit);
+        action.setDiagnostics(Collections.singletonList(diagnostic));
+        action.setIsPreferred(true);
+        return action;
+    }
 
-		// Insert at the top of the file
-		return 0;
-	}
+    private CodeAction createRemoveAllUnusedImportsAction(URI uri, List<Diagnostic> diagnostics) {
+        List<int[]> ranges = new ArrayList<>();
+        for (Diagnostic diagnostic : diagnostics) {
+            Range range = diagnostic.getRange();
+            if (range != null) {
+                ranges.add(new int[] { range.getStart().getLine(), range.getEnd().getLine() + 1 });
+            }
+        }
+
+        if (ranges.isEmpty()) {
+            return null;
+        }
+
+        ranges.sort((a, b) -> Integer.compare(a[0], b[0]));
+        List<int[]> merged = new ArrayList<>();
+        merged.add(ranges.get(0));
+        for (int i = 1; i < ranges.size(); i++) {
+            int[] last = merged.get(merged.size() - 1);
+            int[] current = ranges.get(i);
+            if (current[0] <= last[1]) {
+                last[1] = Math.max(last[1], current[1]);
+            } else {
+                merged.add(current);
+            }
+        }
+
+        List<TextEdit> edits = new ArrayList<>();
+        for (int[] range : merged) {
+            edits.add(new TextEdit(
+                    new Range(new Position(range[0], 0), new Position(range[1], 0)),
+                    ""));
+        }
+
+        WorkspaceEdit workspaceEdit = new WorkspaceEdit();
+        workspaceEdit.setChanges(Collections.singletonMap(uri.toString(), edits));
+
+        CodeAction action = new CodeAction("Remove all unused imports");
+        action.setKind(CodeActionKind.QuickFix);
+        action.setEdit(workspaceEdit);
+        action.setDiagnostics(diagnostics);
+        return action;
+    }
+
+    private int findImportInsertionLine(URI uri) {
+        String contents = fileContentsTracker.getContents(uri);
+        if (contents == null) {
+            return 0;
+        }
+
+        String[] lines = contents.split("\n", -1);
+        int lastImportLine = -1;
+        int packageLine = -1;
+
+        for (int i = 0; i < lines.length; i++) {
+            String trimmed = lines[i].trim();
+            if (trimmed.startsWith("import ")) {
+                lastImportLine = i;
+            } else if (trimmed.startsWith(PACKAGE_PREFIX)) {
+                packageLine = i;
+            }
+        }
+
+        if (lastImportLine >= 0) {
+            return lastImportLine + 1;
+        }
+        if (packageLine >= 0) {
+            return packageLine + 1;
+        }
+        return 0;
+    }
 }

@@ -39,6 +39,7 @@ import com.tomaszrup.groovyls.config.CompilationUnitFactory;
  * Tests for {@link GroovyServices#didChangeWatchedFiles(DidChangeWatchedFilesParams)}
  * and the recompilation chain it triggers.
  */
+@SuppressWarnings("all")
 class GroovyServicesDidChangeWatchedFilesTests {
 	private static final String LANGUAGE_GROOVY = "groovy";
 	private static final String PATH_WORKSPACE = "./build/test_workspace/";

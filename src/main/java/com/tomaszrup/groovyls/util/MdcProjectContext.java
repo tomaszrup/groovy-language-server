@@ -23,6 +23,7 @@ import org.slf4j.MDC;
 
 import java.nio.file.Path;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Manages the SLF4J MDC (Mapped Diagnostic Context) key {@code "project"} so
@@ -59,7 +60,7 @@ public final class MdcProjectContext {
      * Workspace root path, set once during server initialization.
      * Used to compute relative project paths.
      */
-    private static volatile Path workspaceRoot;
+    private static final AtomicReference<Path> workspaceRoot = new AtomicReference<>();
 
     private MdcProjectContext() {
         // utility class
@@ -72,7 +73,7 @@ public final class MdcProjectContext {
      * @param root the workspace root path
      */
     public static void setWorkspaceRoot(Path root) {
-        workspaceRoot = root;
+        workspaceRoot.set(root);
     }
 
     /**
@@ -88,7 +89,7 @@ public final class MdcProjectContext {
             return;
         }
 
-        Path wsRoot = workspaceRoot;
+        Path wsRoot = workspaceRoot.get();
         if (wsRoot != null && projectRoot.startsWith(wsRoot)) {
             Path relative = wsRoot.relativize(projectRoot);
             String label = relative.toString().replace('\\', '/');

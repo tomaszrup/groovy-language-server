@@ -20,11 +20,15 @@ import java.util.List;
 
 import org.codehaus.groovy.ast.ASTNode;
 import org.codehaus.groovy.ast.ClassNode;
+import org.codehaus.groovy.ast.ConstructorNode;
 import org.codehaus.groovy.ast.FieldNode;
 import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.ModuleNode;
 import org.codehaus.groovy.ast.PropertyNode;
+import org.codehaus.groovy.ast.expr.ArgumentListExpression;
+import org.codehaus.groovy.ast.expr.ConstantExpression;
 import org.codehaus.groovy.ast.expr.ConstructorCallExpression;
+import org.codehaus.groovy.ast.expr.MethodCallExpression;
 import org.codehaus.groovy.ast.expr.VariableExpression;
 import org.codehaus.groovy.control.CompilerConfiguration;
 import org.codehaus.groovy.control.Phases;
@@ -90,7 +94,7 @@ class GroovyASTUtilsTests {
 		// Find a VariableExpression in the AST
 		List<ASTNode> nodes = ast.getNodes();
 		VariableExpression varExpr = nodes.stream()
-				.filter(n -> n instanceof VariableExpression)
+				.filter(VariableExpression.class::isInstance)
 				.map(n -> (VariableExpression) n)
 				.filter(v -> v.getName().equals("x"))
 				.findFirst().orElse(null);
@@ -188,7 +192,7 @@ class GroovyASTUtilsTests {
 				"}\n");
 		List<ASTNode> nodes = ast.getNodes();
 		ConstructorCallExpression ctorCall = nodes.stream()
-				.filter(n -> n instanceof ConstructorCallExpression)
+				.filter(ConstructorCallExpression.class::isInstance)
 				.map(n -> (ConstructorCallExpression) n)
 				.findFirst().orElse(null);
 		if (ctorCall != null) {
@@ -335,7 +339,7 @@ class GroovyASTUtilsTests {
 				"}\n");
 		List<ASTNode> nodes = ast.getNodes();
 		ConstructorCallExpression ctorCall = nodes.stream()
-				.filter(n -> n instanceof ConstructorCallExpression)
+				.filter(ConstructorCallExpression.class::isInstance)
 				.map(n -> (ConstructorCallExpression) n)
 				.findFirst().orElse(null);
 		if (ctorCall != null) {
@@ -345,6 +349,73 @@ class GroovyASTUtilsTests {
 					"Should find at least 2 constructor overloads, got: " + overloads.size());
 		}
 	}
+
+			@Test
+			void testGetMethodOverloadsFromMethodCallHandlesNoClassDefFoundError() {
+				ASTNodeVisitor ast = compileAndVisit("class X {}\n");
+				ClassNode throwingType = new ClassNode(Object.class) {
+					@Override
+					public List<MethodNode> getMethods(String name) {
+						throw new NoClassDefFoundError("com.example.Frame");
+					}
+				};
+
+				ConstantExpression objectExpression = new ConstantExpression("receiver");
+				objectExpression.setType(throwingType);
+				MethodCallExpression methodCall = new MethodCallExpression(
+						objectExpression,
+						"foo",
+						ArgumentListExpression.EMPTY_ARGUMENTS);
+
+				List<MethodNode> overloads = Assertions.assertDoesNotThrow(
+						() -> GroovyASTUtils.getMethodOverloadsFromCallExpression(methodCall, ast));
+				Assertions.assertNotNull(overloads);
+				Assertions.assertTrue(overloads.isEmpty());
+			}
+
+			@Test
+			void testGetMethodOverloadsFromConstructorCallHandlesNoClassDefFoundError() {
+				ASTNodeVisitor ast = compileAndVisit("class X {}\n");
+				ClassNode throwingType = new ClassNode(Object.class) {
+					@Override
+					public List<ConstructorNode> getDeclaredConstructors() {
+						throw new NoClassDefFoundError("com.example.Frame");
+					}
+				};
+
+				ConstructorCallExpression constructorCall = new ConstructorCallExpression(
+						throwingType,
+						ArgumentListExpression.EMPTY_ARGUMENTS);
+
+				List<MethodNode> overloads = Assertions.assertDoesNotThrow(
+						() -> GroovyASTUtils.getMethodOverloadsFromCallExpression(constructorCall, ast));
+				Assertions.assertNotNull(overloads);
+				Assertions.assertTrue(overloads.isEmpty());
+			}
+
+			@Test
+			void testGetMethodsForLeftSideOfPropertyExpressionHandlesNoClassDefFoundError() {
+				ASTNodeVisitor ast = compileAndVisit("class X {}\n");
+				ClassNode throwingType = new ClassNode(Object.class) {
+					@Override
+					public List<MethodNode> getMethods() {
+						throw new NoClassDefFoundError("com.example.Frame");
+					}
+
+					@Override
+					public ClassNode[] getInterfaces() {
+						throw new NoClassDefFoundError("com.example.Frame");
+					}
+				};
+
+				org.codehaus.groovy.ast.expr.ClassExpression classExpression =
+						new org.codehaus.groovy.ast.expr.ClassExpression(throwingType);
+
+				List<MethodNode> methods = Assertions.assertDoesNotThrow(
+						() -> GroovyASTUtils.getMethodsForLeftSideOfPropertyExpression(classExpression, ast));
+				Assertions.assertNotNull(methods);
+				Assertions.assertTrue(methods.isEmpty());
+			}
 
 	// ------------------------------------------------------------------
 	// findAddImportRange

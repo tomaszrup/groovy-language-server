@@ -19,36 +19,28 @@
 ////////////////////////////////////////////////////////////////////////////////
 package com.tomaszrup.groovyls.util;
 
-import java.io.BufferedReader;
 import java.io.IOException;
-import java.io.InputStreamReader;
 import java.lang.ref.SoftReference;
 import java.net.URI;
 import java.net.URL;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.jar.JarEntry;
-import java.util.jar.JarFile;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import org.eclipse.lsp4j.Location;
-import org.eclipse.lsp4j.Position;
-import org.eclipse.lsp4j.Range;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -66,6 +58,10 @@ import org.slf4j.LoggerFactory;
  */
 public class JavaSourceLocator {
     private static final Logger logger = LoggerFactory.getLogger(JavaSourceLocator.class);
+    private static final String JAVA_EXTENSION = ".java";
+    private static final String GROOVY_EXTENSION = ".groovy";
+    private static final String CLASS_EXTENSION = ".class";
+    private static final String DECOMPILED_SCHEME = "decompiled:";
 
     private static final List<String> JAVA_SOURCE_DIRS = Arrays.asList(
             "src/main/java",
@@ -74,36 +70,14 @@ public class JavaSourceLocator {
             "src/test/groovy"
     );
 
-    // Matches class/interface/enum/record declarations (not inside comments)
-    private static final Pattern CLASS_DECL_PATTERN = Pattern.compile(
-            "^[^/]*\\b(?:class|interface|enum|record)\\s+(\\w+)");
-
-    // Matches method declarations: optional modifiers, return type, method name, opening paren
-    // Captures: group(1)=method name
-    private static final Pattern METHOD_DECL_PATTERN = Pattern.compile(
-            "^\\s*(?:(?:public|protected|private|static|final|abstract|synchronized|native|default)\\s+)*"
-            + "(?:<[^>]+>\\s+)?"        // optional generic type params
-            + "(?:[\\w\\[\\]<>,?\\s]+)\\s+" // return type (words, arrays, generics)
-            + "(\\w+)\\s*\\(");          // method name + open paren
-
-    // Matches constructor declarations
-    private static final Pattern CONSTRUCTOR_DECL_PATTERN = Pattern.compile(
-            "^\\s*(?:(?:public|protected|private)\\s+)?(\\w+)\\s*\\(");
-
-    // Matches field declarations (Java: ends with ; or =  /  Groovy: may omit the semicolon)
-    private static final Pattern FIELD_DECL_PATTERN = Pattern.compile(
-            "^\\s*(?:(?:public|protected|private|static|final|volatile|transient)\\s+)*"
-            + "(?:[\\w\\[\\]<>,?]+)\\s+"  // type
-            + "(\\w+)\\s*[;=$]");          // field name followed by ; or = ($ matches EOL for Groovy)
-
     /** Maps fully-qualified class name → source file path (volatile for safe publication) */
-    private volatile Map<String, Path> classNameToSource = Collections.emptyMap();
+    private final Map<String, Path> classNameToSource = new ConcurrentHashMap<>();
 
     /**
      * Maps fully-qualified class name → source JAR path + entry name for classes
      * found inside {@code *-sources.jar} dependency archives.
      */
-    private volatile Map<String, SourceJarEntry> classNameToSourceJar = Collections.emptyMap();
+    private final Map<String, SourceJarEntry> classNameToSourceJar = new ConcurrentHashMap<>();
 
     /** All project roots being tracked (thread-safe for concurrent adds) */
     private final List<Path> projectRoots = new CopyOnWriteArrayList<>();
@@ -128,7 +102,6 @@ public class JavaSourceLocator {
      * pressure (the content can be re-decompiled on demand).
      * Uses a bounded LRU eviction policy to prevent unbounded growth.
      */
-    @SuppressWarnings("serial")
     private final Map<String, SoftReference<List<String>>> decompiledContentCache =
             new LinkedHashMap<String, SoftReference<List<String>>>(64, 0.75f, true) {
                 @Override
@@ -146,7 +119,6 @@ public class JavaSourceLocator {
     private static final int CLASS_FILE_CACHE_MAX_ENTRIES = 2000;
 
     /** Cache of FQCN → class-file URI (jar: or jrt: scheme). Bounded LRU. */
-    @SuppressWarnings("serial")
     private final Map<String, URI> classFileURICache =
             new LinkedHashMap<String, URI>(64, 0.75f, true) {
                 @Override
@@ -156,7 +128,6 @@ public class JavaSourceLocator {
             };
 
     /** Reverse lookup: URI string → FQCN for serving decompiled content by URI. Bounded LRU. */
-    @SuppressWarnings("serial")
     private final Map<String, String> uriToClassName =
             new LinkedHashMap<String, String>(64, 0.75f, true) {
                 @Override
@@ -166,7 +137,7 @@ public class JavaSourceLocator {
             };
 
     /** Shared source JAR index entry (may be null if not using shared indexing). */
-    private volatile SharedSourceJarIndex.IndexEntry sharedIndexEntry;
+    private final AtomicReference<SharedSourceJarIndex.IndexEntry> sharedIndexEntry = new AtomicReference<>();
 
     // --- SoftReference decompiled-cache helpers ---
 
@@ -187,7 +158,7 @@ public class JavaSourceLocator {
     }
 
     /** The classloader used by the Groovy compiler, for locating .class files. */
-    private volatile ClassLoader compilationClassLoader;
+    private final AtomicReference<ClassLoader> compilationClassLoader = new AtomicReference<>();
 
     /**
      * Represents a Java source entry inside a source JAR.
@@ -203,6 +174,7 @@ public class JavaSourceLocator {
     }
 
     public JavaSourceLocator() {
+        // Intentionally empty.
     }
 
     /**
@@ -210,10 +182,9 @@ public class JavaSourceLocator {
      * to decrement the shared source-JAR index ref count.
      */
     public void dispose() {
-        SharedSourceJarIndex.IndexEntry entry = sharedIndexEntry;
+        SharedSourceJarIndex.IndexEntry entry = sharedIndexEntry.getAndSet(null);
         if (entry != null) {
             SharedSourceJarIndex.getInstance().release(entry);
-            sharedIndexEntry = null;
         }
         decompiledContentCache.clear();
         classFileURICache.clear();
@@ -230,10 +201,7 @@ public class JavaSourceLocator {
     public long estimateMemoryBytes() {
         long bytes = 0;
         // classNameToSource: FQCN string -> Path (~200 bytes per entry)
-        Map<String, Path> snapshot = classNameToSource;
-        if (snapshot != null) {
-            bytes += (long) snapshot.size() * 200;
-        }
+        bytes += (long) classNameToSource.size() * 200;
         // decompiledContentCache: up to DECOMPILED_CACHE_MAX_ENTRIES.
         // Each entry is SoftReference<List<String>> — only count if not GC'd.
         // Average decompiled class ~5 KB of source lines.
@@ -259,7 +227,7 @@ public class JavaSourceLocator {
      * @param classLoader the compilation classloader (may be null)
      */
     public void setCompilationClassLoader(ClassLoader classLoader) {
-        this.compilationClassLoader = classLoader;
+        this.compilationClassLoader.set(classLoader);
     }
 
     /**
@@ -274,7 +242,8 @@ public class JavaSourceLocator {
                 indexSourceDirectory(sourcePath, snapshot);
             }
         }
-        classNameToSource = Collections.unmodifiableMap(snapshot);
+        classNameToSource.clear();
+        classNameToSource.putAll(snapshot);
         logger.debug("addProjectRoot({}): indexed {} source classes", projectRoot, snapshot.size());
     }
 
@@ -292,7 +261,8 @@ public class JavaSourceLocator {
                 }
             }
         }
-        classNameToSource = Collections.unmodifiableMap(snapshot);
+        classNameToSource.clear();
+        classNameToSource.putAll(snapshot);
     }
 
     /**
@@ -322,15 +292,16 @@ public class JavaSourceLocator {
         // Use the shared source-JAR index to avoid per-scope duplication.
         // Release any previously held entry before acquiring a new one.
         SharedSourceJarIndex sharedIndex = SharedSourceJarIndex.getInstance();
-        SharedSourceJarIndex.IndexEntry oldEntry = sharedIndexEntry;
+        SharedSourceJarIndex.IndexEntry oldEntry = sharedIndexEntry.get();
         SharedSourceJarIndex.IndexEntry newEntry = sharedIndex.acquire(new ArrayList<>(classpathEntries));
-        sharedIndexEntry = newEntry;
+        sharedIndexEntry.set(newEntry);
         if (oldEntry != null) {
             sharedIndex.release(oldEntry);
         }
 
         // Update classNameToSourceJar to point to the shared map
-        classNameToSourceJar = newEntry.getClassNameToSourceJar();
+        classNameToSourceJar.clear();
+        classNameToSourceJar.putAll(newEntry.getClassNameToSourceJar());
 
         logger.info("Using shared source JAR index: {} dependency classes",
                 classNameToSourceJar.size());
@@ -353,180 +324,25 @@ public class JavaSourceLocator {
 
     /**
      * Given a classpath JAR path, find the corresponding {@code -sources.jar}.
-     * Supports two conventions:
-     * <ol>
-     *   <li><b>Maven / sibling convention:</b> {@code foo-1.0.jar} →
-     *       {@code foo-1.0-sources.jar} in the same directory
-     *       (works for {@code ~/.m2/repository/} layout).</li>
-     *   <li><b>Gradle module cache convention:</b> compiled JARs and source
-     *       JARs live in <em>different hash subdirectories</em> under the same
-     *       version directory:
-     *       {@code files-2.1/<group>/<artifact>/<version>/<hash>/foo-1.0.jar}
-     *       vs {@code files-2.1/<group>/<artifact>/<version>/<hash2>/foo-1.0-sources.jar}.
-     *       This method walks up to the version directory and searches all
-     *       hash subdirectories for the sources JAR.</li>
-     * </ol>
+     * Delegates to {@link SourceJarIndexer#findSourceJar(String)}.
      */
     static Path findSourceJar(String classpathEntry) {
-        if (classpathEntry == null) {
-            return null;
-        }
-        Path jarPath = Paths.get(classpathEntry);
-        if (!Files.isRegularFile(jarPath)) {
-            return null;
-        }
-        String fileName = jarPath.getFileName().toString();
-        if (!fileName.endsWith(".jar")) {
-            return null;
-        }
-
-        // foo-1.0.jar → foo-1.0-sources.jar
-        String baseName = fileName.substring(0, fileName.length() - 4);
-        String sourcesFileName = baseName + "-sources.jar";
-
-        // 1. Maven / sibling convention: look in the same directory
-        Path sourcesJar = jarPath.resolveSibling(sourcesFileName);
-        if (Files.isRegularFile(sourcesJar)) {
-            return sourcesJar;
-        }
-
-        // 2. Gradle module cache convention:
-        //    <cache>/files-2.1/<group>/<artifact>/<version>/<hash>/<file>.jar
-        //    Source JAR may be in a different <hash2> directory under <version>/
-        Path hashDir = jarPath.getParent();
-        if (hashDir != null) {
-            Path versionDir = hashDir.getParent();
-            if (versionDir != null && isGradleCacheLayout(versionDir)) {
-                try (Stream<Path> dirs = Files.list(versionDir)) {
-                    Path found = dirs
-                            .filter(Files::isDirectory)
-                            .filter(d -> !d.equals(hashDir))
-                            .map(d -> d.resolve(sourcesFileName))
-                            .filter(Files::isRegularFile)
-                            .findFirst()
-                            .orElse(null);
-                    if (found != null) {
-                        return found;
-                    }
-                } catch (IOException ignored) {
-                    // ignore errors during Gradle cache search
-                }
-            }
-        }
-
-        return null;
+        return SourceJarIndexer.findSourceJar(classpathEntry);
     }
 
     /**
-     * Check whether the given directory appears to be a version directory
-     * inside the Gradle module cache.
-     * <p>
-     * Expected layout: {@code .../files-2.1/<group>/<artifact>/<version>/}
-     * where {@code versionDir} is the {@code <version>} directory.
-     */
-    private static boolean isGradleCacheLayout(Path versionDir) {
-        // Walk up: version → artifact → group → files-2.1
-        Path artifactDir = versionDir.getParent();
-        if (artifactDir == null) return false;
-        Path groupDir = artifactDir.getParent();
-        if (groupDir == null) return false;
-        Path cacheDir = groupDir.getParent();
-        if (cacheDir == null) return false;
-        return "files-2.1".equals(cacheDir.getFileName().toString());
-    }
-
-    /**
-     * Static variant of {@link #indexSourceJar} used by
-     * {@link SharedSourceJarIndex} to build the shared index without
-     * needing an instance (no project-source precedence check).
+     * Static variant used by {@link SharedSourceJarIndex} to build the shared
+     * index. Delegates to {@link SourceJarIndexer#indexSourceJar}.
      */
     static void indexSourceJarStatic(Path sourceJar, Map<String, SourceJarEntry> target) {
-        try (JarFile jar = new JarFile(sourceJar.toFile())) {
-            Enumeration<JarEntry> entries = jar.entries();
-            while (entries.hasMoreElements()) {
-                JarEntry entry = entries.nextElement();
-                String name = entry.getName();
-                if ((name.endsWith(".java") || name.endsWith(".groovy")) && !entry.isDirectory()) {
-                    String fqcn = jarEntryToClassName(name);
-                    if (fqcn != null) {
-                        target.putIfAbsent(fqcn, new SourceJarEntry(sourceJar, name));
-                    }
-                }
-            }
-        } catch (IOException e) {
-            logger.warn("Failed to index source JAR {}: {}", sourceJar, e.getMessage());
-        }
-    }
-
-    /**
-     * Convert a JAR entry path to a fully-qualified class name.
-     * e.g., "com/example/Foo.java" → "com.example.Foo"
-     * e.g., "spock/lang/Specification.groovy" → "spock.lang.Specification"
-     */
-    private static String jarEntryToClassName(String entryName) {
-        if (entryName == null) {
-            return null;
-        }
-        int extLen;
-        if (entryName.endsWith(".java")) {
-            extLen = 5; // ".java".length()
-        } else if (entryName.endsWith(".groovy")) {
-            extLen = 7; // ".groovy".length()
-        } else {
-            return null;
-        }
-        // Some source JARs may have a prefix directory; strip common prefixes
-        String path = entryName;
-        if (path.startsWith("/")) {
-            path = path.substring(1);
-        }
-        // Remove source file extension
-        path = path.substring(0, path.length() - extLen);
-        return path.replace('/', '.');
+        SourceJarIndexer.indexSourceJar(sourceJar, target);
     }
 
     /**
      * Read the content of a Java source file from inside a source JAR.
      */
     private List<String> readSourceFromJar(SourceJarEntry entry) {
-        try (JarFile jar = new JarFile(entry.sourceJarPath.toFile())) {
-            JarEntry jarEntry = jar.getJarEntry(entry.entryName);
-            if (jarEntry == null) {
-                return null;
-            }
-            List<String> lines = new ArrayList<>();
-            try (BufferedReader reader = new BufferedReader(
-                    new InputStreamReader(jar.getInputStream(jarEntry), StandardCharsets.UTF_8))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    lines.add(line);
-                }
-            }
-            return lines;
-        } catch (IOException e) {
-            logger.warn("Failed to read {} from {}: {}",
-                    entry.entryName, entry.sourceJarPath, e.getMessage());
-            return null;
-        }
-    }
-
-    /**
-     * Returns the URI for a source inside a JAR using the {@code jar:} URI scheme.
-     * e.g., {@code jar:file:///path/to/sources.jar!/com/example/Foo.java}
-     *
-     * @deprecated Use {@link #sourceJarToVSCodeURI(SourceJarEntry)} instead.
-     *             The nested {@code file:///} URI gets mangled by VS Code's
-     *             {@code Uri.parse()} (colons in the path are percent-encoded),
-     *             breaking the round-trip.
-     */
-    @SuppressWarnings("unused")
-    private static URI sourceJarEntryToURI(SourceJarEntry entry) {
-        try {
-            return URI.create("jar:" + entry.sourceJarPath.toUri().toString()
-                    + "!/" + entry.entryName);
-        } catch (Exception e) {
-            return entry.sourceJarPath.toUri();
-        }
+        return SourceJarIndexer.readSourceFromJar(entry);
     }
 
     /**
@@ -542,18 +358,7 @@ public class JavaSourceLocator {
      * → {@code jar:///spock-core-2.4-sources.jar/spock.lang/Specification.java}
      */
     private static URI sourceJarToVSCodeURI(SourceJarEntry entry) {
-        String jarFileName = entry.sourceJarPath.getFileName().toString();
-        String entryPath = entry.entryName; // e.g. "com/example/Foo.java"
-        int lastSlash = entryPath.lastIndexOf('/');
-        String dottedEntry;
-        if (lastSlash >= 0) {
-            String pkg = entryPath.substring(0, lastSlash).replace('/', '.');
-            String fileName = entryPath.substring(lastSlash + 1);
-            dottedEntry = pkg + "/" + fileName;
-        } else {
-            dottedEntry = entryPath;
-        }
-        return URI.create("jar:///" + jarFileName + "/" + dottedEntry);
+        return ClassFileURIResolver.sourceJarToVSCodeURI(entry);
     }
 
     private void indexSourceDirectory(Path sourceRoot, Map<String, Path> target) {
@@ -562,7 +367,7 @@ public class JavaSourceLocator {
                     .filter(Files::isRegularFile)
                     .filter(p -> {
                         String name = p.toString();
-                        return name.endsWith(".java") || name.endsWith(".groovy");
+                        return name.endsWith(JAVA_EXTENSION) || name.endsWith(GROOVY_EXTENSION);
                     })
                     .forEach(sourceFile -> {
                         String fqcn = pathToClassName(sourceRoot, sourceFile);
@@ -583,10 +388,10 @@ public class JavaSourceLocator {
     private String pathToClassName(Path sourceRoot, Path sourceFile) {
         Path relative = sourceRoot.relativize(sourceFile);
         String relStr = relative.toString();
-        if (relStr.endsWith(".java")) {
-            relStr = relStr.substring(0, relStr.length() - 5);
-        } else if (relStr.endsWith(".groovy")) {
-            relStr = relStr.substring(0, relStr.length() - 7);
+        if (relStr.endsWith(JAVA_EXTENSION)) {
+            relStr = relStr.substring(0, relStr.length() - JAVA_EXTENSION.length());
+        } else if (relStr.endsWith(GROOVY_EXTENSION)) {
+            relStr = relStr.substring(0, relStr.length() - GROOVY_EXTENSION.length());
         }
         return relStr.replace('/', '.').replace('\\', '.');
     }
@@ -661,13 +466,13 @@ public class JavaSourceLocator {
                     return Files.readAllLines(filePath);
                 } catch (IOException e) {
                     logger.warn("Failed to read Java source {}: {}", filePath, e.getMessage());
-                    return null;
+                    return Collections.emptyList();
                 }
             }
             if (jarEntry != null && locator != null) {
                 return locator.readSourceFromJar(jarEntry);
             }
-            return null;
+            return Collections.emptyList();
         }
     }
 
@@ -694,7 +499,7 @@ public class JavaSourceLocator {
             URI uri = sourceJarToVSCodeURI(jarEntry);
             uriToClassName.put(uri.toString(), className);
             List<String> lines = readSourceFromJar(jarEntry);
-            if (lines != null) {
+            if (!lines.isEmpty()) {
                 putDecompiledCacheEntry(className, lines);
                 return new SourceInfo(uri, lines);
             }
@@ -736,52 +541,7 @@ public class JavaSourceLocator {
         if (source == null) {
             return null;
         }
-        // For inner classes (Outer$Inner), use the inner class simple name
-        String baseName = className.contains(".")
-                ? className.substring(className.lastIndexOf('.') + 1)
-                : className;
-        String simpleName = baseName.contains("$")
-                ? baseName.substring(baseName.lastIndexOf('$') + 1)
-                : baseName;
-
-        List<String> lines = source.readLines();
-        if (lines != null) {
-            boolean inBlockComment = false;
-            for (int i = 0; i < lines.size(); i++) {
-                String line = lines.get(i);
-
-                // Track block comments
-                if (inBlockComment) {
-                    if (line.contains("*/")) {
-                        inBlockComment = false;
-                    }
-                    continue;
-                }
-                if (line.trim().startsWith("/*")) {
-                    inBlockComment = true;
-                    if (line.contains("*/")) {
-                        inBlockComment = false;
-                    }
-                    continue;
-                }
-                // Skip single-line comments
-                String trimmed = line.trim();
-                if (trimmed.startsWith("//")) {
-                    continue;
-                }
-
-                Matcher m = CLASS_DECL_PATTERN.matcher(line);
-                if (m.find() && m.group(1).equals(simpleName)) {
-                    int col = line.indexOf(simpleName);
-                    Position start = new Position(i, col);
-                    Position end = new Position(i, col + simpleName.length());
-                    return new Location(source.uri.toString(), new Range(start, end));
-                }
-            }
-        }
-
-        // Fallback: top of file
-        return new Location(source.uri.toString(), new Range(new Position(0, 0), new Position(0, 0)));
+        return DeclarationLocationFinder.findLocationForClass(source.uri, source.readLines(), className);
     }
 
     /**
@@ -798,49 +558,11 @@ public class JavaSourceLocator {
         if (source == null) {
             return null;
         }
-
-        List<String> lines = source.readLines();
-        if (lines != null) {
-            boolean inBlockComment = false;
-            for (int i = 0; i < lines.size(); i++) {
-                String line = lines.get(i);
-
-                // Track block comments
-                if (inBlockComment) {
-                    if (line.contains("*/")) {
-                        inBlockComment = false;
-                    }
-                    continue;
-                }
-                if (line.trim().startsWith("/*")) {
-                    inBlockComment = true;
-                    if (line.contains("*/")) {
-                        inBlockComment = false;
-                    }
-                    continue;
-                }
-                String trimmed = line.trim();
-                if (trimmed.startsWith("//")) {
-                    continue;
-                }
-
-                Matcher m = METHOD_DECL_PATTERN.matcher(line);
-                if (m.find() && m.group(1).equals(methodName)) {
-                    if (paramCount >= 0) {
-                        // Collect the full signature across lines if needed
-                        String fullSig = collectUntilClosingParen(lines, i, m.start());
-                        if (!matchesParamCount(fullSig, methodName, paramCount)) {
-                            continue;
-                        }
-                    }
-                    int col = line.indexOf(methodName);
-                    Position start = new Position(i, col);
-                    Position end = new Position(i, col + methodName.length());
-                    return new Location(source.uri.toString(), new Range(start, end));
-                }
-            }
+        Location location = DeclarationLocationFinder.findLocationForMethod(
+                source.uri, source.readLines(), methodName, paramCount);
+        if (location != null) {
+            return location;
         }
-
         // Fallback to class location if method not found
         return findLocationForClass(className);
     }
@@ -858,64 +580,11 @@ public class JavaSourceLocator {
         if (source == null) {
             return null;
         }
-        // For inner classes (Outer$Inner), use the inner class simple name
-        String baseName = className.contains(".")
-                ? className.substring(className.lastIndexOf('.') + 1)
-                : className;
-        String simpleName = baseName.contains("$")
-                ? baseName.substring(baseName.lastIndexOf('$') + 1)
-                : baseName;
-
-        List<String> lines = source.readLines();
-        if (lines != null) {
-            boolean inBlockComment = false;
-            boolean seenClassDecl = false;
-            for (int i = 0; i < lines.size(); i++) {
-                String line = lines.get(i);
-
-                if (inBlockComment) {
-                    if (line.contains("*/")) {
-                        inBlockComment = false;
-                    }
-                    continue;
-                }
-                if (line.trim().startsWith("/*")) {
-                    inBlockComment = true;
-                    if (line.contains("*/")) {
-                        inBlockComment = false;
-                    }
-                    continue;
-                }
-                String trimmed = line.trim();
-                if (trimmed.startsWith("//")) {
-                    continue;
-                }
-
-                // Only look for constructors after the class declaration
-                if (!seenClassDecl) {
-                    Matcher cm = CLASS_DECL_PATTERN.matcher(line);
-                    if (cm.find() && cm.group(1).equals(simpleName)) {
-                        seenClassDecl = true;
-                    }
-                    continue;
-                }
-
-                Matcher m = CONSTRUCTOR_DECL_PATTERN.matcher(line);
-                if (m.find() && m.group(1).equals(simpleName)) {
-                    if (paramCount >= 0) {
-                        String fullSig = collectUntilClosingParen(lines, i, m.start());
-                        if (!matchesParamCount(fullSig, simpleName, paramCount)) {
-                            continue;
-                        }
-                    }
-                    int col = line.indexOf(simpleName);
-                    Position start = new Position(i, col);
-                    Position end = new Position(i, col + simpleName.length());
-                    return new Location(source.uri.toString(), new Range(start, end));
-                }
-            }
+        Location location = DeclarationLocationFinder.findLocationForConstructor(
+                source.uri, source.readLines(), className, paramCount);
+        if (location != null) {
+            return location;
         }
-
         return findLocationForClass(className);
     }
 
@@ -931,97 +600,12 @@ public class JavaSourceLocator {
         if (source == null) {
             return null;
         }
-
-        List<String> lines = source.readLines();
-        if (lines != null) {
-            boolean inBlockComment = false;
-            for (int i = 0; i < lines.size(); i++) {
-                String line = lines.get(i);
-
-                if (inBlockComment) {
-                    if (line.contains("*/")) {
-                        inBlockComment = false;
-                    }
-                    continue;
-                }
-                if (line.trim().startsWith("/*")) {
-                    inBlockComment = true;
-                    if (line.contains("*/")) {
-                        inBlockComment = false;
-                    }
-                    continue;
-                }
-                String trimmed = line.trim();
-                if (trimmed.startsWith("//")) {
-                    continue;
-                }
-
-                Matcher m = FIELD_DECL_PATTERN.matcher(line);
-                if (m.find() && m.group(1).equals(fieldName)) {
-                    int col = line.indexOf(fieldName);
-                    Position start = new Position(i, col);
-                    Position end = new Position(i, col + fieldName.length());
-                    return new Location(source.uri.toString(), new Range(start, end));
-                }
-            }
+        Location location = DeclarationLocationFinder.findLocationForField(
+                source.uri, source.readLines(), fieldName);
+        if (location != null) {
+            return location;
         }
-
         return findLocationForClass(className);
-    }
-
-    /**
-     * Collect source text starting from the method/constructor name until the
-     * closing parenthesis of the parameter list, spanning multiple lines if
-     * necessary.
-     */
-    private String collectUntilClosingParen(List<String> lines, int startLine, int startCol) {
-        StringBuilder sb = new StringBuilder();
-        int depth = 0;
-        boolean started = false;
-        for (int i = startLine; i < lines.size(); i++) {
-            String line = (i == startLine) ? lines.get(i).substring(startCol) : lines.get(i);
-            for (int j = 0; j < line.length(); j++) {
-                char c = line.charAt(j);
-                if (c == '(') {
-                    depth++;
-                    started = true;
-                } else if (c == ')') {
-                    depth--;
-                    if (started && depth == 0) {
-                        sb.append(line, 0, j + 1);
-                        return sb.toString();
-                    }
-                }
-            }
-            sb.append(line).append('\n');
-        }
-        return sb.toString();
-    }
-
-    /**
-     * Check if the collected signature has the expected parameter count.
-     * A parameter count of 0 matches empty parens "()" or "()".
-     */
-    private boolean matchesParamCount(String signature, String name, int expected) {
-        int parenOpen = signature.indexOf('(');
-        int parenClose = signature.lastIndexOf(')');
-        if (parenOpen == -1 || parenClose == -1 || parenClose <= parenOpen) {
-            return false;
-        }
-        String params = signature.substring(parenOpen + 1, parenClose).trim();
-        if (params.isEmpty()) {
-            return expected == 0;
-        }
-        // Count commas at top-level (not inside < > generics)
-        int count = 1;
-        int genericDepth = 0;
-        for (int i = 0; i < params.length(); i++) {
-            char c = params.charAt(i);
-            if (c == '<') genericDepth++;
-            else if (c == '>') genericDepth--;
-            else if (c == ',' && genericDepth == 0) count++;
-        }
-        return count == expected;
     }
 
     /**
@@ -1133,7 +717,7 @@ public class JavaSourceLocator {
             uriToClassName.put(classFileURI.toString(), className);
             return classFileURI;
         }
-        URI syntheticURI = decompiledContentToURI(className);
+        URI syntheticURI = ClassFileURIResolver.decompiledContentToURI(className);
         uriToClassName.put(syntheticURI.toString(), className);
         return syntheticURI;
     }
@@ -1192,10 +776,10 @@ public class JavaSourceLocator {
         }
         for (String line : lines) {
             String trimmed = line.trim();
-            if (trimmed.isEmpty()) continue;
-            if (trimmed.startsWith("package ")) continue;
-            // The decompiler always emits this as the first non-package line
-            return trimmed.startsWith("// Decompiled from bytecode");
+            if (!trimmed.isEmpty() && !trimmed.startsWith("package ")) {
+                // The decompiler always emits this as the first non-package line
+                return trimmed.startsWith("// Decompiled from bytecode");
+            }
         }
         return false;
     }
@@ -1221,10 +805,10 @@ public class JavaSourceLocator {
             return getDecompiledContent(className);
         }
         // Fall back to parsing the URI for the decompiled: scheme
-        if (uri.startsWith("decompiled:")) {
-            className = uri.substring("decompiled:".length());
-            if (className.endsWith(".java")) {
-                className = className.substring(0, className.length() - ".java".length());
+        if (uri.startsWith(DECOMPILED_SCHEME)) {
+            className = uri.substring(DECOMPILED_SCHEME.length());
+            if (className.endsWith(JAVA_EXTENSION)) {
+                className = className.substring(0, className.length() - JAVA_EXTENSION.length());
             }
             className = className.replace('/', '.');
             String freshContent = refreshFromRealSourceIfAvailable(className);
@@ -1234,7 +818,7 @@ public class JavaSourceLocator {
             return getDecompiledContent(className);
         }
         // Try extracting FQCN from jar: or jrt: class-file URIs
-        className = classFileURIToClassName(uri);
+        className = ClassFileURIResolver.classFileURIToClassName(uri);
         if (className != null) {
             String freshContent = refreshFromRealSourceIfAvailable(className);
             if (freshContent != null) {
@@ -1244,7 +828,7 @@ public class JavaSourceLocator {
         }
         // Handle jar: URIs pointing to .java/.groovy source files inside source JARs
         if (uri.startsWith("jar:") && uri.contains("!/")
-                && (uri.endsWith(".java") || uri.endsWith(".groovy"))) {
+                && (uri.endsWith(JAVA_EXTENSION) || uri.endsWith(GROOVY_EXTENSION))) {
             return readSourceFromJarURI(uri);
         }
         return null;
@@ -1256,7 +840,7 @@ public class JavaSourceLocator {
         }
 
         String className = uriToClassName.get(uri);
-        if (className == null && uri.startsWith("jar:/") && uri.endsWith(".java")) {
+        if (className == null && uri.startsWith("jar:/") && uri.endsWith(JAVA_EXTENSION)) {
             className = classNameFromVirtualJarURI(uri);
         }
 
@@ -1290,11 +874,11 @@ public class JavaSourceLocator {
         }
 
         String packageAndFile = withoutPrefix.substring(firstSlash + 1);
-        if (!packageAndFile.endsWith(".java")) {
+        if (!packageAndFile.endsWith(JAVA_EXTENSION)) {
             return null;
         }
 
-        String javaPath = packageAndFile.substring(0, packageAndFile.length() - ".java".length());
+        String javaPath = packageAndFile.substring(0, packageAndFile.length() - JAVA_EXTENSION.length());
         int lastSlash = javaPath.lastIndexOf('/');
         if (lastSlash <= 0 || lastSlash + 1 >= javaPath.length()) {
             return null;
@@ -1317,13 +901,19 @@ public class JavaSourceLocator {
     private String readSourceFromJarURI(String jarUri) {
         try {
             int bang = jarUri.indexOf("!/");
+            if (bang <= 4) {
+                return null;
+            }
             // Extract the JAR file path: "jar:file:///path/to/foo.jar" -> file URI
             String jarFileUri = jarUri.substring(4, bang); // strip "jar:"
             Path jarPath = Paths.get(URI.create(jarFileUri));
             String entryName = jarUri.substring(bang + 2);
+            if (!SourceJarIndexer.isSafeSourceJarPath(jarPath) || !SourceJarIndexer.isSafeArchiveEntryName(entryName)) {
+                return null;
+            }
             SourceJarEntry entry = new SourceJarEntry(jarPath, entryName);
             List<String> lines = readSourceFromJar(entry);
-            if (lines != null) {
+            if (!lines.isEmpty()) {
                 return String.join("\n", lines);
             }
         } catch (Exception e) {
@@ -1356,131 +946,24 @@ public class JavaSourceLocator {
         if (cached != null) {
             return cached;
         }
-        ClassLoader cl = compilationClassLoader;
+        ClassLoader cl = compilationClassLoader.get();
         if (cl == null) {
             cl = ClassLoader.getSystemClassLoader();
         }
-        String resourcePath = className.replace('.', '/') + ".class";
+        String resourcePath = className.replace('.', '/') + CLASS_EXTENSION;
         URL url = cl.getResource(resourcePath);
         if (url == null) {
             return null;
         }
         try {
             URI rawUri = url.toURI();
-            URI uri = toVSCodeCompatibleURI(rawUri);
+            URI uri = ClassFileURIResolver.toVSCodeCompatibleURI(rawUri);
             classFileURICache.put(className, uri);
             return uri;
         } catch (Exception e) {
             logger.debug("Failed to convert class URL to URI for {}: {}", className, e.getMessage());
             return null;
         }
-    }
-
-    /**
-     * Transform a JVM-produced {@code jar:file:///…} URI into a VS Code
-     * compatible format matching the RedHat Java extension convention:
-     * only the JAR filename is kept, packages use dotted notation, and
-     * there is no {@code !} separator.
-     * <p>
-     * Input:  {@code jar:file:///C:/Users/.../foo.jar!/com/example/Foo.class}<br>
-     * Output: {@code jar:///foo.jar/com.example/Foo.class}
-     * <p>
-     * Non-{@code jar:} URIs (e.g. {@code jrt:}) are returned unchanged.
-     */
-    private static URI toVSCodeCompatibleURI(URI rawUri) {
-        String raw = rawUri.toString();
-        if (!raw.startsWith("jar:")) {
-            return rawUri;
-        }
-        int bangSlash = raw.indexOf("!/");
-        if (bangSlash < 0) {
-            return rawUri;
-        }
-        // Extract the JAR file path between "jar:" and "!"
-        // e.g. "file:///C:/Users/.../spock-core-2.4-M1-groovy-4.0.jar"
-        String jarFilePart = raw.substring(4, bangSlash);
-        // Extract just the filename from the path
-        int lastSlash = jarFilePart.lastIndexOf('/');
-        String jarFileName = (lastSlash >= 0) ? jarFilePart.substring(lastSlash + 1) : jarFilePart;
-        // Entry path after "!/"  e.g. "com/example/Foo.class"
-        String entryPath = raw.substring(bangSlash + 2);
-        // Convert package separators to dots:
-        // "com/example/Foo.class" -> package="com.example", file="Foo.class"
-        int lastEntrySlash = entryPath.lastIndexOf('/');
-        String dottedEntry;
-        if (lastEntrySlash >= 0) {
-            String pkg = entryPath.substring(0, lastEntrySlash).replace('/', '.');
-            String fileName = entryPath.substring(lastEntrySlash + 1);
-            dottedEntry = pkg + "/" + fileName;
-        } else {
-            dottedEntry = entryPath;
-        }
-        // Build: jar:///<jarFileName>/<dotted.package>/<ClassName.class>
-        return URI.create("jar:///" + jarFileName + "/" + dottedEntry);
-    }
-
-    /**
-     * Extract a FQCN from a class-file URI ({@code jar:} or {@code jrt:} scheme).
-     * <p>
-     * Examples:
-     * <ul>
-     *   <li>{@code jar:file:///path/to/foo.jar!/com/example/Foo.class} → {@code com.example.Foo}</li>
-     *   <li>{@code jrt:/java.base/java/util/List.class} → {@code java.util.List}</li>
-     * </ul>
-     */
-    static String classFileURIToClassName(String uri) {
-        if (uri == null) return null;
-        String path = null;
-        if (uri.startsWith("jar:")) {
-            int bangSlash = uri.indexOf("!/");
-            if (bangSlash >= 0) {
-                // Legacy format: jar:file:///path/foo.jar!/com/example/Foo.class
-                path = uri.substring(bangSlash + 2);
-            } else {
-                // VS Code format: jar:///foo.jar/com.example/Foo.class
-                // Find the .jar segment, entry is everything after it
-                int jarExt = uri.indexOf(".jar/");
-                if (jarExt >= 0) {
-                    path = uri.substring(jarExt + 5); // after ".jar/"
-                    // Convert dotted package back: "com.example/Foo.class" -> "com/example/Foo.class"
-                    int lastSlash = path.lastIndexOf('/');
-                    if (lastSlash >= 0) {
-                        String pkg = path.substring(0, lastSlash).replace('.', '/');
-                        path = pkg + path.substring(lastSlash);
-                    }
-                }
-            }
-        } else if (uri.startsWith("jrt:")) {
-            // jrt:/module/package/Class.class
-            path = uri.substring("jrt:/".length());
-            int slash = path.indexOf('/');
-            if (slash >= 0) {
-                path = path.substring(slash + 1);
-            }
-        }
-        if (path != null && path.endsWith(".class")) {
-            path = path.substring(0, path.length() - ".class".length());
-            return path.replace('/', '.');
-        }
-        // Also handle .java/.groovy source files from source JARs
-        if (path != null && path.endsWith(".java")) {
-            path = path.substring(0, path.length() - ".java".length());
-            return path.replace('/', '.');
-        }
-        if (path != null && path.endsWith(".groovy")) {
-            path = path.substring(0, path.length() - ".groovy".length());
-            return path.replace('/', '.');
-        }
-        return null;
-    }
-
-    /**
-     * Create a synthetic URI for decompiled content.
-     * Uses the {@code decompiled:} scheme so clients can identify these as
-     * non-editable.
-     */
-    private static URI decompiledContentToURI(String className) {
-        return URI.create("decompiled:" + className.replace('.', '/') + ".java");
     }
 
 }

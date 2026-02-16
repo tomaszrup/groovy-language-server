@@ -686,15 +686,15 @@ class JavaSourceLocatorTests {
 		String jrt = "jrt:/java.base/java/util/List.class";
 		String sourceJava = "jar:file:///C:/repo/foo-sources.jar!/com/example/Foo.java";
 
-		Assertions.assertEquals("com.example.Foo", JavaSourceLocator.classFileURIToClassName(legacyJar));
-		Assertions.assertEquals("com.example.Foo", JavaSourceLocator.classFileURIToClassName(vscodeJar));
-		Assertions.assertEquals("java.util.List", JavaSourceLocator.classFileURIToClassName(jrt));
-		Assertions.assertEquals("com.example.Foo", JavaSourceLocator.classFileURIToClassName(sourceJava));
+		Assertions.assertEquals("com.example.Foo", ClassFileURIResolver.classFileURIToClassName(legacyJar));
+		Assertions.assertEquals("com.example.Foo", ClassFileURIResolver.classFileURIToClassName(vscodeJar));
+		Assertions.assertEquals("java.util.List", ClassFileURIResolver.classFileURIToClassName(jrt));
+		Assertions.assertEquals("com.example.Foo", ClassFileURIResolver.classFileURIToClassName(sourceJava));
 	}
 
 	@Test
 	void testToVSCodeCompatibleURIForJarAndNonJar() throws Exception {
-		Method convert = JavaSourceLocator.class.getDeclaredMethod("toVSCodeCompatibleURI", URI.class);
+		Method convert = ClassFileURIResolver.class.getDeclaredMethod("toVSCodeCompatibleURI", URI.class);
 		convert.setAccessible(true);
 
 		URI jar = URI.create("jar:file:///C:/cache/lib-1.0.jar!/com/example/Foo.class");
@@ -727,7 +727,7 @@ class JavaSourceLocatorTests {
 		Path versionDir = tempProjectRoot.resolve("files-2.1/com.example/lib/1.2.3");
 		Files.createDirectories(versionDir);
 
-		Method isGradleLayout = JavaSourceLocator.class.getDeclaredMethod("isGradleCacheLayout", Path.class);
+		Method isGradleLayout = SourceJarIndexer.class.getDeclaredMethod("isGradleCacheLayout", Path.class);
 		isGradleLayout.setAccessible(true);
 
 		boolean match = (boolean) isGradleLayout.invoke(null, versionDir);
@@ -753,16 +753,16 @@ class JavaSourceLocatorTests {
 
 	@Test
 	void testSourceJarEntryToURIBuildsJarUri() throws Exception {
-		Method sourceJarEntryToURI = JavaSourceLocator.class.getDeclaredMethod(
-				"sourceJarEntryToURI", JavaSourceLocator.SourceJarEntry.class);
-		sourceJarEntryToURI.setAccessible(true);
+		Method sourceJarToVSCodeURI = JavaSourceLocator.class.getDeclaredMethod(
+				"sourceJarToVSCodeURI", JavaSourceLocator.SourceJarEntry.class);
+		sourceJarToVSCodeURI.setAccessible(true);
 
 		Path sourceJar = createSourceJar("libs/legacy-sources.jar", "org/example/Legacy.java",
 				"package org.example; public class Legacy {}\n");
 		JavaSourceLocator.SourceJarEntry entry = new JavaSourceLocator.SourceJarEntry(sourceJar, "org/example/Legacy.java");
 
-		URI uri = (URI) sourceJarEntryToURI.invoke(null, entry);
+		URI uri = (URI) sourceJarToVSCodeURI.invoke(null, entry);
 		Assertions.assertTrue(uri.toString().startsWith("jar:"));
-		Assertions.assertTrue(uri.toString().contains("!/org/example/Legacy.java"));
+		Assertions.assertTrue(uri.toString().contains("org.example/Legacy.java"));
 	}
 }

@@ -31,6 +31,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -71,11 +72,12 @@ public class JavaSourceAwareClassLoader extends ClassLoader {
             {"src", "main", "java"},
             {"src", "test", "java"},
     };
+        private static final String JAVA_EXTENSION = ".java";
 
     private final Path projectRoot;
 
-    /** Lazily-built index: FQCN → source Path.  {@code null} until built. */
-    private volatile Map<String, Path> sourceIndex;
+    /** Lazily-built index: FQCN → source Path. */
+    private final AtomicReference<Map<String, Path>> sourceIndex = new AtomicReference<>();
 
     /** Stub classes already defined by this loader to avoid re-definition. */
     private final ConcurrentHashMap<String, Class<?>> definedStubs = new ConcurrentHashMap<>();
@@ -94,7 +96,7 @@ public class JavaSourceAwareClassLoader extends ClassLoader {
      * scan.  Call this when Java files are created, deleted, or moved.
      */
     public void invalidateIndex() {
-        sourceIndex = null;
+        sourceIndex.set(null);
     }
 
     @Override
@@ -138,7 +140,7 @@ public class JavaSourceAwareClassLoader extends ClassLoader {
                 try {
                     return loadClass(name);
                 } catch (ClassNotFoundException ex) {
-                    throw new RuntimeException("Failed to define stub class: " + name, e);
+                    throw new IllegalStateException("Failed to define stub class: " + name, e);
                 }
             }
         });
@@ -267,17 +269,17 @@ public class JavaSourceAwareClassLoader extends ClassLoader {
     }
 
     private Map<String, Path> getOrBuildIndex() {
-        Map<String, Path> idx = sourceIndex;
+        Map<String, Path> idx = sourceIndex.get();
         if (idx != null) {
             return idx;
         }
         synchronized (this) {
-            idx = sourceIndex;
+            idx = sourceIndex.get();
             if (idx != null) {
                 return idx;
             }
             idx = buildIndex();
-            sourceIndex = idx;
+            sourceIndex.set(idx);
             return idx;
         }
     }
@@ -291,7 +293,7 @@ public class JavaSourceAwareClassLoader extends ClassLoader {
                     @Override
                     public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
                         String fileName = file.getFileName().toString();
-                        if (fileName.endsWith(".java")) {
+                        if (fileName.endsWith(JAVA_EXTENSION)) {
                             Path relative = sourceDir.relativize(file);
                             String fqcn = pathToFqcn(relative);
                             if (fqcn != null) {
@@ -343,10 +345,10 @@ public class JavaSourceAwareClassLoader extends ClassLoader {
             String segment = relativePath.getName(i).toString();
             if (i == relativePath.getNameCount() - 1) {
                 // Last segment: strip .java extension
-                if (!segment.endsWith(".java")) {
+                if (!segment.endsWith(JAVA_EXTENSION)) {
                     return null;
                 }
-                segment = segment.substring(0, segment.length() - ".java".length());
+                segment = segment.substring(0, segment.length() - JAVA_EXTENSION.length());
             }
             if (segment.isEmpty()) {
                 return null;

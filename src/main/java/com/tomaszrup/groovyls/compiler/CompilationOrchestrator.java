@@ -30,6 +30,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 import org.codehaus.groovy.GroovyBugError;
 import org.codehaus.groovy.control.CompilationFailedException;
@@ -58,6 +59,9 @@ public class CompilationOrchestrator {
 	private static final Logger logger = LoggerFactory.getLogger(CompilationOrchestrator.class);
 	private static final Pattern PATTERN_CONSTRUCTOR_CALL = Pattern.compile(".*new \\w*$");
 	private static final Set<String> REPORTED_GROOVY_BUG_KEYS = ConcurrentHashMap.newKeySet();
+	private static final String KNOWN_HARMLESS_GROOVY_BUG_PREFIX = "Known Groovy compiler bug during";
+	private static final String MISSING_OR_INCOMPATIBLE_DEPENDENCY_MSG =
+			"(a dependency may be missing or incompatible): {}";
 
 	/**
 	 * Process-wide shared cache for ClassGraph scan results. Scopes with
@@ -116,9 +120,8 @@ public class CompilationOrchestrator {
 		if (existingUnit != null) {
 			File targetDirectory = existingUnit.getConfiguration().getTargetDirectory();
 			if (targetDirectory != null && targetDirectory.exists()) {
-				try {
-					Files.walk(targetDirectory.toPath()).sorted(Comparator.reverseOrder()).map(Path::toFile)
-							.forEach(File::delete);
+				try (Stream<Path> walk = Files.walk(targetDirectory.toPath())) {
+					walk.sorted(Comparator.reverseOrder()).map(Path::toFile).forEach(File::delete);
 				} catch (IOException e) {
 					logger.error("Failed to delete target directory: {}", targetDirectory.getAbsolutePath(), e);
 					return new CompilationResult(null, existingClassLoader, existingScanResult, false);
@@ -163,11 +166,8 @@ public class CompilationOrchestrator {
 			logger.debug("AST visit exception details", e);
 		} catch (LinkageError e) {
 			logger.warn("Classpath linkage error during AST visit "
-					+ "(a dependency may be missing or incompatible): {}", e.toString());
+					+ MISSING_OR_INCOMPATIBLE_DEPENDENCY_MSG, e.toString());
 			logger.debug("AST visit LinkageError details", e);
-		} catch (VirtualMachineError e) {
-			logger.error("VirtualMachineError during AST visit — returning partial visitor: {}", e.toString());
-			// Return the partial visitor so callers can still use whatever was visited
 		}
 		return astVisitor;
 	}
@@ -199,10 +199,9 @@ public class CompilationOrchestrator {
 			logger.warn("Exception during incremental AST visit: {}", e.getMessage());
 			logger.debug("Incremental AST visit exception details", e);
 		} catch (LinkageError e) {
-			logger.warn("Classpath linkage error during incremental AST visit: {}", e.toString());
+			logger.warn("Classpath linkage error during incremental AST visit "
+					+ MISSING_OR_INCOMPATIBLE_DEPENDENCY_MSG, e.toString());
 			logger.debug("Incremental AST visit LinkageError details", e);
-		} catch (VirtualMachineError e) {
-			logger.error("VirtualMachineError during incremental AST visit: {}", e.toString());
 		}
 		return newVisitor;
 	}
@@ -226,10 +225,11 @@ public class CompilationOrchestrator {
 					e.getMessage());
 		} catch (GroovyBugError e) {
 			if (isKnownHarmlessTraitComposerBug(e)) {
-				String key = String.valueOf(projectRoot) + "|" + String.valueOf(e.getMessage());
+				String key = projectRoot + "|" + e.getMessage();
 				if (REPORTED_GROOVY_BUG_KEYS.add(key)) {
 					logger.debug(
-							"Known Groovy compiler bug during compilation for scope {} (suppressing stack trace; benign for language features): {}",
+							"{} compilation for scope {} (suppressing stack trace; benign for language features): {}",
+							KNOWN_HARMLESS_GROOVY_BUG_PREFIX,
 							projectRoot, e.getMessage());
 				}
 			} else {
@@ -248,13 +248,9 @@ public class CompilationOrchestrator {
 			// so this doesn't propagate to LSP4J's listener thread and kill
 			// the server (EPIPE).
 			logger.warn("Classpath linkage error during compilation for scope {} "
-					+ "(a dependency may be missing or incompatible): {}",
+					+ MISSING_OR_INCOMPATIBLE_DEPENDENCY_MSG,
 					projectRoot, e.toString());
 			logger.debug("LinkageError details", e);
-		} catch (VirtualMachineError e) {
-			logger.error("VirtualMachineError during compilation for scope {}: {}",
-					projectRoot, e.toString());
-			throw e; // re-throw so callers (CompilationService) can handle
 		}
 		return compilationUnit.getErrorCollector();
 	}
@@ -287,10 +283,11 @@ public class CompilationOrchestrator {
 			logger.debug("Incremental compilation failed for {}: {}", projectRoot, e.getMessage());
 		} catch (GroovyBugError e) {
 			if (isKnownHarmlessTraitComposerBug(e)) {
-				String key = String.valueOf(projectRoot) + "|incremental|" + String.valueOf(e.getMessage());
+				String key = projectRoot + "|incremental|" + e.getMessage();
 				if (REPORTED_GROOVY_BUG_KEYS.add(key)) {
 					logger.debug(
-							"Known Groovy compiler bug during incremental compile for {} (suppressing stack trace; benign for language features): {}",
+							"{} incremental compile for {} (suppressing stack trace; benign for language features): {}",
+							KNOWN_HARMLESS_GROOVY_BUG_PREFIX,
 							projectRoot, e.getMessage());
 				}
 			} else {
@@ -301,13 +298,9 @@ public class CompilationOrchestrator {
 			logger.warn("Unexpected exception during incremental compile for {}: {}", projectRoot, e.getMessage());
 		} catch (LinkageError e) {
 			logger.warn("Classpath linkage error during incremental compile for {} "
-					+ "(a dependency may be missing or incompatible): {}",
+					+ MISSING_OR_INCOMPATIBLE_DEPENDENCY_MSG,
 					projectRoot, e.toString());
 			logger.debug("LinkageError details", e);
-		} catch (VirtualMachineError e) {
-			logger.error("VirtualMachineError during incremental compile for {}: {}",
-					projectRoot, e.toString());
-			throw e;
 		}
 		return incrementalUnit.getErrorCollector();
 	}
@@ -340,8 +333,8 @@ public class CompilationOrchestrator {
 	 * @return the original source text before injection, or {@code null} if no
 	 *         injection was performed
 	 */
-	public String injectCompletionPlaceholder(ASTNodeVisitor astVisitor,
-			FileContentsTracker fileContentsTracker, URI uri, Position position) {
+	public String injectCompletionPlaceholder(FileContentsTracker fileContentsTracker,
+			URI uri, Position position) {
 		String originalSource = fileContentsTracker.getContents(uri);
 		if (originalSource == null) {
 			return null;

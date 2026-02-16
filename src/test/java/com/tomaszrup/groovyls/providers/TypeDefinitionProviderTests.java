@@ -7,6 +7,7 @@ import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.Parameter;
 import org.codehaus.groovy.ast.expr.VariableExpression;
 import org.eclipse.lsp4j.Location;
+import org.eclipse.lsp4j.LocationLink;
 import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.Range;
 import org.eclipse.lsp4j.TextDocumentIdentifier;
@@ -23,7 +24,7 @@ class TypeDefinitionProviderTests {
     @Test
     void testProvideTypeDefinitionWithNullAstReturnsEmpty() throws Exception {
         TypeDefinitionProvider provider = new TypeDefinitionProvider(null);
-        Either<List<? extends Location>, List<? extends org.eclipse.lsp4j.LocationLink>> result =
+        Either<List<Location>, List<LocationLink>> result =
                 provider.provideTypeDefinition(new TextDocumentIdentifier("file:///tmp/Test.groovy"), new Position(0, 0)).get();
         Assertions.assertTrue(result.isLeft());
         Assertions.assertTrue(result.getLeft().isEmpty());

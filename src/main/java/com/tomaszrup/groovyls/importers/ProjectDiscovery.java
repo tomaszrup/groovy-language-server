@@ -102,73 +102,89 @@ public final class ProjectDiscovery {
      * @throws IOException if the walk fails
      */
     public static DiscoveryResult discoverAll(Path workspaceRoot, Set<String> enabledImporters) throws IOException {
-        boolean gradleEnabled = enabledImporters == null || enabledImporters.isEmpty()
-                || enabledImporters.contains("Gradle");
-        boolean mavenEnabled = enabledImporters == null || enabledImporters.isEmpty()
-                || enabledImporters.contains("Maven");
+        boolean gradleEnabled = isImporterEnabled(enabledImporters, "Gradle");
+        boolean mavenEnabled = isImporterEnabled(enabledImporters, "Maven");
 
-        List<Path> gradleProjects = new ArrayList<>();
-        List<Path> mavenProjects = new ArrayList<>();
-
-        // Use a FileVisitor so we can SKIP_SUBTREE for pruned directories
-        Files.walkFileTree(workspaceRoot, EnumSet.noneOf(FileVisitOption.class),
-            Integer.MAX_VALUE, new SimpleFileVisitor<Path>() {
-
-            @Override
-            public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
-                // Never prune the root itself
-                if (dir.equals(workspaceRoot)) {
-                    return FileVisitResult.CONTINUE;
-                }
-                String dirName = dir.getFileName().toString();
-                // Skip hidden directories (except .gradle which is already in PRUNED_DIRS)
-                if (dirName.startsWith(".") || PRUNED_DIRS.contains(dirName.toLowerCase())) {
-                    return FileVisitResult.SKIP_SUBTREE;
-                }
-                return FileVisitResult.CONTINUE;
-            }
-
-            @Override
-            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
-                if (!attrs.isRegularFile()) {
-                    return FileVisitResult.CONTINUE;
-                }
-                String fileName = file.getFileName().toString();
-                if (!BUILD_FILE_NAMES.contains(fileName)) {
-                    return FileVisitResult.CONTINUE;
-                }
-
-                Path projectDir = file.getParent();
-                if (projectDir == null) {
-                    return FileVisitResult.CONTINUE;
-                }
-
-                if (!isJvmProject(projectDir)) {
-                    return FileVisitResult.CONTINUE;
-                }
-
-                if (gradleEnabled && ("build.gradle".equals(fileName)
-                        || "build.gradle.kts".equals(fileName))) {
-                    gradleProjects.add(projectDir);
-                } else if (mavenEnabled && "pom.xml".equals(fileName)) {
-                    mavenProjects.add(projectDir);
-                }
-
-                return FileVisitResult.CONTINUE;
-            }
-
-            @Override
-            public FileVisitResult visitFileFailed(Path file, IOException exc) {
-                // Log and skip inaccessible files/directories
-                logger.debug("Cannot access {}: {}", file, exc.getMessage());
-                return FileVisitResult.CONTINUE;
-            }
-        });
+        DiscoveryVisitor visitor = new DiscoveryVisitor(workspaceRoot, gradleEnabled, mavenEnabled);
+        Files.walkFileTree(workspaceRoot, EnumSet.noneOf(FileVisitOption.class), Integer.MAX_VALUE, visitor);
+        DiscoveryResult result = visitor.toResult();
 
         logger.info("Unified discovery: {} Gradle project(s), {} Maven project(s) in {}",
-                gradleProjects.size(), mavenProjects.size(), workspaceRoot);
+                result.gradleProjects.size(), result.mavenProjects.size(), workspaceRoot);
 
-        return new DiscoveryResult(gradleProjects, mavenProjects);
+        return result;
+    }
+
+    private static boolean isImporterEnabled(Set<String> enabledImporters, String importerName) {
+        return enabledImporters == null
+                || enabledImporters.isEmpty()
+                || enabledImporters.contains(importerName);
+    }
+
+    private static final class DiscoveryVisitor extends SimpleFileVisitor<Path> {
+        private final Path workspaceRoot;
+        private final boolean gradleEnabled;
+        private final boolean mavenEnabled;
+        private final List<Path> gradleProjects = new ArrayList<>();
+        private final List<Path> mavenProjects = new ArrayList<>();
+
+        private DiscoveryVisitor(Path workspaceRoot, boolean gradleEnabled, boolean mavenEnabled) {
+            this.workspaceRoot = workspaceRoot;
+            this.gradleEnabled = gradleEnabled;
+            this.mavenEnabled = mavenEnabled;
+        }
+
+        @Override
+        public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
+            if (dir.equals(workspaceRoot)) {
+                return FileVisitResult.CONTINUE;
+            }
+            String dirName = dir.getFileName().toString();
+            if (dirName.startsWith(".") || PRUNED_DIRS.contains(dirName.toLowerCase())) {
+                return FileVisitResult.SKIP_SUBTREE;
+            }
+            return FileVisitResult.CONTINUE;
+        }
+
+        @Override
+        public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+            if (attrs.isRegularFile()) {
+                addDiscoveredProject(file);
+            }
+            return FileVisitResult.CONTINUE;
+        }
+
+        private void addDiscoveredProject(Path buildFile) {
+            String fileName = buildFile.getFileName().toString();
+            if (!BUILD_FILE_NAMES.contains(fileName)) {
+                return;
+            }
+
+            Path projectDir = buildFile.getParent();
+            if (projectDir == null || !isJvmProject(projectDir)) {
+                return;
+            }
+
+            if (isGradleBuildFile(fileName) && gradleEnabled) {
+                gradleProjects.add(projectDir);
+            } else if ("pom.xml".equals(fileName) && mavenEnabled) {
+                mavenProjects.add(projectDir);
+            }
+        }
+
+        private boolean isGradleBuildFile(String fileName) {
+            return "build.gradle".equals(fileName) || "build.gradle.kts".equals(fileName);
+        }
+
+        @Override
+        public FileVisitResult visitFileFailed(Path file, IOException exc) {
+            logger.debug("Cannot access {}: {}", file, exc.getMessage());
+            return FileVisitResult.CONTINUE;
+        }
+
+        private DiscoveryResult toResult() {
+            return new DiscoveryResult(gradleProjects, mavenProjects);
+        }
     }
 
     /**

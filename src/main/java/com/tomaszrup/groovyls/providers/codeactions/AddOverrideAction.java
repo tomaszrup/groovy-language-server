@@ -48,6 +48,10 @@ import com.tomaszrup.groovyls.util.GroovyLanguageServerUtils;
  */
 public class AddOverrideAction {
 
+    private static final String JAVA_LANG_OBJECT = "java.lang.Object";
+    private static final String JAVA_LANG_OVERRIDE = "java.lang.Override";
+    private static final String OVERRIDE_SIMPLE_NAME = "Override";
+
     private ASTNodeVisitor ast;
     private FileContentsTracker fileContentsTracker;
 
@@ -106,8 +110,8 @@ public class AddOverrideAction {
 
     private boolean hasOverrideAnnotation(MethodNode method) {
         for (AnnotationNode annotation : method.getAnnotations()) {
-            if (annotation.getClassNode().getName().equals("java.lang.Override")
-                    || annotation.getClassNode().getNameWithoutPackage().equals("Override")) {
+            if (annotation.getClassNode().getName().equals(JAVA_LANG_OVERRIDE)
+                    || annotation.getClassNode().getNameWithoutPackage().equals(OVERRIDE_SIMPLE_NAME)) {
                 return true;
             }
         }
@@ -117,39 +121,48 @@ public class AddOverrideAction {
     private boolean overridesParentMethod(ClassNode classNode, MethodNode method) {
         String methodName = method.getName();
         Parameter[] params = method.getParameters();
-
-        // Check superclass chain
-        ClassNode superClass = null;
-        try {
-            superClass = classNode.getSuperClass();
-        } catch (NoClassDefFoundError e) {
-            // ignore
+        if (overridesInSuperClasses(classNode, methodName, params)) {
+            return true;
         }
-        while (superClass != null && !superClass.getName().equals("java.lang.Object")) {
-            for (MethodNode superMethod : superClass.getMethods()) {
-                if (superMethod.getName().equals(methodName)
-                        && parametersMatch(superMethod.getParameters(), params)) {
-                    return true;
-                }
-            }
-            try {
-                superClass = superClass.getSuperClass();
-            } catch (NoClassDefFoundError e) {
-                break;
-            }
-        }
+        return overridesInInterfaces(classNode, methodName, params);
+    }
 
-        // Check interfaces
-        for (ClassNode iface : classNode.getAllInterfaces()) {
-            for (MethodNode ifaceMethod : iface.getMethods()) {
-                if (ifaceMethod.getName().equals(methodName)
-                        && parametersMatch(ifaceMethod.getParameters(), params)) {
-                    return true;
-                }
+    private boolean overridesInSuperClasses(ClassNode classNode, String methodName, Parameter[] params) {
+        ClassNode superClass = safeGetSuperClass(classNode);
+        while (superClass != null && !JAVA_LANG_OBJECT.equals(superClass.getName())) {
+            if (hasMatchingMethod(superClass.getMethods(), methodName, params)) {
+                return true;
             }
+            superClass = safeGetSuperClass(superClass);
         }
-
         return false;
+    }
+
+    private boolean overridesInInterfaces(ClassNode classNode, String methodName, Parameter[] params) {
+        for (ClassNode iface : classNode.getAllInterfaces()) {
+            if (hasMatchingMethod(iface.getMethods(), methodName, params)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean hasMatchingMethod(List<MethodNode> methods, String methodName, Parameter[] params) {
+        for (MethodNode candidate : methods) {
+            if (candidate.getName().equals(methodName)
+                    && parametersMatch(candidate.getParameters(), params)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private ClassNode safeGetSuperClass(ClassNode classNode) {
+        try {
+            return classNode.getSuperClass();
+        } catch (NoClassDefFoundError e) {
+            return null;
+        }
     }
 
     private boolean parametersMatch(Parameter[] a, Parameter[] b) {
@@ -170,37 +183,10 @@ public class AddOverrideAction {
             return null;
         }
 
-        // Insert @Override before the method declaration
         int insertLine = methodRange.getStart().getLine();
         int insertCol = methodRange.getStart().getCharacter();
-
-        // Detect indentation character from the existing line
-        char indentChar = ' ';
-        if (fileContentsTracker != null) {
-            String contents = fileContentsTracker.getContents(uri);
-            if (contents != null) {
-                String[] lines = contents.split("\n", -1);
-                if (insertLine < lines.length) {
-                    String methodLine = lines[insertLine];
-                    for (int i = 0; i < methodLine.length(); i++) {
-                        if (methodLine.charAt(i) == '\t') {
-                            indentChar = '\t';
-                            break;
-                        } else if (methodLine.charAt(i) != ' ') {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Build indentation to match the method
-        StringBuilder indent = new StringBuilder();
-        for (int i = 0; i < insertCol; i++) {
-            indent.append(indentChar);
-        }
-
-        String annotationText = indent.toString() + "@Override\n";
+        char indentChar = detectIndentChar(uri, insertLine);
+        String annotationText = buildIndentation(insertCol, indentChar) + "@Override\n";
 
         TextEdit edit = new TextEdit(
                 new Range(new Position(insertLine, 0), new Position(insertLine, 0)),
@@ -213,5 +199,41 @@ public class AddOverrideAction {
         action.setKind(CodeActionKind.QuickFix);
         action.setEdit(workspaceEdit);
         return action;
+    }
+
+    private char detectIndentChar(URI uri, int insertLine) {
+        if (fileContentsTracker == null) {
+            return ' ';
+        }
+
+        String contents = fileContentsTracker.getContents(uri);
+        if (contents == null) {
+            return ' ';
+        }
+
+        String[] lines = contents.split("\n", -1);
+        if (insertLine >= lines.length) {
+            return ' ';
+        }
+
+        String methodLine = lines[insertLine];
+        for (int i = 0; i < methodLine.length(); i++) {
+            char current = methodLine.charAt(i);
+            if (current == '\t') {
+                return '\t';
+            }
+            if (current != ' ') {
+                return ' ';
+            }
+        }
+        return ' ';
+    }
+
+    private String buildIndentation(int indentWidth, char indentChar) {
+        StringBuilder indent = new StringBuilder();
+        for (int i = 0; i < indentWidth; i++) {
+            indent.append(indentChar);
+        }
+        return indent.toString();
     }
 }

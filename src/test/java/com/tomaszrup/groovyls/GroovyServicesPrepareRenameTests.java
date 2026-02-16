@@ -39,6 +39,7 @@ import org.junit.jupiter.api.Test;
 
 import com.tomaszrup.groovyls.config.CompilationUnitFactory;
 
+@SuppressWarnings("all")
 class GroovyServicesPrepareRenameTests {
 	private static final String LANGUAGE_GROOVY = "groovy";
 	private static final String PATH_WORKSPACE = "./build/test_workspace/";

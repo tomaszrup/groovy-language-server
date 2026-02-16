@@ -55,6 +55,9 @@ public class ClasspathCache {
 
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 
+    private ClasspathCache() {
+    }
+
     /**
      * Build file names whose modification is tracked for cache validation.
      * {@code gradle.lockfile} is intentionally excluded — it is a build
@@ -78,11 +81,11 @@ public class ClasspathCache {
      */
     public static class ProjectCacheEntry {
         /** Build-file stamps for this project only (key → stamp). */
-        public Map<String, String> stamps;
+        Map<String, String> stamps;
         /** Resolved classpath entries for this project. */
-        public List<String> classpath;
+        List<String> classpath;
         /** Detected Groovy dependency version for this project, if known. */
-        public String groovyVersion;
+        String groovyVersion;
 
         public ProjectCacheEntry() {}
 
@@ -100,33 +103,33 @@ public class ClasspathCache {
 
     /** JSON-serializable cache entry. */
     public static class CacheData {
-        public int version;
-        public long timestamp;
+        int version;
+        long timestamp;
         /**
          * <b>v2 (legacy):</b> global build-file stamps. Retained for
          * backward-compatible loading; new caches use per-project stamps
          * inside {@link #projects}.
          */
-        public Map<String, String> buildFileHashes;
+        Map<String, String> buildFileHashes;
         /**
          * <b>v2 (legacy):</b> global classpath map. Retained for
          * backward-compatible loading; new caches use per-project entries
          * inside {@link #projects}.
          */
-        public Map<String, List<String>> classpaths;
+        Map<String, List<String>> classpaths;
         /**
          * <b>v3:</b> Per-project cache entries keyed by normalised absolute
          * project root path. Each entry contains its own build-file stamps
          * and classpath so validation and invalidation are per-project.
          */
-        public Map<String, ProjectCacheEntry> projects;
+        Map<String, ProjectCacheEntry> projects;
         /**
          * Discovered project root paths (absolute, normalised).  Persisted so
          * that the expensive {@code Files.walk()} discovery phase can be
          * skipped on subsequent starts when the cache is valid.
          * May be {@code null} for caches created before this field was added.
          */
-        public List<String> discoveredProjects;
+        List<String> discoveredProjects;
     }
 
     // ---- Public API ----
@@ -263,22 +266,7 @@ public class ClasspathCache {
             Files.createDirectories(cacheFile.getParent());
 
             // Load existing cache (or start fresh)
-            CacheData data;
-            if (Files.isRegularFile(cacheFile)) {
-                try (Reader reader = Files.newBufferedReader(cacheFile, StandardCharsets.UTF_8)) {
-                    data = GSON.fromJson(reader, CacheData.class);
-                    if (data == null || data.version != CACHE_VERSION) {
-                        data = new CacheData();
-                        data.version = CACHE_VERSION;
-                    }
-                } catch (Exception e) {
-                    data = new CacheData();
-                    data.version = CACHE_VERSION;
-                }
-            } else {
-                data = new CacheData();
-                data.version = CACHE_VERSION;
-            }
+            CacheData data = loadOrCreateCacheData(cacheFile);
             data.timestamp = System.currentTimeMillis();
 
             if (data.projects == null) {
@@ -321,6 +309,24 @@ public class ClasspathCache {
         } catch (IOException e) {
             logger.warn("Failed to merge classpath cache for {}: {}", projectRoot, e.getMessage());
         }
+    }
+
+    private static CacheData loadOrCreateCacheData(Path cacheFile) {
+        if (!Files.isRegularFile(cacheFile)) {
+            return newCacheData();
+        }
+        try (Reader reader = Files.newBufferedReader(cacheFile, StandardCharsets.UTF_8)) {
+            CacheData data = GSON.fromJson(reader, CacheData.class);
+            return (data != null && data.version == CACHE_VERSION) ? data : newCacheData();
+        } catch (IOException | RuntimeException e) {
+            return newCacheData();
+        }
+    }
+
+    private static CacheData newCacheData() {
+        CacheData data = new CacheData();
+        data.version = CACHE_VERSION;
+        return data;
     }
 
     /**
@@ -441,30 +447,44 @@ public class ClasspathCache {
             return true; // nothing to validate
         }
 
-        for (Map.Entry<String, List<String>> entry : cached.classpaths.entrySet()) {
-            List<String> cpEntries = entry.getValue();
-            if (cpEntries == null || cpEntries.isEmpty()) {
-                continue;
-            }
-            int toCheck = sampleSize > 0 ? Math.min(sampleSize, cpEntries.size()) : cpEntries.size();
-            int missing = 0;
-            for (int i = 0; i < toCheck; i++) {
-                Path p = Paths.get(cpEntries.get(i));
-                if (!Files.exists(p)) {
-                    missing++;
-                }
-            }
-            // If more than half the sampled entries are missing, the cache
-            // is almost certainly stale (e.g. after `gradle clean`).
-            if (missing > 0 && missing > toCheck / 2) {
-                logger.info("Classpath cache stale: {}/{} sampled entries missing in project {}",
-                        missing, toCheck, entry.getKey());
-                return false;
-            }
-            // Only need to check the first project with classpath data
-            break;
+        Map.Entry<String, List<String>> firstProject = findFirstProjectWithClasspath(cached.classpaths);
+        if (firstProject == null) {
+            return true;
+        }
+
+        int toCheck = determineSampleCount(firstProject.getValue(), sampleSize);
+        int missing = countMissingClasspathEntries(firstProject.getValue(), toCheck);
+        if (missing > 0 && missing > toCheck / 2) {
+            logger.info("Classpath cache stale: {}/{} sampled entries missing in project {}",
+                    missing, toCheck, firstProject.getKey());
+            return false;
         }
         return true;
+    }
+
+    private static Map.Entry<String, List<String>> findFirstProjectWithClasspath(Map<String, List<String>> classpaths) {
+        for (Map.Entry<String, List<String>> entry : classpaths.entrySet()) {
+            List<String> cpEntries = entry.getValue();
+            if (cpEntries != null && !cpEntries.isEmpty()) {
+                return entry;
+            }
+        }
+        return null;
+    }
+
+    private static int determineSampleCount(List<String> cpEntries, int sampleSize) {
+        return sampleSize > 0 ? Math.min(sampleSize, cpEntries.size()) : cpEntries.size();
+    }
+
+    private static int countMissingClasspathEntries(List<String> cpEntries, int toCheck) {
+        int missing = 0;
+        for (int i = 0; i < toCheck; i++) {
+            Path path = Paths.get(cpEntries.get(i));
+            if (!Files.exists(path)) {
+                missing++;
+            }
+        }
+        return missing;
     }
 
     /**
@@ -499,10 +519,9 @@ public class ClasspathCache {
     }
 
     /**
-     * @deprecated Use {@link #computeBuildFileStamps(Collection)} instead.
-     *             Retained for backward compatibility with existing tests.
+     * Compatibility alias for {@link #computeBuildFileStamps(Collection)}.
+     * Retained for backward compatibility with existing tests.
      */
-    @Deprecated
     public static Map<String, String> computeBuildFileHashes(Collection<Path> projectRoots) {
         return computeBuildFileStamps(projectRoots);
     }
@@ -589,7 +608,7 @@ public class ClasspathCache {
             return sb.toString();
         } catch (NoSuchAlgorithmException e) {
             // SHA-256 is guaranteed by the Java spec — should never happen
-            throw new RuntimeException(e);
+            throw new IllegalStateException("SHA-256 algorithm unavailable", e);
         }
     }
 }

@@ -150,8 +150,7 @@ class FileChangeHandlerTests {
 				Collections.singletonList(
 						new FileEvent(groovyFile.toUri().toString(), FileChangeType.Changed)));
 
-		// Should not throw
-		handler.handleDidChangeWatchedFiles(params);
+		Assertions.assertDoesNotThrow(() -> handler.handleDidChangeWatchedFiles(params));
 	}
 
 	// --- handleDidChangeWatchedFiles with project scopes ---
@@ -171,8 +170,7 @@ class FileChangeHandlerTests {
 				Collections.singletonList(
 						new FileEvent(srcDir.resolve("App.groovy").toUri().toString(), FileChangeType.Changed)));
 
-		// Should not throw
-		handler.handleDidChangeWatchedFiles(params);
+		Assertions.assertDoesNotThrow(() -> handler.handleDidChangeWatchedFiles(params));
 	}
 
 	@Test
@@ -189,8 +187,7 @@ class FileChangeHandlerTests {
 				Collections.singletonList(
 						new FileEvent(srcDir.resolve("Helper.java").toUri().toString(), FileChangeType.Changed)));
 
-		// Should schedule a debounced Java recompile, not throw
-		handler.handleDidChangeWatchedFiles(params);
+		Assertions.assertDoesNotThrow(() -> handler.handleDidChangeWatchedFiles(params));
 	}
 
 	@Test
@@ -207,8 +204,7 @@ class FileChangeHandlerTests {
 						new FileEvent(projectRoot.resolve("build.gradle").toUri().toString(),
 								FileChangeType.Changed)));
 
-		// Should schedule a debounced recompile for build-file change
-		handler.handleDidChangeWatchedFiles(params);
+		Assertions.assertDoesNotThrow(() -> handler.handleDidChangeWatchedFiles(params));
 	}
 
 	@Test
@@ -226,8 +222,7 @@ class FileChangeHandlerTests {
 						new FileEvent(srcDir.resolve("Unresolved.groovy").toUri().toString(),
 								FileChangeType.Changed)));
 
-		// Should skip compilation for unresolved scope, not throw
-		handler.handleDidChangeWatchedFiles(params);
+		Assertions.assertDoesNotThrow(() -> handler.handleDidChangeWatchedFiles(params));
 	}
 
 	// --- setJavaChangeListener ---
@@ -235,8 +230,8 @@ class FileChangeHandlerTests {
 	@Test
 	void testSetJavaChangeListener() {
 		boolean[] called = { false };
-		handler.setJavaChangeListener(root -> called[0] = true);
-		// Just verifies no exception
+		Assertions.assertDoesNotThrow(() -> handler.setJavaChangeListener(root -> called[0] = true));
+		Assertions.assertFalse(called[0]);
 	}
 
 	// --- Empty params ---
@@ -244,7 +239,6 @@ class FileChangeHandlerTests {
 	@Test
 	void testHandleDidChangeWatchedFilesEmptyParams() {
 		DidChangeWatchedFilesParams params = new DidChangeWatchedFilesParams(Collections.emptyList());
-		// Should be a no-op
-		handler.handleDidChangeWatchedFiles(params);
+		Assertions.assertDoesNotThrow(() -> handler.handleDidChangeWatchedFiles(params));
 	}
 }

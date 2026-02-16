@@ -53,7 +53,7 @@ class CompilationOrchestratorTests {
 		tracker.setContents(TEST_URI, source);
 
 		String original = orchestrator.injectCompletionPlaceholder(
-				new ASTNodeVisitor(), tracker, TEST_URI, new Position(2, 4));
+				tracker, TEST_URI, new Position(2, 4));
 
 		Assertions.assertNotNull(original);
 		Assertions.assertEquals(source, original);
@@ -72,7 +72,7 @@ class CompilationOrchestratorTests {
 		tracker.setContents(TEST_URI, source);
 
 		String original = orchestrator.injectCompletionPlaceholder(
-				new ASTNodeVisitor(), tracker, TEST_URI, new Position(2, 11));
+				tracker, TEST_URI, new Position(2, 11));
 
 		Assertions.assertNotNull(original);
 		String modified = tracker.getContents(TEST_URI);
@@ -85,7 +85,7 @@ class CompilationOrchestratorTests {
 	void testInjectCompletionPlaceholderNullSource() {
 		// No contents set for the URI
 		String result = orchestrator.injectCompletionPlaceholder(
-				new ASTNodeVisitor(), tracker, TEST_URI, new Position(0, 0));
+				tracker, TEST_URI, new Position(0, 0));
 		Assertions.assertNull(result);
 	}
 
@@ -94,7 +94,7 @@ class CompilationOrchestratorTests {
 		tracker.setContents(TEST_URI, "hi");
 
 		String result = orchestrator.injectCompletionPlaceholder(
-				new ASTNodeVisitor(), tracker, TEST_URI, new Position(99, 0));
+				tracker, TEST_URI, new Position(99, 0));
 		// Should return null for invalid offset
 		Assertions.assertNull(result);
 	}

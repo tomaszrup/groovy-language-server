@@ -44,9 +44,7 @@ class ProjectDiscoveryTests {
         if (tempDir != null && Files.exists(tempDir)) {
             Files.walk(tempDir)
                     .sorted(Comparator.reverseOrder())
-                    .forEach(p -> {
-                        try { Files.deleteIfExists(p); } catch (IOException ignored) {}
-                    });
+                    .forEach(this::deletePathQuietly);
         }
     }
 
@@ -257,31 +255,12 @@ class ProjectDiscoveryTests {
     // --- isJvmProject ---
 
     @Test
-    void testIsJvmProjectWithMainJava() throws IOException {
-        Path project = tempDir.resolve("project");
-        Files.createDirectories(project.resolve("src/main/java"));
-        Assertions.assertTrue(ProjectDiscovery.isJvmProject(project));
-    }
-
-    @Test
-    void testIsJvmProjectWithMainGroovy() throws IOException {
-        Path project = tempDir.resolve("project");
-        Files.createDirectories(project.resolve("src/main/groovy"));
-        Assertions.assertTrue(ProjectDiscovery.isJvmProject(project));
-    }
-
-    @Test
-    void testIsJvmProjectWithTestJava() throws IOException {
-        Path project = tempDir.resolve("project");
-        Files.createDirectories(project.resolve("src/test/java"));
-        Assertions.assertTrue(ProjectDiscovery.isJvmProject(project));
-    }
-
-    @Test
-    void testIsJvmProjectWithTestGroovy() throws IOException {
-        Path project = tempDir.resolve("project");
-        Files.createDirectories(project.resolve("src/test/groovy"));
-        Assertions.assertTrue(ProjectDiscovery.isJvmProject(project));
+    void testIsJvmProjectWithSourceDir() throws IOException {
+        for (String sourceDir : new String[] {"src/main/java", "src/main/groovy", "src/test/java", "src/test/groovy"}) {
+            Path project = tempDir.resolve("project-" + sourceDir.replace('/', '-'));
+            Files.createDirectories(project.resolve(sourceDir));
+            Assertions.assertTrue(ProjectDiscovery.isJvmProject(project));
+        }
     }
 
     @Test
@@ -289,5 +268,13 @@ class ProjectDiscoveryTests {
         Path project = tempDir.resolve("project");
         Files.createDirectories(project);
         Assertions.assertFalse(ProjectDiscovery.isJvmProject(project));
+    }
+
+    private void deletePathQuietly(Path path) {
+        try {
+            Files.deleteIfExists(path);
+        } catch (IOException ignored) {
+            // best-effort cleanup for temporary test files
+        }
     }
 }

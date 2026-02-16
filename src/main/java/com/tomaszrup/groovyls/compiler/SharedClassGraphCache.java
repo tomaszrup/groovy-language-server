@@ -23,14 +23,11 @@ import java.io.File;
 import java.io.IOException;
 import java.lang.ref.SoftReference;
 import java.net.URL;
-import java.net.URLClassLoader;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.net.URISyntaxException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -40,6 +37,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 
 import groovy.lang.GroovyClassLoader;
 import io.github.classgraph.ClassGraph;
@@ -183,8 +181,8 @@ public class SharedClassGraphCache {
 	 * {@code groovy.memory.rejectedPackages}. Defaults to
 	 * {@link #DEFAULT_ADDITIONAL_REJECTED_PACKAGES}.
 	 */
-	private volatile List<String> additionalRejectedPackages =
-			DEFAULT_ADDITIONAL_REJECTED_PACKAGES;
+	private final AtomicReference<List<String>> additionalRejectedPackages =
+			new AtomicReference<>(DEFAULT_ADDITIONAL_REJECTED_PACKAGES);
 
 	/**
 	 * Set the list of additional public JDK packages to reject from
@@ -204,17 +202,18 @@ public class SharedClassGraphCache {
 	 *                 {@code "javax.swing"}, {@code "java.awt"})
 	 */
 	public void setAdditionalRejectedPackages(List<String> packages) {
-		this.additionalRejectedPackages = packages != null
+		List<String> updated = packages != null
 				? Collections.unmodifiableList(new ArrayList<>(packages))
 				: DEFAULT_ADDITIONAL_REJECTED_PACKAGES;
-		logger.info("ClassGraph additional rejected packages: {}", this.additionalRejectedPackages);
+		this.additionalRejectedPackages.set(updated);
+		logger.info("ClassGraph additional rejected packages: {}", updated);
 	}
 
 	/**
 	 * Returns the merged array of all rejected packages (base + additional).
 	 */
 	private String[] getMergedRejectedPackages() {
-		List<String> additional = this.additionalRejectedPackages;
+		List<String> additional = this.additionalRejectedPackages.get();
 		String[] merged = new String[BASE_REJECTED_PACKAGES.length + additional.size()];
 		System.arraycopy(BASE_REJECTED_PACKAGES, 0, merged, 0, BASE_REJECTED_PACKAGES.length);
 		for (int i = 0; i < additional.size(); i++) {
@@ -266,14 +265,14 @@ public class SharedClassGraphCache {
 	}
 
 	static final class CacheEntry {
-		volatile SoftReference<ScanResult> scanResultRef;
+		private final AtomicReference<SoftReference<ScanResult>> scanResultRef;
 		final String classpathKey;
 		/** The sorted set of classpath URL strings for this entry. */
 		final Set<String> classpathUrls;
 		int refCount;
 
 		CacheEntry(ScanResult scanResult, String classpathKey, Set<String> classpathUrls) {
-			this.scanResultRef = new SoftReference<>(scanResult);
+			this.scanResultRef = new AtomicReference<>(new SoftReference<>(scanResult));
 			this.classpathKey = classpathKey;
 			this.classpathUrls = classpathUrls;
 			this.refCount = 1;
@@ -284,14 +283,22 @@ public class SharedClassGraphCache {
 		 * the soft reference.
 		 */
 		ScanResult get() {
-			return scanResultRef.get();
+			SoftReference<ScanResult> reference = scanResultRef.get();
+			return reference != null ? reference.get() : null;
 		}
 
 		/**
 		 * Replace the scan result (e.g. after re-loading from disk).
 		 */
 		void set(ScanResult scanResult) {
-			this.scanResultRef = new SoftReference<>(scanResult);
+			this.scanResultRef.set(new SoftReference<>(scanResult));
+		}
+
+		void clearReference() {
+			SoftReference<ScanResult> reference = scanResultRef.get();
+			if (reference != null) {
+				reference.clear();
+			}
 		}
 	}
 
@@ -305,12 +312,16 @@ public class SharedClassGraphCache {
 	private long scanBuilds;
 	private long budgetRejects;
 
+	private static final long BYTES_PER_MB = 1024L * 1024L;
+
 	/**
 	 * Reverse lookup: ScanResult identity → cache key.  Needed so that
 	 * {@link #release(ScanResult)} can find the entry without the caller
 	 * having to remember the key.
 	 */
 	private final ConcurrentHashMap<ScanResult, String> reverseIndex = new ConcurrentHashMap<>();
+
+	private final ClassGraphDiskCache diskCache = new ClassGraphDiskCache();
 
 	// Package-private for testing
 	SharedClassGraphCache() {
@@ -362,45 +373,24 @@ public class SharedClassGraphCache {
 		acquireRequests++;
 		String key = computeClasspathKey(classLoader);
 		Set<String> requestedUrls = extractUrlSet(classLoader);
+		String shortKey = ClassGraphDiskCache.abbreviateKey(key);
 
 		logger.info("SharedClassGraphCache acquireWithResult: {} URLs from classloader, "
 				+ "cache has {} entries, key={}…",
 				requestedUrls.size(), cache.size(),
-				key.substring(0, Math.min(12, key.length())));
+				shortKey);
 
 		// --- Exact cache hit ---
 		CacheEntry entry = cache.get(key);
 		if (entry != null) {
-			ScanResult existing = entry.get();
-			if (existing != null) {
-				exactHits++;
-				entry.refCount++;
-				logger.debug("SharedClassGraphCache HIT for key {}… (refCount={}), cache size={}",
-						key.substring(0, Math.min(12, key.length())), entry.refCount, cache.size());
-				return new AcquireResult(existing, null, false);
+			AcquireResult exactHit = tryAcquireExactEntry(entry, key, shortKey);
+			if (exactHit != null) {
+				return exactHit;
 			}
-			// SoftReference was cleared by GC — reload from disk or rescan
-			logger.info("SharedClassGraphCache: SoftReference cleared for key {}… — reloading",
-					key.substring(0, Math.min(12, key.length())));
-			reverseIndex.values().remove(key);
-			ScanResult reloaded = loadFromDisk(key);
-			if (reloaded != null) {
-				diskHits++;
-				entry.set(reloaded);
-				entry.refCount++;
-				reverseIndex.put(reloaded, key);
-				logger.info("SharedClassGraphCache: reloaded from disk for key {}…",
-						key.substring(0, Math.min(12, key.length())));
-				return new AcquireResult(reloaded, null, false);
-			}
-			// Disk cache also missing — need full rescan
-			cache.remove(key);
-			logger.info("SharedClassGraphCache: disk cache miss for key {}… — full rescan needed",
-					key.substring(0, Math.min(12, key.length())));
 		}
 
 		// --- Similarity-based sharing: check existing entries ---
-		AcquireResult supersetHit = findSupersetEntry(requestedUrls, classLoader);
+		AcquireResult supersetHit = findSupersetEntry(requestedUrls);
 		if (supersetHit != null) {
 			overlapHits++;
 			return supersetHit;
@@ -408,12 +398,12 @@ public class SharedClassGraphCache {
 
 		// --- Try loading from disk cache ---
 		long loadStart = System.currentTimeMillis();
-		ScanResult scanResult = loadFromDisk(key);
+		ScanResult scanResult = diskCache.loadFromDisk(key);
 		if (scanResult != null) {
 			diskHits++;
 			long loadElapsed = System.currentTimeMillis() - loadStart;
 			logger.info("SharedClassGraphCache DISK HIT for key {}… ({}ms)",
-					key.substring(0, Math.min(12, key.length())), loadElapsed);
+					shortKey, loadElapsed);
 			entry = new CacheEntry(scanResult, key, requestedUrls);
 			cache.put(key, entry);
 			reverseIndex.put(scanResult, key);
@@ -422,7 +412,7 @@ public class SharedClassGraphCache {
 
 		// --- Cache miss — perform full scan ---
 		logger.debug("SharedClassGraphCache MISS for key {}… — scanning classpath ({} URLs)",
-				key.substring(0, Math.min(12, key.length())), classLoader.getURLs().length);
+				shortKey, classLoader.getURLs().length);
 
 		// Before scanning, enforce the held-entries limit by evicting
 		// zero-refcount entries.  This caps total ClassGraph memory.
@@ -430,7 +420,7 @@ public class SharedClassGraphCache {
 		if (isOverAdmissionBudget(classLoader, key)) {
 			budgetRejects++;
 			logger.warn("ClassGraph scan budget exceeded for key {}… but continuing scan to preserve usability",
-					key.substring(0, Math.min(12, key.length())));
+					shortKey);
 		}
 
 		try {
@@ -452,7 +442,7 @@ public class SharedClassGraphCache {
 			logger.debug("SharedClassGraphCache stored new entry, cache size={}", cache.size());
 
 			// Persist to disk for future server starts
-			saveToDisk(key, scanResult);
+			diskCache.saveToDisk(key, scanResult);
 
 			return new AcquireResult(scanResult, null, false);
 		} catch (ClassGraphException e) {
@@ -461,16 +451,42 @@ public class SharedClassGraphCache {
 		} catch (VirtualMachineError e) {
 			logger.error("VirtualMachineError during ClassGraph scan ({} URLs): {}",
 					classLoader.getURLs().length, e.toString());
-			// Attempt to free memory before propagating
-			try { System.gc(); } catch (Throwable ignored) { }
 			return null;
 		}
 	}
 
+	private AcquireResult tryAcquireExactEntry(CacheEntry entry, String key, String shortKey) {
+		ScanResult existing = entry.get();
+		if (existing != null) {
+			exactHits++;
+			entry.refCount++;
+			logger.debug("SharedClassGraphCache HIT for key {}… (refCount={}), cache size={}",
+					shortKey, entry.refCount, cache.size());
+			return new AcquireResult(existing, null, false);
+		}
+
+		logger.info("SharedClassGraphCache: SoftReference cleared for key {}… — reloading", shortKey);
+		reverseIndex.values().remove(key);
+		ScanResult reloaded = diskCache.loadFromDisk(key);
+		if (reloaded != null) {
+			diskHits++;
+			entry.set(reloaded);
+			entry.refCount++;
+			reverseIndex.put(reloaded, key);
+			logger.info("SharedClassGraphCache: reloaded from disk for key {}…", shortKey);
+			return new AcquireResult(reloaded, null, false);
+		}
+
+		cache.remove(key);
+		logger.info("SharedClassGraphCache: disk cache miss for key {}… — full rescan needed", shortKey);
+		return null;
+	}
+
 	private boolean isOverAdmissionBudget(GroovyClassLoader classLoader, String key) {
+		String shortKey = ClassGraphDiskCache.abbreviateKey(key);
 		if (cache.size() >= MAX_HELD_SCANS) {
 			logger.warn("ClassGraph scan budget pressure for key {}…: entry count {} at/above configured limit {}",
-					key.substring(0, Math.min(12, key.length())), cache.size(), MAX_HELD_SCANS);
+					shortKey, cache.size(), MAX_HELD_SCANS);
 			return true;
 		}
 
@@ -479,10 +495,10 @@ public class SharedClassGraphCache {
 		if (estimatedBytes >= budgetBytes) {
 			logger.warn("ClassGraph scan budget pressure for key {}…: estimated usage {} MB exceeds budget {} MB "
 					+ "(maxHeap={} MB, urls={})",
-					key.substring(0, Math.min(12, key.length())),
-					estimatedBytes / (1024 * 1024),
-					budgetBytes / (1024 * 1024),
-					Runtime.getRuntime().maxMemory() / (1024 * 1024),
+					shortKey,
+					estimatedBytes / BYTES_PER_MB,
+					budgetBytes / BYTES_PER_MB,
+					Runtime.getRuntime().maxMemory() / BYTES_PER_MB,
 					classLoader.getURLs().length);
 			return true;
 		}
@@ -510,7 +526,7 @@ public class SharedClassGraphCache {
 	 *
 	 * <p><b>Must be called while holding the synchronized lock.</b></p>
 	 */
-	private AcquireResult findSupersetEntry(Set<String> requestedUrls, GroovyClassLoader classLoader) {
+	private AcquireResult findSupersetEntry(Set<String> requestedUrls) {
 		if (requestedUrls.isEmpty()) {
 			return null;
 		}
@@ -520,28 +536,17 @@ public class SharedClassGraphCache {
 		int bestMatchCount = 0;
 
 		for (CacheEntry candidate : cache.values()) {
-			ScanResult sr = candidate.get();
-			if (sr == null) continue;
 			Set<String> cachedUrls = candidate.classpathUrls;
-			if (cachedUrls == null || cachedUrls.isEmpty()) continue;
+			if (candidate.get() != null && cachedUrls != null && !cachedUrls.isEmpty()) {
+				int matchCount = ClassGraphDiskCache.countMatches(requestedUrls, cachedUrls);
+				double overlap = (double) matchCount / requestedUrls.size();
+				diskCache.logOverlapCheck(candidate, cachedUrls, requestedUrls, matchCount, overlap);
 
-			int matchCount = 0;
-			for (String url : requestedUrls) {
-				if (cachedUrls.contains(url)) matchCount++;
-			}
-			double overlap = (double) matchCount / requestedUrls.size();
-
-			logger.info("SharedClassGraphCache overlap check: {}/{} = {}% "
-					+ "(cached={} URLs [key={}…], requested={} URLs)",
-					matchCount, requestedUrls.size(), (int) (overlap * 100),
-					cachedUrls.size(),
-					candidate.classpathKey.substring(0, Math.min(8, candidate.classpathKey.length())),
-					requestedUrls.size());
-
-			if (overlap >= SUPERSET_OVERLAP_THRESHOLD && overlap > bestOverlap) {
-				bestCandidate = candidate;
-				bestOverlap = overlap;
-				bestMatchCount = matchCount;
+				if (overlap >= SUPERSET_OVERLAP_THRESHOLD && overlap > bestOverlap) {
+					bestCandidate = candidate;
+					bestOverlap = overlap;
+					bestMatchCount = matchCount;
+				}
 			}
 		}
 
@@ -589,13 +594,14 @@ public class SharedClassGraphCache {
 				java.net.URI uri = new java.net.URI(url);
 				File f = new File(uri);
 				files.add(f.getCanonicalFile());
-			} catch (Exception e) {
+			} catch (URISyntaxException | IOException | IllegalArgumentException e) {
 				// Skip URLs that can't be converted to files (e.g. jrt:/)
 				try {
 					// Try as a plain path
 					files.add(new File(url).getCanonicalFile());
-				} catch (Exception ignored) {
-					// Skip entirely
+				} catch (IOException | SecurityException ignored) {
+					// Non-file URLs and inaccessible paths are intentionally skipped.
+					logger.debug("Failed to convert URL string to file: {}", url);
 				}
 			}
 		}
@@ -630,16 +636,17 @@ public class SharedClassGraphCache {
 			return;
 		}
 		entry.refCount--;
+		String shortKey = ClassGraphDiskCache.abbreviateKey(key);
 		logger.debug("SharedClassGraphCache release() for key {}… (refCount={})",
-				key.substring(0, Math.min(12, key.length())), entry.refCount);
+				shortKey, entry.refCount);
 		if (entry.refCount <= 0) {
 			cache.remove(key);
 			reverseIndex.remove(scanResult);
 			// Clear the soft reference and close the scan result
-			entry.scanResultRef.clear();
+			entry.clearReference();
 			scanResult.close();
 			logger.debug("SharedClassGraphCache evicted entry for key {}…, cache size={}",
-					key.substring(0, Math.min(12, key.length())), cache.size());
+					shortKey, cache.size());
 		}
 	}
 
@@ -657,14 +664,15 @@ public class SharedClassGraphCache {
 			var entry = iterator.next();
 			CacheEntry ce = entry.getValue();
 			if (ce.refCount <= 0) {
+			String shortKey = ClassGraphDiskCache.abbreviateKey(ce.classpathKey);
 				logger.info("ClassGraph cache limit reached ({}/{}). "
 						+ "Evicting unused entry for key {}…",
 						cache.size(), MAX_HELD_SCANS,
-						ce.classpathKey.substring(0, Math.min(12, ce.classpathKey.length())));
+						shortKey);
 				ScanResult sr = ce.get();
 				if (sr != null) {
 					reverseIndex.remove(sr);
-					ce.scanResultRef.clear();
+					ce.clearReference();
 					sr.close();
 				}
 				iterator.remove();
@@ -701,7 +709,7 @@ public class SharedClassGraphCache {
 			sb.append(url).append('\n');
 		}
 		// Include rejected packages so changing the filter invalidates the cache
-		List<String> additional = this.additionalRejectedPackages;
+		List<String> additional = this.additionalRejectedPackages.get();
 		if (!additional.isEmpty()) {
 			sb.append("rejected:");
 			List<String> sorted = new ArrayList<>(additional);
@@ -725,7 +733,7 @@ public class SharedClassGraphCache {
 			return hex.toString();
 		} catch (NoSuchAlgorithmException e) {
 			// SHA-256 is guaranteed by the JVM spec — this cannot happen
-			throw new RuntimeException(e);
+			throw new IllegalStateException("SHA-256 digest algorithm is unavailable", e);
 		}
 	}
 
@@ -775,9 +783,9 @@ public class SharedClassGraphCache {
 					// ~6 KB per ClassInfo (type refs, method/field lists,
 					// annotations, generics, interned strings, index entries)
 					// + 2 MB base overhead for ClassGraph internal structures
-					total += 2L * 1024 * 1024 + (long) classCount * 6144;
-				} catch (Exception e) {
-					total += 2L * 1024 * 1024; // base only if ScanResult is closed
+					total += 2L * BYTES_PER_MB + (long) classCount * 6144;
+				} catch (RuntimeException e) {
+					total += 2L * BYTES_PER_MB; // base only if ScanResult is closed
 				}
 			}
 		}
@@ -810,7 +818,7 @@ public class SharedClassGraphCache {
 						String prefix = MemoryProfiler.truncatePackage(ci.getPackageName(), 2);
 						countsMap.merge(prefix, 1, Integer::sum);
 					}
-				} catch (Exception e) {
+				} catch (RuntimeException e) {
 					// ScanResult may have been closed
 				}
 			}
@@ -871,14 +879,10 @@ public class SharedClassGraphCache {
 	 */
 	public synchronized void clear() {
 		for (CacheEntry entry : cache.values()) {
-			try {
-				ScanResult sr = entry.get();
-				if (sr != null) {
-					entry.scanResultRef.clear();
-					sr.close();
-				}
-			} catch (Exception e) {
-				logger.debug("Error closing ScanResult during cache clear", e);
+			ScanResult sr = entry.get();
+			if (sr != null) {
+				entry.clearReference();
+				diskCache.closeScanResultQuietly(sr, "cache clear");
 			}
 		}
 		cache.clear();
@@ -904,155 +908,29 @@ public class SharedClassGraphCache {
 		if (projectRoot == null || cache.isEmpty()) {
 			return 0;
 		}
-		Path normalizedRoot = normalizePath(projectRoot);
+		Path normalizedRoot = ClassGraphDiskCache.normalizePath(projectRoot);
 		int removed = 0;
 		var iterator = cache.entrySet().iterator();
 		while (iterator.hasNext()) {
 			Map.Entry<String, CacheEntry> cacheEntry = iterator.next();
 			String cacheKey = cacheEntry.getKey();
 			CacheEntry entry = cacheEntry.getValue();
-			if (!containsPathUnderRoot(entry.classpathUrls, normalizedRoot)) {
+			if (!ClassGraphDiskCache.containsPathUnderRoot(entry.classpathUrls, normalizedRoot)) {
 				continue;
 			}
 			ScanResult sr = entry.get();
 			if (sr != null) {
 				reverseIndex.remove(sr);
-				entry.scanResultRef.clear();
-				try {
-					sr.close();
-				} catch (Exception e) {
-					logger.debug("Error closing ScanResult during targeted invalidation", e);
-				}
+				entry.clearReference();
+				diskCache.closeScanResultQuietly(sr, "targeted invalidation");
 			}
 			iterator.remove();
-			deleteDiskCacheEntry(cacheKey);
+			diskCache.deleteDiskCacheEntry(cacheKey);
 			removed++;
 		}
 		if (removed > 0) {
 			logger.info("SharedClassGraphCache invalidated {} entries for project {}", removed, normalizedRoot);
 		}
 		return removed;
-	}
-
-	private void deleteDiskCacheEntry(String classpathKey) {
-		if (classpathKey == null || classpathKey.isEmpty()) {
-			return;
-		}
-		Path cacheFile = getDiskCacheDir().resolve(classpathKey + ".json");
-		try {
-			Files.deleteIfExists(cacheFile);
-		} catch (IOException e) {
-			logger.debug("Failed to delete ClassGraph disk cache for key {}…: {}",
-					classpathKey.substring(0, Math.min(12, classpathKey.length())),
-					e.getMessage());
-		}
-	}
-
-	private static boolean containsPathUnderRoot(Set<String> urlStrings, Path projectRoot) {
-		if (urlStrings == null || urlStrings.isEmpty()) {
-			return false;
-		}
-		for (String url : urlStrings) {
-			Path candidate = toPath(url);
-			if (candidate != null && candidate.startsWith(projectRoot)) {
-				return true;
-			}
-		}
-		return false;
-	}
-
-	private static Path toPath(String url) {
-		if (url == null || url.isEmpty()) {
-			return null;
-		}
-		try {
-			java.net.URI uri = new java.net.URI(url);
-			if ("file".equalsIgnoreCase(uri.getScheme())) {
-				return normalizePath(Paths.get(uri));
-			}
-		} catch (Exception ignored) {
-		}
-		try {
-			return normalizePath(Paths.get(url));
-		} catch (Exception ignored) {
-			return null;
-		}
-	}
-
-	private static Path normalizePath(Path path) {
-		if (path == null) {
-			return null;
-		}
-		try {
-			return path.toRealPath();
-		} catch (IOException e) {
-			return path.toAbsolutePath().normalize();
-		}
-	}
-
-	// --- On-disk persistence ---
-
-	/**
-	 * Directory for persisted ClassGraph scan results.
-	 * Stored under {@code ~/.groovyls/cache/classgraph/}.
-	 */
-	private static Path getDiskCacheDir() {
-		String home = System.getProperty("user.home");
-		return Paths.get(home, ".groovyls", "cache", "classgraph");
-	}
-
-	/**
-	 * Load a previously cached scan result from disk.
-	 *
-	 * @param classpathKey the SHA-256 hash of the classpath
-	 * @return the deserialized {@link ScanResult}, or {@code null} if not found
-	 *         or corrupt
-	 */
-	private ScanResult loadFromDisk(String classpathKey) {
-		Path cacheFile = getDiskCacheDir().resolve(classpathKey + ".json");
-		if (!Files.isRegularFile(cacheFile)) {
-			return null;
-		}
-		try {
-			String json = Files.readString(cacheFile, StandardCharsets.UTF_8);
-			ScanResult result = ScanResult.fromJSON(json);
-			return result;
-		} catch (Exception e) {
-			logger.debug("Failed to load ClassGraph cache from disk for key {}…: {}",
-					classpathKey.substring(0, Math.min(12, classpathKey.length())),
-					e.getMessage());
-			// Delete corrupt cache file
-			try {
-				Files.deleteIfExists(cacheFile);
-			} catch (IOException ignored) {
-			}
-			return null;
-		}
-	}
-
-	/**
-	 * Persist a scan result to disk atomically (write-to-temp then rename).
-	 *
-	 * @param classpathKey the SHA-256 hash of the classpath
-	 * @param scanResult   the scan result to persist
-	 */
-	private void saveToDisk(String classpathKey, ScanResult scanResult) {
-		try {
-			Path cacheDir = getDiskCacheDir();
-			Files.createDirectories(cacheDir);
-			Path cacheFile = cacheDir.resolve(classpathKey + ".json");
-			Path tempFile = cacheDir.resolve(classpathKey + ".tmp");
-
-			String json = scanResult.toJSON();
-			Files.writeString(tempFile, json, StandardCharsets.UTF_8);
-			Files.move(tempFile, cacheFile, StandardCopyOption.REPLACE_EXISTING,
-					StandardCopyOption.ATOMIC_MOVE);
-			logger.debug("Persisted ClassGraph scan to disk for key {}…",
-					classpathKey.substring(0, Math.min(12, classpathKey.length())));
-		} catch (Exception e) {
-			logger.debug("Failed to persist ClassGraph scan to disk for key {}…: {}",
-					classpathKey.substring(0, Math.min(12, classpathKey.length())),
-					e.getMessage());
-		}
 	}
 }

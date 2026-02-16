@@ -49,6 +49,14 @@ import com.tomaszrup.groovyls.util.GroovyLanguageServerUtils;
  */
 public class GenerateGetterSetterAction {
 
+    private static final String BOOLEAN_TYPE = "boolean";
+    private static final String BOOLEAN_WRAPPER_TYPE = "Boolean";
+    private static final String DOLLAR_PREFIX = "$";
+    private static final String DOUBLE_UNDERSCORE_PREFIX = "__";
+    private static final String GET_PREFIX = "get";
+    private static final String IS_PREFIX = "is";
+    private static final String SET_PREFIX = "set";
+
     private ASTNodeVisitor ast;
 
     public GenerateGetterSetterAction(ASTNodeVisitor ast) {
@@ -56,63 +64,17 @@ public class GenerateGetterSetterAction {
     }
 
     public List<CodeAction> provideCodeActions(CodeActionParams params) {
-        if (ast == null) {
+        ActionContext context = resolveActionContext(params);
+        if (context == null) {
             return Collections.emptyList();
         }
 
-        URI uri = URI.create(params.getTextDocument().getUri());
-        Position position = params.getRange().getStart();
-
-        ASTNode offsetNode = ast.getNodeAtLineAndColumn(uri, position.getLine(), position.getCharacter());
-        if (offsetNode == null) {
+        if (context.classNode.isInterface()) {
             return Collections.emptyList();
         }
 
-        // Find the enclosing class
-        ASTNode enclosingClass = GroovyASTUtils.getEnclosingNodeOfType(offsetNode, ClassNode.class, ast);
-        if (!(enclosingClass instanceof ClassNode)) {
-            return Collections.emptyList();
-        }
-
-        ClassNode classNode = (ClassNode) enclosingClass;
-        if (classNode.isInterface()) {
-            return Collections.emptyList();
-        }
-
-        // Collect existing method names
-        Set<String> existingMethods = new HashSet<>();
-        for (MethodNode method : classNode.getMethods()) {
-            existingMethods.add(method.getName());
-        }
-
-        List<MissingAccessor> missingAccessors = new ArrayList<>();
-
-        // Check fields (non-property fields need explicit getters/setters)
-        for (FieldNode field : classNode.getFields()) {
-            if (field.isStatic() || field.isSynthetic()
-                    || field.getName().startsWith("$")
-                    || field.getName().startsWith("__")) {
-                continue;
-            }
-            // Skip if this field is a property (Groovy auto-generates accessors for properties)
-            if (classNode.getProperty(field.getName()) != null) {
-                continue;
-            }
-
-            String capitalName = capitalize(field.getName());
-            String type = field.getType().getNameWithoutPackage();
-            boolean isBoolean = type.equals("boolean") || type.equals("Boolean");
-
-            String getterName = (isBoolean ? "is" : "get") + capitalName;
-            String setterName = "set" + capitalName;
-
-            if (!existingMethods.contains(getterName)) {
-                missingAccessors.add(new MissingAccessor(field.getName(), type, getterName, true));
-            }
-            if (!existingMethods.contains(setterName) && !field.isFinal()) {
-                missingAccessors.add(new MissingAccessor(field.getName(), type, setterName, false));
-            }
-        }
+        Set<String> existingMethods = collectExistingMethods(context.classNode);
+        List<MissingAccessor> missingAccessors = collectMissingAccessors(context.classNode, existingMethods);
 
         if (missingAccessors.isEmpty()) {
             return Collections.emptyList();
@@ -120,32 +82,26 @@ public class GenerateGetterSetterAction {
 
         List<CodeAction> actions = new ArrayList<>();
 
-        // Generate all getters and setters at once
-        CodeAction allAction = createGenerateAllAccessorsAction(uri, classNode, missingAccessors);
+        CodeAction allAction = createGenerateAllAccessorsAction(context.uri, context.classNode, missingAccessors);
         if (allAction != null) {
             actions.add(allAction);
         }
 
-        // Individual getter/setter actions for the field at cursor
-        if (offsetNode instanceof FieldNode || offsetNode instanceof PropertyNode) {
-            String fieldName;
-            if (offsetNode instanceof FieldNode) {
-                fieldName = ((FieldNode) offsetNode).getName();
-            } else {
-                fieldName = ((PropertyNode) offsetNode).getName();
-            }
-
-            for (MissingAccessor accessor : missingAccessors) {
-                if (accessor.fieldName.equals(fieldName)) {
-                    CodeAction action = createSingleAccessorAction(uri, classNode, accessor);
-                    if (action != null) {
-                        actions.add(action);
-                    }
-                }
-            }
-        }
+        addSingleAccessorActions(actions, context, missingAccessors);
 
         return actions;
+    }
+
+    private static class ActionContext {
+        final URI uri;
+        final ASTNode offsetNode;
+        final ClassNode classNode;
+
+        ActionContext(URI uri, ASTNode offsetNode, ClassNode classNode) {
+            this.uri = uri;
+            this.offsetNode = offsetNode;
+            this.classNode = classNode;
+        }
     }
 
     private static class MissingAccessor {
@@ -160,6 +116,98 @@ public class GenerateGetterSetterAction {
             this.methodName = methodName;
             this.isGetter = isGetter;
         }
+    }
+
+    private ActionContext resolveActionContext(CodeActionParams params) {
+        if (ast == null) {
+            return null;
+        }
+
+        URI uri = URI.create(params.getTextDocument().getUri());
+        Position position = params.getRange().getStart();
+        ASTNode offsetNode = ast.getNodeAtLineAndColumn(uri, position.getLine(), position.getCharacter());
+        if (offsetNode == null) {
+            return null;
+        }
+
+        ASTNode enclosingClass = GroovyASTUtils.getEnclosingNodeOfType(offsetNode, ClassNode.class, ast);
+        if (!(enclosingClass instanceof ClassNode)) {
+            return null;
+        }
+
+        return new ActionContext(uri, offsetNode, (ClassNode) enclosingClass);
+    }
+
+    private Set<String> collectExistingMethods(ClassNode classNode) {
+        Set<String> existingMethods = new HashSet<>();
+        for (MethodNode method : classNode.getMethods()) {
+            existingMethods.add(method.getName());
+        }
+        return existingMethods;
+    }
+
+    private List<MissingAccessor> collectMissingAccessors(ClassNode classNode, Set<String> existingMethods) {
+        List<MissingAccessor> missingAccessors = new ArrayList<>();
+        for (FieldNode field : classNode.getFields()) {
+            if (isEligibleField(classNode, field)) {
+                addMissingAccessorsForField(missingAccessors, existingMethods, field);
+            }
+        }
+        return missingAccessors;
+    }
+
+    private boolean isEligibleField(ClassNode classNode, FieldNode field) {
+        return !field.isStatic()
+                && !field.isSynthetic()
+                && !field.getName().startsWith(DOLLAR_PREFIX)
+                && !field.getName().startsWith(DOUBLE_UNDERSCORE_PREFIX)
+                && classNode.getProperty(field.getName()) == null;
+    }
+
+    private void addMissingAccessorsForField(List<MissingAccessor> missingAccessors, Set<String> existingMethods,
+            FieldNode field) {
+        String capitalName = capitalize(field.getName());
+        String type = field.getType().getNameWithoutPackage();
+        String getterName = (isBooleanType(type) ? IS_PREFIX : GET_PREFIX) + capitalName;
+        String setterName = SET_PREFIX + capitalName;
+
+        if (!existingMethods.contains(getterName)) {
+            missingAccessors.add(new MissingAccessor(field.getName(), type, getterName, true));
+        }
+        if (!existingMethods.contains(setterName) && !field.isFinal()) {
+            missingAccessors.add(new MissingAccessor(field.getName(), type, setterName, false));
+        }
+    }
+
+    private boolean isBooleanType(String type) {
+        return BOOLEAN_TYPE.equals(type) || BOOLEAN_WRAPPER_TYPE.equals(type);
+    }
+
+    private void addSingleAccessorActions(List<CodeAction> actions, ActionContext context,
+            List<MissingAccessor> missingAccessors) {
+        String fieldName = getFieldNameAtCursor(context.offsetNode);
+        if (fieldName == null) {
+            return;
+        }
+
+        for (MissingAccessor accessor : missingAccessors) {
+            if (accessor.fieldName.equals(fieldName)) {
+                CodeAction action = createSingleAccessorAction(context.uri, context.classNode, accessor);
+                if (action != null) {
+                    actions.add(action);
+                }
+            }
+        }
+    }
+
+    private String getFieldNameAtCursor(ASTNode offsetNode) {
+        if (offsetNode instanceof FieldNode) {
+            return ((FieldNode) offsetNode).getName();
+        }
+        if (offsetNode instanceof PropertyNode) {
+            return ((PropertyNode) offsetNode).getName();
+        }
+        return null;
     }
 
     private String capitalize(String name) {

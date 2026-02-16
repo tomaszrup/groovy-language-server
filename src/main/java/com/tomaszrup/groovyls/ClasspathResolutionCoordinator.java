@@ -33,6 +33,7 @@ import java.net.URI;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Coordinates lazy on-demand classpath resolution for project scopes.
@@ -57,6 +58,7 @@ public class ClasspathResolutionCoordinator {
 
     /** Delay before backfill kicks in, to coalesce multiple rapid file opens. */
     private static final long BACKFILL_DELAY_MS = 2000;
+    private static final String STATUS_IMPORTING = "importing";
 
     private final ProjectScopeManager scopeManager;
     private final CompilationService compilationService;
@@ -74,9 +76,9 @@ public class ClasspathResolutionCoordinator {
     /** Explicit per-project resolution lifecycle state. */
     private final ConcurrentHashMap<Path, ResolutionState> resolutionStates = new ConcurrentHashMap<>();
 
-    private volatile GroovyLanguageClient languageClient;
-    private volatile Path workspaceRoot;
-    private volatile List<Path> allDiscoveredRoots;
+    private final AtomicReference<GroovyLanguageClient> languageClient = new AtomicReference<>();
+    private final AtomicReference<Path> workspaceRoot = new AtomicReference<>();
+    private final AtomicReference<List<Path>> allDiscoveredRoots = new AtomicReference<>();
     private volatile boolean classpathCacheEnabled = true;
     private volatile boolean backfillEnabled = false;
 
@@ -99,15 +101,15 @@ public class ClasspathResolutionCoordinator {
     }
 
     public void setLanguageClient(GroovyLanguageClient client) {
-        this.languageClient = client;
+        this.languageClient.set(client);
     }
 
     public void setWorkspaceRoot(Path workspaceRoot) {
-        this.workspaceRoot = workspaceRoot;
+        this.workspaceRoot.set(workspaceRoot);
     }
 
     public void setAllDiscoveredRoots(List<Path> roots) {
-        this.allDiscoveredRoots = roots;
+        this.allDiscoveredRoots.set(roots);
     }
 
     public void setClasspathCacheEnabled(boolean enabled) {
@@ -148,7 +150,7 @@ public class ClasspathResolutionCoordinator {
         logger.info("Scheduling lazy classpath resolution for {}", projectRoot);
         importPool.submit(() -> {
             try {
-                doResolve(scope, triggerURI);
+                doResolve(scope);
             } catch (Exception e) {
                 logger.error("Lazy classpath resolution failed for {}: {}",
                         scope.getProjectRoot(), e.getMessage(), e);
@@ -160,7 +162,7 @@ public class ClasspathResolutionCoordinator {
         MdcProjectContext.clear();
     }
 
-    private void doResolve(ProjectScope scope, URI triggerURI) {
+    private void doResolve(ProjectScope scope) {
         Path projectRoot = scope.getProjectRoot();
         MdcProjectContext.setProject(projectRoot);
         ProjectImporter importer = projectImporterMap.get(projectRoot);
@@ -170,27 +172,16 @@ public class ClasspathResolutionCoordinator {
             return;
         }
 
-        logProgress("Resolving classpath for " + projectRoot.getFileName() + "...");
-        sendStatusUpdate("importing", "Resolving classpath for " + projectRoot.getFileName() + "...");
-        long start = System.currentTimeMillis();
-
-        // Resolve classpath for this single project
-        List<String> classpath = importer.resolveClasspath(projectRoot);
-        boolean markResolved = importer.shouldMarkClasspathResolved(projectRoot, classpath);
-        String detectedGroovyVersion = importer
-            .detectProjectGroovyVersion(projectRoot, classpath)
-            .orElse(null);
-
-        long elapsed = System.currentTimeMillis() - start;
+        ResolutionResult resolved = resolveProjectClasspath(importer, projectRoot);
         String resolvedMsg = "Classpath resolved for " + projectRoot.getFileName()
-                + " (" + classpath.size() + " entries, " + elapsed + "ms)";
+                + " (" + resolved.classpath.size() + " entries, " + resolved.elapsedMillis + "ms)";
         logProgress(resolvedMsg);
         sendStatusUpdate("ready", resolvedMsg);
 
         // Apply to scope
         ProjectScope updatedScope = scopeManager.updateProjectClasspath(
-            projectRoot, classpath, detectedGroovyVersion, markResolved);
-        if (markResolved) {
+            projectRoot, resolved.classpath, resolved.groovyVersion, resolved.markResolved);
+        if (resolved.markResolved) {
             transitionState(projectRoot, ResolutionState.RESOLVED);
         } else {
             logger.warn("Classpath for {} applied but scope remains unresolved", projectRoot);
@@ -198,47 +189,19 @@ public class ClasspathResolutionCoordinator {
             String retryMsg = "Classpath for " + projectRoot.getFileName()
                     + " is incomplete (target-only). Dependencies will be retried on next file open.";
             logProgress(retryMsg);
-            sendStatusUpdate("importing", retryMsg);
+            sendStatusUpdate(STATUS_IMPORTING, retryMsg);
         }
 
         // Compile Java/Kotlin sources so that .class files are up to date
         // before Groovy compilation.  The lazy resolve only resolves
         // dependency JARs — it does NOT compile source code.
-        try {
-            logProgress("Compiling " + importer.getName() + " sources for "
-                    + projectRoot.getFileName() + "...");
-            importer.recompile(projectRoot);
-        } catch (Exception e) {
-            logger.warn("Post-resolve source compilation failed for {}: {}",
-                    projectRoot, e.getMessage());
-        }
+        recompileResolvedProject(importer, projectRoot);
 
         // Save to cache
-        if (classpathCacheEnabled && workspaceRoot != null && markResolved) {
-            String cachedGroovyVersion = updatedScope != null
-                ? updatedScope.getDetectedGroovyVersion()
-                : null;
-            ClasspathCache.mergeProject(workspaceRoot, projectRoot, classpath,
-                cachedGroovyVersion, allDiscoveredRoots);
-        }
+        updateClasspathCache(projectRoot, updatedScope, resolved);
 
         // Compile if the scope has open files
-        if (updatedScope != null) {
-            updatedScope.getLock().writeLock().lock();
-            try {
-                compilationService.ensureScopeCompiled(updatedScope);
-            } catch (VirtualMachineError e) {
-                logger.error("VirtualMachineError during post-resolve compilation for {}: {}",
-                        projectRoot, e.toString());
-                // Swallow — the scope is already marked as failed by
-                // CompilationService.handleCompilationOOM if it got that far.
-            } finally {
-                updatedScope.getLock().writeLock().unlock();
-            }
-            if (languageClient != null) {
-                languageClient.refreshSemanticTokens();
-            }
-        }
+        ensureUpdatedScopeCompiled(projectRoot, updatedScope);
 
         // Schedule backfill for sibling subprojects (if enabled)
         if (backfillEnabled) {
@@ -250,6 +213,61 @@ public class ClasspathResolutionCoordinator {
         // Schedule low-priority background source JAR download so that
         // Go-to-Definition can show real source.  This is NOT on the
         // critical path to first diagnostic.
+        scheduleSourceJarDownload(importer, projectRoot);
+    }
+
+    private ResolutionResult resolveProjectClasspath(ProjectImporter importer, Path projectRoot) {
+        logProgress("Resolving classpath for " + projectRoot.getFileName() + "...");
+        sendStatusUpdate(STATUS_IMPORTING, "Resolving classpath for " + projectRoot.getFileName() + "...");
+        long start = System.currentTimeMillis();
+        List<String> classpath = importer.resolveClasspath(projectRoot);
+        boolean markResolved = importer.shouldMarkClasspathResolved(projectRoot, classpath);
+        String detectedGroovyVersion = importer.detectProjectGroovyVersion(projectRoot, classpath).orElse(null);
+        long elapsed = System.currentTimeMillis() - start;
+        return new ResolutionResult(classpath, markResolved, detectedGroovyVersion, elapsed);
+    }
+
+    private void recompileResolvedProject(ProjectImporter importer, Path projectRoot) {
+        try {
+            logProgress("Compiling " + importer.getName() + " sources for "
+                    + projectRoot.getFileName() + "...");
+            importer.recompile(projectRoot);
+        } catch (Exception e) {
+            logger.warn("Post-resolve source compilation failed for {}: {}",
+                    projectRoot, e.getMessage());
+        }
+    }
+
+    private void updateClasspathCache(Path projectRoot, ProjectScope updatedScope, ResolutionResult resolved) {
+        Path workspaceRootPath = workspaceRoot.get();
+        if (classpathCacheEnabled && workspaceRootPath != null && resolved.markResolved) {
+            List<Path> discoveredRoots = allDiscoveredRoots.get();
+            String cachedGroovyVersion = updatedScope != null ? updatedScope.getDetectedGroovyVersion() : null;
+            ClasspathCache.mergeProject(workspaceRootPath, projectRoot, resolved.classpath,
+                    cachedGroovyVersion, discoveredRoots);
+        }
+    }
+
+    private void ensureUpdatedScopeCompiled(Path projectRoot, ProjectScope updatedScope) {
+        if (updatedScope == null) {
+            return;
+        }
+        updatedScope.getLock().writeLock().lock();
+        try {
+            compilationService.ensureScopeCompiled(updatedScope);
+        } catch (VirtualMachineError e) {
+            logger.error("VirtualMachineError during post-resolve compilation for {}: {}",
+                    projectRoot, e.toString());
+        } finally {
+            updatedScope.getLock().writeLock().unlock();
+        }
+        GroovyLanguageClient client = languageClient.get();
+        if (client != null) {
+            client.refreshSemanticTokens();
+        }
+    }
+
+    private void scheduleSourceJarDownload(ProjectImporter importer, Path projectRoot) {
         importPool.submit(() -> {
             try {
                 importer.downloadSourceJarsAsync(projectRoot);
@@ -257,6 +275,20 @@ public class ClasspathResolutionCoordinator {
                 logger.debug("Background source JAR download failed: {}", e.getMessage());
             }
         });
+    }
+
+    private static final class ResolutionResult {
+        private final List<String> classpath;
+        private final boolean markResolved;
+        private final String groovyVersion;
+        private final long elapsedMillis;
+
+        private ResolutionResult(List<String> classpath, boolean markResolved, String groovyVersion, long elapsedMillis) {
+            this.classpath = classpath;
+            this.markResolved = markResolved;
+            this.groovyVersion = groovyVersion;
+            this.elapsedMillis = elapsedMillis;
+        }
     }
 
     /**
@@ -278,27 +310,16 @@ public class ClasspathResolutionCoordinator {
             existing.cancel(false);
         }
 
-        ScheduledFuture<?> future = schedulingPool.schedule(() -> {
-            importPool.submit(() -> doBackfill(importer, buildToolRoot));
-        }, BACKFILL_DELAY_MS, TimeUnit.MILLISECONDS);
+        ScheduledFuture<?> future = schedulingPool.schedule(
+            () -> importPool.submit(() -> doBackfill(importer, buildToolRoot)),
+            BACKFILL_DELAY_MS, TimeUnit.MILLISECONDS);
 
         pendingBackfills.put(buildToolRoot, future);
     }
 
     private void doBackfill(ProjectImporter importer, Path buildToolRoot) {
         MdcProjectContext.setProject(buildToolRoot);
-        // Find all unresolved sibling scopes under this build-tool root
-        List<ProjectScope> unresolvedSiblings = new ArrayList<>();
-        for (ProjectScope scope : scopeManager.getProjectScopes()) {
-            if (scope.getProjectRoot() != null
-                    && !scope.isClasspathResolved()
-                    && !scopeManager.isResolutionInFlight(scope.getProjectRoot())) {
-                Path scopeBuildToolRoot = importer.getBuildToolRoot(scope.getProjectRoot());
-                if (buildToolRoot.equals(scopeBuildToolRoot)) {
-                    unresolvedSiblings.add(scope);
-                }
-            }
-        }
+        List<ProjectScope> unresolvedSiblings = collectUnresolvedSiblings(importer, buildToolRoot);
 
         if (unresolvedSiblings.isEmpty()) {
             logger.debug("Backfill: no unresolved siblings under {}", buildToolRoot);
@@ -306,14 +327,7 @@ public class ClasspathResolutionCoordinator {
             return;
         }
 
-        // Mark all as in-flight
-        List<Path> toResolve = new ArrayList<>();
-        for (ProjectScope scope : unresolvedSiblings) {
-            if (scopeManager.markResolutionStarted(scope.getProjectRoot())) {
-                toResolve.add(scope.getProjectRoot());
-                transitionState(scope.getProjectRoot(), ResolutionState.RESOLVING);
-            }
-        }
+        List<Path> toResolve = markScopesAsResolving(unresolvedSiblings);
 
         if (toResolve.isEmpty()) {
             pendingBackfills.remove(buildToolRoot);
@@ -322,66 +336,117 @@ public class ClasspathResolutionCoordinator {
 
         logProgress("Backfill: resolving " + toResolve.size()
                 + " sibling project(s) under " + buildToolRoot.getFileName() + "...");
-        sendStatusUpdate("importing", "Backfill: resolving " + toResolve.size()
+        sendStatusUpdate(STATUS_IMPORTING, "Backfill: resolving " + toResolve.size()
                 + " sibling project(s) under " + buildToolRoot.getFileName() + "...");
         long start = System.currentTimeMillis();
 
         try {
-            Map<Path, List<String>> batchResult =
-                    importer.resolveClasspathsForRoot(buildToolRoot, toResolve);
-
-            for (Map.Entry<Path, List<String>> entry : batchResult.entrySet()) {
-                Path root = entry.getKey();
-                List<String> classpath = entry.getValue();
-                boolean markResolved = importer.shouldMarkClasspathResolved(root, classpath);
-                String detectedGroovyVersion = importer
-                    .detectProjectGroovyVersion(root, classpath)
-                    .orElse(null);
-
-                ProjectScope updatedScope = scopeManager.updateProjectClasspath(
-                    root, classpath, detectedGroovyVersion, markResolved);
-                if (markResolved) {
-                    transitionState(root, ResolutionState.RESOLVED);
-                } else {
-                    transitionState(root, ResolutionState.FAILED);
-                    logger.warn("Backfill classpath for {} is incomplete (target-only); scope remains unresolved", root);
-                }
-
-                if (classpathCacheEnabled && workspaceRoot != null && markResolved) {
-                    String cachedGroovyVersion = updatedScope != null
-                            ? updatedScope.getDetectedGroovyVersion()
-                            : null;
-                    ClasspathCache.mergeProject(workspaceRoot, root, classpath,
-                        cachedGroovyVersion, allDiscoveredRoots);
-                }
-            }
-
-            for (Path root : toResolve) {
-                if (!batchResult.containsKey(root)) {
-                    transitionState(root, ResolutionState.FAILED);
-                }
-            }
+            Map<Path, List<String>> batchResult = importer.resolveClasspathsForRoot(buildToolRoot, toResolve);
+            applyBackfillBatchResults(importer, batchResult);
+            markMissingBackfillResultsFailed(toResolve, batchResult);
 
             long elapsed = System.currentTimeMillis() - start;
-            String backfillMsg = "Backfill complete: " + batchResult.size()
-                    + " project(s) resolved in " + elapsed + "ms";
-            logProgress(backfillMsg);
-            sendStatusUpdate("ready", backfillMsg);
+            publishBackfillCompletion(batchResult.size(), elapsed);
 
             // Log memory stats after backfill so the user (and us) can
             // diagnose memory pressure in large workspaces early.
             logMemoryStats();
         } catch (Exception e) {
             logger.error("Backfill failed for root {}: {}", buildToolRoot, e.getMessage(), e);
-            for (Path root : toResolve) {
+            markBackfillFailed(toResolve);
+        } finally {
+            finishBackfill(buildToolRoot, toResolve);
+        }
+    }
+
+    private List<ProjectScope> collectUnresolvedSiblings(ProjectImporter importer, Path buildToolRoot) {
+        List<ProjectScope> unresolvedSiblings = new ArrayList<>();
+        for (ProjectScope scope : scopeManager.getProjectScopes()) {
+            if (isUnresolvedSibling(importer, buildToolRoot, scope)) {
+                unresolvedSiblings.add(scope);
+            }
+        }
+        return unresolvedSiblings;
+    }
+
+    private boolean isUnresolvedSibling(ProjectImporter importer, Path buildToolRoot, ProjectScope scope) {
+        if (scope.getProjectRoot() == null || scope.isClasspathResolved()
+                || scopeManager.isResolutionInFlight(scope.getProjectRoot())) {
+            return false;
+        }
+        Path scopeBuildToolRoot = importer.getBuildToolRoot(scope.getProjectRoot());
+        return buildToolRoot.equals(scopeBuildToolRoot);
+    }
+
+    private List<Path> markScopesAsResolving(List<ProjectScope> unresolvedSiblings) {
+        List<Path> toResolve = new ArrayList<>();
+        for (ProjectScope scope : unresolvedSiblings) {
+            if (scopeManager.markResolutionStarted(scope.getProjectRoot())) {
+                toResolve.add(scope.getProjectRoot());
+                transitionState(scope.getProjectRoot(), ResolutionState.RESOLVING);
+            }
+        }
+        return toResolve;
+    }
+
+    private void applyBackfillBatchResults(ProjectImporter importer, Map<Path, List<String>> batchResult) {
+        for (Map.Entry<Path, List<String>> entry : batchResult.entrySet()) {
+            Path root = entry.getKey();
+            List<String> classpath = entry.getValue();
+            boolean markResolved = importer.shouldMarkClasspathResolved(root, classpath);
+            String detectedGroovyVersion = importer.detectProjectGroovyVersion(root, classpath).orElse(null);
+
+            ProjectScope updatedScope = scopeManager.updateProjectClasspath(
+                    root, classpath, detectedGroovyVersion, markResolved);
+            if (markResolved) {
+                transitionState(root, ResolutionState.RESOLVED);
+            } else {
+                transitionState(root, ResolutionState.FAILED);
+                logger.warn("Backfill classpath for {} is incomplete (target-only); scope remains unresolved", root);
+            }
+            mergeBackfillClasspathCache(root, classpath, updatedScope, markResolved);
+        }
+    }
+
+    private void mergeBackfillClasspathCache(Path root,
+            List<String> classpath,
+            ProjectScope updatedScope,
+            boolean markResolved) {
+        Path workspaceRootPath = workspaceRoot.get();
+        if (classpathCacheEnabled && workspaceRootPath != null && markResolved) {
+            List<Path> discoveredRoots = allDiscoveredRoots.get();
+            String cachedGroovyVersion = updatedScope != null ? updatedScope.getDetectedGroovyVersion() : null;
+            ClasspathCache.mergeProject(workspaceRootPath, root, classpath,
+                    cachedGroovyVersion, discoveredRoots);
+        }
+    }
+
+    private void markMissingBackfillResultsFailed(List<Path> toResolve, Map<Path, List<String>> batchResult) {
+        for (Path root : toResolve) {
+            if (!batchResult.containsKey(root)) {
                 transitionState(root, ResolutionState.FAILED);
             }
-        } finally {
-            for (Path root : toResolve) {
-                scopeManager.markResolutionComplete(root);
-            }
-            pendingBackfills.remove(buildToolRoot);
         }
+    }
+
+    private void publishBackfillCompletion(int resolvedProjectCount, long elapsedMillis) {
+        String backfillMsg = "Backfill complete: " + resolvedProjectCount
+                + " project(s) resolved in " + elapsedMillis + "ms";
+        logProgress(backfillMsg);
+        sendStatusUpdate("ready", backfillMsg);
+    }
+
+    private void markBackfillFailed(List<Path> toResolve) {
+        for (Path root : toResolve) {
+            transitionState(root, ResolutionState.FAILED);
+        }
+    }
+
+    private void finishBackfill(Path buildToolRoot, List<Path> toResolve) {
+        for (Path root : toResolve) {
+            scopeManager.markResolutionComplete(root);
+        }
+        pendingBackfills.remove(buildToolRoot);
     }
 
     private void transitionState(Path projectRoot, ResolutionState newState) {
@@ -400,15 +465,17 @@ public class ClasspathResolutionCoordinator {
 
     private void logProgress(String message) {
         logger.info(message);
-        if (languageClient != null) {
-            languageClient.logMessage(new MessageParams(MessageType.Info, message));
+        GroovyLanguageClient client = languageClient.get();
+        if (client != null) {
+            client.logMessage(new MessageParams(MessageType.Info, message));
         }
     }
 
     private void sendStatusUpdate(String state, String message) {
-        if (languageClient != null) {
+        GroovyLanguageClient client = languageClient.get();
+        if (client != null) {
             try {
-                languageClient.statusUpdate(new StatusUpdateParams(state, message));
+                client.statusUpdate(new StatusUpdateParams(state, message));
             } catch (Exception e) {
                 logger.debug("Failed to send statusUpdate: {}", e.getMessage());
             }
@@ -434,8 +501,9 @@ public class ClasspathResolutionCoordinator {
                     usedMB, maxMB, scopeCount,
                     Math.min(4096, (int) (maxMB * 2)));
             logger.warn(warning);
-            if (languageClient != null) {
-                languageClient.logMessage(new MessageParams(MessageType.Warning, warning));
+            GroovyLanguageClient client = languageClient.get();
+            if (client != null) {
+                client.logMessage(new MessageParams(MessageType.Warning, warning));
             }
         }
         MemoryProfiler.logProfile(scopeManager.getProjectScopes());

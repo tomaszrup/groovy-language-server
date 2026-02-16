@@ -149,6 +149,9 @@ public class SpockCodeActionProvider {
 
         // Only offer this near the end of the class body
         int insertLine = classRange.getEnd().getLine();
+        if (position != null && Math.abs(position.getLine() - insertLine) > 3) {
+            return;
+        }
 
         String featureTemplate = "\n    def \"should do something\"() {\n" +
                 "        given:\n" +

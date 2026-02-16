@@ -543,6 +543,7 @@ class ProjectScopeManagerTests {
 
 		// This should be ignored since project scopes are active
 		manager.updateClasspath(Arrays.asList("/lib/ignored.jar"));
+		Assertions.assertNull(manager.getDefaultScope().getCompilationUnitFactory().getAdditionalClasspathList());
 	}
 
 	// --- updateClasspathFromSettings ---
@@ -567,8 +568,9 @@ class ProjectScopeManagerTests {
 	@Test
 	void testUpdateClasspathFromSettingsEmptyWhenNoGroovyKey() {
 		JsonObject settings = new JsonObject();
-		manager.updateClasspathFromSettings(settings);
-		// Should not throw; default classpath unchanged or set to empty
+		Assertions.assertDoesNotThrow(() -> manager.updateClasspathFromSettings(settings));
+		List<String> classpath = manager.getDefaultScope().getCompilationUnitFactory().getAdditionalClasspathList();
+		Assertions.assertTrue(classpath == null || classpath.isEmpty());
 	}
 
 	// --- hasClasspathChanged ---

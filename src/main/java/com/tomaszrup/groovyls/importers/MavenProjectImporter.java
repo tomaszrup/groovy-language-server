@@ -39,6 +39,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -64,6 +65,11 @@ import com.tomaszrup.groovyls.util.GroovyVersionDetector;
 public class MavenProjectImporter implements ProjectImporter {
 
     private static final Logger logger = LoggerFactory.getLogger(MavenProjectImporter.class);
+    private static final String POM_XML = "pom.xml";
+    private static final String SETTINGS_KEY_MAVEN_SECTION = "maven";
+    private static final String SETTINGS_KEY_HOME = "home";
+    private static final String WRAPPER_MARKER_MAVEN = "maven";
+    private static final String WRAPPER_MARKER_MVN = "mvn";
 
     /** Optional override for the Maven home directory (set from VS Code setting). */
     private String mavenHome;
@@ -73,7 +79,7 @@ public class MavenProjectImporter implements ProjectImporter {
      * If set, {@link #doImportProjects} uses this pool instead of creating
      * a new throw-away pool per call.
      */
-    private volatile ExecutorService sharedImportPool;
+    private final AtomicReference<ExecutorService> sharedImportPool = new AtomicReference<>();
 
     private static final Pattern PROPERTY_REF = Pattern.compile("^\\$\\{([^}]+)}$");
     private static final int WRAPPER_HEADER_SCAN_BYTES = 8192;
@@ -88,7 +94,7 @@ public class MavenProjectImporter implements ProjectImporter {
      * instead of creating a new thread pool per invocation.
      */
     public void setImportPool(ExecutorService pool) {
-        this.sharedImportPool = pool;
+        this.sharedImportPool.set(pool);
     }
 
     @Override
@@ -179,46 +185,14 @@ public class MavenProjectImporter implements ProjectImporter {
 
     private Map<Path, List<String>> doImportProjects(List<Path> projectRoots, boolean compile) {
         Map<Path, List<String>> result = new ConcurrentHashMap<>();
-        ExecutorService pool = sharedImportPool;
+        ExecutorService pool = sharedImportPool.get();
         boolean ownPool = (pool == null);
         if (ownPool) {
-            int parallelism = Math.max(2, Runtime.getRuntime().availableProcessors());
-            pool = Executors.newFixedThreadPool(parallelism, r -> {
-                Thread t = new Thread(r, "groovyls-maven-import");
-                t.setDaemon(true);
-                return t;
-            });
+            pool = createOwnedImportPool();
         }
         try {
-            List<Future<?>> futures = new ArrayList<>();
-            for (Path root : projectRoots) {
-                futures.add(pool.submit(() -> {
-                    try {
-                        List<String> cp = new ArrayList<>();
-                        if (compile) {
-                            compileProject(root);
-                        }
-                        cp.addAll(resolveClasspathInternal(root));
-                        cp.addAll(discoverClassDirs(root));
-                        logger.info("Classpath for Maven project {}: {} entries (compile={})",
-                                root, cp.size(), compile);
-                        result.put(root, cp);
-                    } catch (Exception e) {
-                        logger.error("Error importing Maven project {}: {}", root, e.getMessage(), e);
-                        result.put(root, new ArrayList<>());
-                    }
-                }));
-            }
-            for (Future<?> f : futures) {
-                try {
-                    f.get();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
-                } catch (ExecutionException e) {
-                    logger.error("Maven import task failed: {}", e.getCause().getMessage());
-                }
-            }
+            List<Future<?>> futures = submitImportTasks(pool, projectRoots, compile, result);
+            awaitImportTasks(futures);
         } finally {
             if (ownPool) {
                 pool.shutdownNow();
@@ -235,6 +209,57 @@ public class MavenProjectImporter implements ProjectImporter {
         return ordered;
     }
 
+    private ExecutorService createOwnedImportPool() {
+        int parallelism = Math.max(2, Runtime.getRuntime().availableProcessors());
+        return Executors.newFixedThreadPool(parallelism, runnable -> {
+            Thread thread = new Thread(runnable, "groovyls-maven-import");
+            thread.setDaemon(true);
+            return thread;
+        });
+    }
+
+    private List<Future<?>> submitImportTasks(ExecutorService pool,
+                                              List<Path> projectRoots,
+                                              boolean compile,
+                                              Map<Path, List<String>> result) {
+        List<Future<?>> futures = new ArrayList<>();
+        for (Path root : projectRoots) {
+            futures.add(pool.submit(() -> importSingleProject(root, compile, result)));
+        }
+        return futures;
+    }
+
+    private void importSingleProject(Path root, boolean compile, Map<Path, List<String>> result) {
+        try {
+            List<String> classpath = new ArrayList<>();
+            if (compile) {
+                compileProject(root);
+            }
+            classpath.addAll(resolveClasspathInternal(root));
+            classpath.addAll(discoverClassDirs(root));
+            logger.info("Classpath for Maven project {}: {} entries (compile={})",
+                    root, classpath.size(), compile);
+            result.put(root, classpath);
+        } catch (Exception e) {
+            logger.error("Error importing Maven project {}: {}", root, e.getMessage(), e);
+            result.put(root, new ArrayList<>());
+        }
+    }
+
+    private void awaitImportTasks(List<Future<?>> futures) {
+        for (Future<?> future : futures) {
+            try {
+                future.get();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            } catch (ExecutionException e) {
+                Throwable cause = e.getCause();
+                logger.error("Maven import task failed: {}", cause != null ? cause.getMessage() : e.getMessage());
+            }
+        }
+    }
+
     @Override
     public void recompile(Path projectRoot) {
         logger.info("Recompiling Maven project: {}", projectRoot);
@@ -244,14 +269,15 @@ public class MavenProjectImporter implements ProjectImporter {
     @Override
     public boolean claimsProject(Path projectRoot) {
         return projectRoot != null
-                && projectRoot.resolve("pom.xml").toFile().exists();
+                && projectRoot.resolve(POM_XML).toFile().exists();
     }
 
     @Override
     public void applySettings(JsonObject settings) {
-        if (settings != null && settings.has("maven") && settings.get("maven").isJsonObject()) {
-            JsonObject maven = settings.get("maven").getAsJsonObject();
-            JsonElement homeElem = maven.get("home");
+        if (settings != null && settings.has(SETTINGS_KEY_MAVEN_SECTION)
+                && settings.get(SETTINGS_KEY_MAVEN_SECTION).isJsonObject()) {
+            JsonObject maven = settings.get(SETTINGS_KEY_MAVEN_SECTION).getAsJsonObject();
+            JsonElement homeElem = maven.get(SETTINGS_KEY_HOME);
             String home = (homeElem != null && !homeElem.isJsonNull()) ? homeElem.getAsString() : null;
             setMavenHome(home);
         }
@@ -259,7 +285,7 @@ public class MavenProjectImporter implements ProjectImporter {
 
     @Override
     public boolean isProjectFile(String filePath) {
-        return filePath != null && filePath.endsWith("pom.xml");
+        return filePath != null && filePath.endsWith(POM_XML);
     }
 
     @Override
@@ -343,17 +369,7 @@ public class MavenProjectImporter implements ProjectImporter {
                     "-q");
 
             if (exitCode == 0) {
-                String content = new String(Files.readAllBytes(cpFile), StandardCharsets.UTF_8).trim();
-                if (!content.isEmpty()) {
-                    String[] entries = content.split(File.pathSeparator.equals(";")
-                            ? ";" : File.pathSeparator);
-                    for (String entry : entries) {
-                        entry = entry.trim();
-                        if (!entry.isEmpty() && new File(entry).exists()) {
-                            classpathEntries.add(entry);
-                        }
-                    }
-                }
+                classpathEntries.addAll(readClasspathEntries(cpFile));
                 logger.info("Resolved {} dependency classpath entries for {}", classpathEntries.size(), projectRoot);
             } else {
                 logger.warn("mvn dependency:build-classpath failed for {} (exit code {})", projectRoot, exitCode);
@@ -368,7 +384,24 @@ public class MavenProjectImporter implements ProjectImporter {
                 try {
                     Files.deleteIfExists(cpFile);
                 } catch (IOException ignored) {
+                    // Temporary classpath file cleanup is best-effort.
                 }
+            }
+        }
+        return classpathEntries;
+    }
+
+    private List<String> readClasspathEntries(Path cpFile) throws IOException {
+        String content = new String(Files.readAllBytes(cpFile), StandardCharsets.UTF_8).trim();
+        if (content.isEmpty()) {
+            return new ArrayList<>();
+        }
+        String[] entries = content.split(File.pathSeparator.equals(";") ? ";" : File.pathSeparator);
+        List<String> classpathEntries = new ArrayList<>();
+        for (String entry : entries) {
+            String trimmed = entry.trim();
+            if (!trimmed.isEmpty() && new File(trimmed).exists()) {
+                classpathEntries.add(trimmed);
             }
         }
         return classpathEntries;
@@ -407,7 +440,7 @@ public class MavenProjectImporter implements ProjectImporter {
     }
 
     private Optional<String> detectGroovyVersionFromPom(Path projectRoot) {
-        Path pomPath = projectRoot.resolve("pom.xml");
+        Path pomPath = projectRoot.resolve(POM_XML);
         if (!Files.isRegularFile(pomPath)) {
             return Optional.empty();
         }
@@ -450,7 +483,7 @@ public class MavenProjectImporter implements ProjectImporter {
     }
 
     private boolean hasDeclaredPomDependencies(Path projectRoot) {
-        Path pomPath = projectRoot.resolve("pom.xml");
+        Path pomPath = projectRoot.resolve(POM_XML);
         if (!Files.isRegularFile(pomPath)) {
             return false;
         }
@@ -524,36 +557,41 @@ public class MavenProjectImporter implements ProjectImporter {
         NodeList dependencyNodes = dependenciesElement.getElementsByTagName("dependency");
         String best = null;
         for (int i = 0; i < dependencyNodes.getLength(); i++) {
-            Node node = dependencyNodes.item(i);
-            if (!(node instanceof Element)) {
-                continue;
-            }
-            Element dep = (Element) node;
-            String groupId = textOfChild(dep, "groupId");
-            String artifactId = textOfChild(dep, "artifactId");
-            String version = textOfChild(dep, "version");
-
-            if (!isGroovyDependency(groupId, artifactId) || version == null || version.isBlank()) {
-                continue;
-            }
-
-            String resolved = resolvePropertyReference(version.trim(), properties);
-            if (resolved == null || resolved.isBlank()) {
-                continue;
-            }
-
-            if (best == null) {
-                best = resolved;
-            } else {
-                Optional<String> max = GroovyVersionDetector.detect(Arrays.asList(
-                        "/fake/groovy-" + best + ".jar",
-                        "/fake/groovy-" + resolved + ".jar"));
-                if (max.isPresent() && max.get().equals(resolved)) {
-                    best = resolved;
-                }
-            }
+            best = updateBestGroovyVersion(best, dependencyNodes.item(i), properties);
         }
         return Optional.ofNullable(best);
+    }
+
+    private String updateBestGroovyVersion(String currentBest, Node dependencyNode, Map<String, String> properties) {
+        if (!(dependencyNode instanceof Element)) {
+            return currentBest;
+        }
+        Optional<String> resolvedVersion = resolveGroovyDependencyVersion((Element) dependencyNode, properties);
+        return resolvedVersion.map(version -> pickHigherGroovyVersion(currentBest, version)).orElse(currentBest);
+    }
+
+    private String pickHigherGroovyVersion(String currentBest, String candidate) {
+        if (currentBest == null) {
+            return candidate;
+        }
+        Optional<String> max = GroovyVersionDetector.detect(Arrays.asList(
+                "/fake/groovy-" + currentBest + ".jar",
+                "/fake/groovy-" + candidate + ".jar"));
+        return max.isPresent() && max.get().equals(candidate) ? candidate : currentBest;
+    }
+
+    private Optional<String> resolveGroovyDependencyVersion(Element dependency, Map<String, String> properties) {
+        String groupId = textOfChild(dependency, "groupId");
+        String artifactId = textOfChild(dependency, "artifactId");
+        String version = textOfChild(dependency, "version");
+        if (!isGroovyDependency(groupId, artifactId) || version == null || version.isBlank()) {
+            return Optional.empty();
+        }
+        String resolved = resolvePropertyReference(version.trim(), properties);
+        if (resolved == null || resolved.isBlank()) {
+            return Optional.empty();
+        }
+        return Optional.of(resolved);
     }
 
     private Map<String, String> readPomProperties(Element root) {
@@ -823,7 +861,8 @@ public class MavenProjectImporter implements ProjectImporter {
                 hasShebangOrBatch = header.startsWith("#!");
             }
 
-            boolean hasMavenMarker = header.contains("maven") || header.contains("mvn");
+                boolean hasMavenMarker = header.contains(WRAPPER_MARKER_MAVEN)
+                    || header.contains(WRAPPER_MARKER_MVN);
 
             if (!hasShebangOrBatch || !hasMavenMarker) {
                 logger.warn("Skipping suspicious Maven wrapper at {}: content does not match " +

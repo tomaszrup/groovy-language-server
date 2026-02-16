@@ -47,6 +47,9 @@ import com.tomaszrup.groovyls.util.GroovyLanguageServerUtils;
  */
 public class GenerateMethodsAction {
 
+    private static final String OVERRIDE_ANNOTATION_LINE = "\n    @Override\n";
+    private static final String METHOD_END_LINE = "    }\n";
+
     private ASTNodeVisitor ast;
 
     public GenerateMethodsAction(ASTNodeVisitor ast) {
@@ -54,69 +57,47 @@ public class GenerateMethodsAction {
     }
 
     public List<CodeAction> provideCodeActions(CodeActionParams params) {
-        if (ast == null) {
+        ActionContext context = resolveContext(params);
+        if (context == null) {
             return Collections.emptyList();
         }
 
-        URI uri = URI.create(params.getTextDocument().getUri());
-        Position position = params.getRange().getStart();
-
-        ASTNode offsetNode = ast.getNodeAtLineAndColumn(uri, position.getLine(), position.getCharacter());
-        if (offsetNode == null) {
-            return Collections.emptyList();
-        }
-
-        // Find the enclosing class
-        ASTNode enclosingClass = GroovyASTUtils.getEnclosingNodeOfType(offsetNode, ClassNode.class, ast);
-        if (!(enclosingClass instanceof ClassNode)) {
-            return Collections.emptyList();
-        }
-
-        ClassNode classNode = (ClassNode) enclosingClass;
+        ClassNode classNode = context.classNode;
         if (classNode.isInterface() || classNode.isEnum()) {
             return Collections.emptyList();
         }
 
-        // Collect field info
         List<FieldInfo> fields = collectFields(classNode);
+        if (fields.isEmpty()) {
+            return Collections.emptyList();
+        }
 
-        // Check which methods already exist
         boolean hasToString = hasMethod(classNode, "toString", 0);
         boolean hasEquals = hasMethod(classNode, "equals", 1);
         boolean hasHashCode = hasMethod(classNode, "hashCode", 0);
 
         List<CodeAction> actions = new ArrayList<>();
-
-        if (!hasToString && !fields.isEmpty()) {
-            CodeAction action = createToStringAction(uri, classNode, fields);
-            if (action != null) {
-                actions.add(action);
-            }
-        }
-
-        if (!hasEquals && !fields.isEmpty()) {
-            CodeAction action = createEqualsAction(uri, classNode, fields);
-            if (action != null) {
-                actions.add(action);
-            }
-        }
-
-        if (!hasHashCode && !fields.isEmpty()) {
-            CodeAction action = createHashCodeAction(uri, classNode, fields);
-            if (action != null) {
-                actions.add(action);
-            }
-        }
-
-        // Combined action for all three
-        if (!hasToString && !hasEquals && !hasHashCode && !fields.isEmpty()) {
-            CodeAction action = createAllThreeAction(uri, classNode, fields);
-            if (action != null) {
-                actions.add(action);
-            }
-        }
+        addActionIfPresent(actions, !hasToString, () -> createToStringAction(context.uri, classNode, fields));
+        addActionIfPresent(actions, !hasEquals, () -> createEqualsAction(context.uri, classNode, fields));
+        addActionIfPresent(actions, !hasHashCode, () -> createHashCodeAction(context.uri, classNode, fields));
+        addActionIfPresent(actions, !hasToString && !hasEquals && !hasHashCode,
+                () -> createAllThreeAction(context.uri, classNode, fields));
 
         return actions;
+    }
+
+    private interface ActionFactory {
+        CodeAction create();
+    }
+
+    private static class ActionContext {
+        final URI uri;
+        final ClassNode classNode;
+
+        ActionContext(URI uri, ClassNode classNode) {
+            this.uri = uri;
+            this.classNode = classNode;
+        }
     }
 
     private static class FieldInfo {
@@ -126,6 +107,36 @@ public class GenerateMethodsAction {
         FieldInfo(String name, String type) {
             this.name = name;
             this.type = type;
+        }
+    }
+
+    private ActionContext resolveContext(CodeActionParams params) {
+        if (ast == null) {
+            return null;
+        }
+
+        URI uri = URI.create(params.getTextDocument().getUri());
+        Position position = params.getRange().getStart();
+        ASTNode offsetNode = ast.getNodeAtLineAndColumn(uri, position.getLine(), position.getCharacter());
+        if (offsetNode == null) {
+            return null;
+        }
+
+        ASTNode enclosingClass = GroovyASTUtils.getEnclosingNodeOfType(offsetNode, ClassNode.class, ast);
+        if (!(enclosingClass instanceof ClassNode)) {
+            return null;
+        }
+
+        return new ActionContext(uri, (ClassNode) enclosingClass);
+    }
+
+    private void addActionIfPresent(List<CodeAction> actions, boolean condition, ActionFactory actionFactory) {
+        if (!condition) {
+            return;
+        }
+        CodeAction action = actionFactory.create();
+        if (action != null) {
+            actions.add(action);
         }
     }
 
@@ -170,7 +181,7 @@ public class GenerateMethodsAction {
         String className = classNode.getNameWithoutPackage();
 
         StringBuilder sb = new StringBuilder();
-        sb.append("\n    @Override\n");
+        sb.append(OVERRIDE_ANNOTATION_LINE);
         sb.append("    String toString() {\n");
         sb.append("        return \"").append(className).append("(\" +\n");
         for (int i = 0; i < fields.size(); i++) {
@@ -186,7 +197,7 @@ public class GenerateMethodsAction {
                 sb.append(" +\n            \")\"\n");
             }
         }
-        sb.append("    }\n");
+        sb.append(METHOD_END_LINE);
 
         return createAction(uri, insertLine, sb.toString(), "Generate toString()");
     }
@@ -201,7 +212,7 @@ public class GenerateMethodsAction {
         String className = classNode.getNameWithoutPackage();
 
         StringBuilder sb = new StringBuilder();
-        sb.append("\n    @Override\n");
+        sb.append(OVERRIDE_ANNOTATION_LINE);
         sb.append("    boolean equals(Object o) {\n");
         sb.append("        if (this.is(o)) return true\n");
         sb.append("        if (!(o instanceof ").append(className).append(")) return false\n");
@@ -213,7 +224,7 @@ public class GenerateMethodsAction {
         }
 
         sb.append("        return true\n");
-        sb.append("    }\n");
+        sb.append(METHOD_END_LINE);
 
         return createAction(uri, insertLine, sb.toString(), "Generate equals()");
     }
@@ -227,7 +238,7 @@ public class GenerateMethodsAction {
         int insertLine = classRange.getEnd().getLine();
 
         StringBuilder sb = new StringBuilder();
-        sb.append("\n    @Override\n");
+        sb.append(OVERRIDE_ANNOTATION_LINE);
         sb.append("    int hashCode() {\n");
         sb.append("        int result = 17\n");
         for (FieldInfo field : fields) {
@@ -239,7 +250,7 @@ public class GenerateMethodsAction {
             }
         }
         sb.append("        return result\n");
-        sb.append("    }\n");
+        sb.append(METHOD_END_LINE);
 
         return createAction(uri, insertLine, sb.toString(), "Generate hashCode()");
     }
@@ -255,8 +266,7 @@ public class GenerateMethodsAction {
 
         StringBuilder sb = new StringBuilder();
 
-        // toString
-        sb.append("\n    @Override\n");
+        sb.append(OVERRIDE_ANNOTATION_LINE);
         sb.append("    String toString() {\n");
         sb.append("        return \"").append(className).append("(\" +\n");
         for (int i = 0; i < fields.size(); i++) {
@@ -272,10 +282,9 @@ public class GenerateMethodsAction {
                 sb.append(" +\n            \")\"\n");
             }
         }
-        sb.append("    }\n");
+        sb.append(METHOD_END_LINE);
 
-        // equals
-        sb.append("\n    @Override\n");
+        sb.append(OVERRIDE_ANNOTATION_LINE);
         sb.append("    boolean equals(Object o) {\n");
         sb.append("        if (this.is(o)) return true\n");
         sb.append("        if (!(o instanceof ").append(className).append(")) return false\n");
@@ -285,10 +294,9 @@ public class GenerateMethodsAction {
                     .append(") return false\n");
         }
         sb.append("        return true\n");
-        sb.append("    }\n");
+        sb.append(METHOD_END_LINE);
 
-        // hashCode
-        sb.append("\n    @Override\n");
+        sb.append(OVERRIDE_ANNOTATION_LINE);
         sb.append("    int hashCode() {\n");
         sb.append("        int result = 17\n");
         for (FieldInfo field : fields) {
@@ -300,7 +308,7 @@ public class GenerateMethodsAction {
             }
         }
         sb.append("        return result\n");
-        sb.append("    }\n");
+        sb.append(METHOD_END_LINE);
 
         return createAction(uri, insertLine, sb.toString(), "Generate toString(), equals(), and hashCode()");
     }

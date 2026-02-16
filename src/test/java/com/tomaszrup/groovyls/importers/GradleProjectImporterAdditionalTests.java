@@ -56,7 +56,11 @@ class GradleProjectImporterAdditionalTests {
             Files.walk(tempDir)
                     .sorted(Comparator.reverseOrder())
                     .forEach(p -> {
-                        try { Files.deleteIfExists(p); } catch (IOException ignored) {}
+                                                try {
+                                                        Files.deleteIfExists(p);
+                                                } catch (IOException e) {
+                                                        Assertions.fail("Failed to clean up temp path: " + p, e);
+                                                }
                     });
         }
     }
@@ -389,7 +393,7 @@ class GradleProjectImporterAdditionalTests {
 
     @Test
     void testFindProjectDirSeparatorUnixPath() throws Exception {
-        Method method = GradleProjectImporter.class
+        Method method = GradleClasspathOutputParser.class
                 .getDeclaredMethod("findProjectDirSeparator", String.class);
         method.setAccessible(true);
 
@@ -399,24 +403,25 @@ class GradleProjectImporterAdditionalTests {
         } else {
             sample = "/workspace/project:/workspace/project/build/classes/java/main";
         }
-        int idx = (int) method.invoke(importer, sample);
+        int idx = (int) method.invoke(new GradleClasspathOutputParser(new java.util.HashMap<>()), sample);
         Assertions.assertTrue(idx > 0);
         Assertions.assertEquals(':', sample.charAt(idx));
     }
 
     @Test
     void testNormaliseHelpers() throws Exception {
-        Method normPath = GradleProjectImporter.class
+        Method normPath = GradleClasspathOutputParser.class
                 .getDeclaredMethod("normalise", Path.class);
         normPath.setAccessible(true);
 
-        Method normString = GradleProjectImporter.class
+        Method normString = GradleClasspathOutputParser.class
                 .getDeclaredMethod("normalise", String.class);
         normString.setAccessible(true);
 
+        GradleClasspathOutputParser parser = new GradleClasspathOutputParser(new java.util.HashMap<>());
         Path path = tempDir.resolve("A").resolve("..").resolve("B");
-        String a = (String) normPath.invoke(importer, path);
-        String b = (String) normString.invoke(importer, path.toString());
+        String a = (String) normPath.invoke(parser, path);
+        String b = (String) normString.invoke(parser, path.toString());
 
         Assertions.assertNotNull(a);
         Assertions.assertNotNull(b);
@@ -455,6 +460,8 @@ class GradleProjectImporterAdditionalTests {
 
         // branch 4: repeated validation hit cached path and returns quickly
         validate.invoke(importer, withSha);
+
+                Assertions.assertDoesNotThrow(() -> validate.invoke(importer, withSha));
     }
 
     @Test

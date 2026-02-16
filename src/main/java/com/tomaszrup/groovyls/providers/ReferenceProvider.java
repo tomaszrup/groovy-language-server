@@ -23,6 +23,7 @@ package com.tomaszrup.groovyls.providers;
 import java.net.URI;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 
@@ -42,7 +43,7 @@ public class ReferenceProvider {
 		this.ast = ast;
 	}
 
-	public CompletableFuture<List<? extends Location>> provideReferences(TextDocumentIdentifier textDocument,
+	public CompletableFuture<List<Location>> provideReferences(TextDocumentIdentifier textDocument,
 			Position position) {
 		if (ast == null) {
 			// this shouldn't happen, but let's avoid an exception if something
@@ -59,7 +60,7 @@ public class ReferenceProvider {
 		List<Location> locations = references.stream().map(node -> {
 			URI uri = ast.getURI(node);
 			return GroovyLanguageServerUtils.astNodeToLocation(node, uri);
-		}).filter(location -> location != null).collect(Collectors.toList());
+		}).filter(Objects::nonNull).collect(Collectors.toList());
 
 		return CompletableFuture.completedFuture(locations);
 	}

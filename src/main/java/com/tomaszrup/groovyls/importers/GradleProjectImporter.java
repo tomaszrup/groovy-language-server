@@ -32,6 +32,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -54,13 +55,23 @@ import com.tomaszrup.groovyls.util.GroovyVersionDetector;
 public class GradleProjectImporter implements ProjectImporter {
 
     private static final Logger logger = LoggerFactory.getLogger(GradleProjectImporter.class);
+    private static final String TASK_CLASSES = "classes";
+    private static final String TASK_TEST_CLASSES = "testClasses";
+    private static final String INIT_SCRIPT_EXTENSION = ".gradle";
+    private static final String INIT_SCRIPT_ARGUMENT = "--init-script";
+
+    private static final class GradleImportException extends RuntimeException {
+        GradleImportException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
 
     /**
      * Optional upper bound for {@link #findGradleRoot(Path)} so that the
      * search stops at the workspace root instead of walking all the way to
      * the filesystem root.  Set via {@link #setWorkspaceBound(Path)}.
      */
-    private volatile Path workspaceBound;
+    private final AtomicReference<Path> workspaceBound = new AtomicReference<>();
 
     /**
      * Tracks Gradle roots that have already been validated for wrapper
@@ -74,13 +85,15 @@ public class GradleProjectImporter implements ProjectImporter {
      */
     private final Map<String, String> detectedGroovyVersionByProject = new ConcurrentHashMap<>();
 
+    private final GradleClasspathOutputParser parser = new GradleClasspathOutputParser(detectedGroovyVersionByProject);
+
     /**
      * Sets an upper bound for the Gradle-root search.  When set,
      * {@link #findGradleRoot(Path)} will not walk above this directory.
      */
     @Override
     public void setWorkspaceBound(Path bound) {
-        this.workspaceBound = bound;
+        this.workspaceBound.set(bound);
     }
 
     @Override
@@ -103,7 +116,7 @@ public class GradleProjectImporter implements ProjectImporter {
     @Override
     public Optional<String> detectProjectGroovyVersion(Path projectRoot, List<String> classpathEntries) {
         if (projectRoot != null) {
-            String cached = detectedGroovyVersionByProject.get(normalise(projectRoot));
+            String cached = detectedGroovyVersionByProject.get(parser.normalise(projectRoot));
             if (cached != null && !cached.isEmpty()) {
                 return Optional.of(cached);
             }
@@ -138,7 +151,7 @@ public class GradleProjectImporter implements ProjectImporter {
 
             logger.info("Classpath for project {}: {} entries", projectRoot, classpathList.size());
         } catch (Exception e) {
-            logger.error(e.getMessage(), e);
+            logger.error("Failed to import Gradle project {}: {}", projectRoot, e.getMessage(), e);
         }
         return classpathList;
     }
@@ -198,7 +211,7 @@ public class GradleProjectImporter implements ProjectImporter {
                     resolveSingleProjectClasspathViaInitScript(connection, projectRoot);
 
             List<String> cp = new ArrayList<>();
-            String normSub = normalise(projectRoot);
+            String normSub = parser.normalise(projectRoot);
 
             List<String> resolved = classpathsByProjectDir.get(normSub);
             if (resolved != null) {
@@ -217,11 +230,7 @@ public class GradleProjectImporter implements ProjectImporter {
                 }
             }
 
-            try {
-                cp.addAll(discoverClassDirs(projectRoot));
-            } catch (IOException e) {
-                logger.warn("Could not discover class dirs for {}: {}", projectRoot, e.getMessage());
-            }
+            addDiscoveredClassDirs(cp, projectRoot);
 
             // Deduplicate
             cp = new ArrayList<>(new LinkedHashSet<>(cp));
@@ -323,17 +332,12 @@ public class GradleProjectImporter implements ProjectImporter {
 
             // 2. Resolve classpath for ALL subprojects in a single init-script run
             logger.info("Resolving classpaths for {} subproject(s) from root: {}", subprojects.size(), gradleRoot);
-            Set<String> subprojectDirStrings = new LinkedHashSet<>();
-            for (Path sub : subprojects) {
-                subprojectDirStrings.add(normalise(sub));
-            }
-
             Map<String, List<String>> classpathsByProjectDir = resolveAllClasspathsViaInitScript(connection);
 
             // 3. Match resolved classpaths to our discovered subprojects & add class dirs
             for (Path subproject : subprojects) {
                 List<String> cp = new ArrayList<>();
-                String normSub = normalise(subproject);
+                String normSub = parser.normalise(subproject);
 
                 List<String> resolved = classpathsByProjectDir.get(normSub);
                 if (resolved != null) {
@@ -343,11 +347,7 @@ public class GradleProjectImporter implements ProjectImporter {
                 }
 
                 // Add build/classes/** output dirs
-                try {
-                    cp.addAll(discoverClassDirs(subproject));
-                } catch (IOException e) {
-                    logger.warn("Could not discover class dirs for {}: {}", subproject, e.getMessage());
-                }
+                addDiscoveredClassDirs(cp, subproject);
 
                 // Deduplicate (preserving order) — init-script results and
                 // discoverClassDirs may overlap, and Windows path casing can
@@ -358,8 +358,7 @@ public class GradleProjectImporter implements ProjectImporter {
                 result.put(subproject, cp);
             }
         } catch (Exception e) {
-            logger.error("Batch import via Gradle root {} failed: {}", gradleRoot, e.getMessage(), e);
-            throw new RuntimeException(e);
+            throw new GradleImportException("Batch import failed for Gradle root " + gradleRoot, e);
         }
 
         return result;
@@ -373,27 +372,34 @@ public class GradleProjectImporter implements ProjectImporter {
                 .forProjectDirectory(projectRoot.toFile());
 
         try (ProjectConnection connection = connector.connect()) {
-            try {
-                connection.newBuild()
-                        .forTasks("classes", "testClasses")
-                        .setStandardOutput(newLogOutputStream())
-                        .setStandardError(newLogOutputStream())
-                        .run();
+            if (runRecompileBuild(connection, projectRoot)) {
                 logger.info("Gradle recompile succeeded for {}", projectRoot);
-            } catch (Exception buildEx) {
-                logger.warn("Gradle recompile failed for {}: {}", projectRoot, buildEx.getMessage());
-                try {
-                    connection.newBuild()
-                            .forTasks("classes")
-                            .setStandardOutput(newLogOutputStream())
-                            .setStandardError(newLogOutputStream())
-                            .run();
-                } catch (Exception ex) {
-                    logger.warn("Gradle recompile fallback also failed for {}: {}", projectRoot, ex.getMessage());
-                }
             }
         } catch (Exception e) {
-            logger.error("Could not connect to Gradle for recompile of {}: {}", projectRoot, e.getMessage());
+			throw new GradleImportException("Could not recompile Gradle project " + projectRoot, e);
+        }
+    }
+
+    private boolean runRecompileBuild(ProjectConnection connection, Path projectRoot) {
+        if (runBuildTasks(connection, projectRoot, TASK_CLASSES, TASK_TEST_CLASSES)) {
+            return true;
+        }
+        logger.warn("Gradle recompile failed for {}. Retrying with main classes only.", projectRoot);
+        return runBuildTasks(connection, projectRoot, TASK_CLASSES);
+    }
+
+    private boolean runBuildTasks(ProjectConnection connection, Path projectRoot, String... tasks) {
+        try {
+            connection.newBuild()
+                    .forTasks(tasks)
+                    .setStandardOutput(parser.newLogOutputStream())
+                    .setStandardError(parser.newLogOutputStream())
+                    .run();
+            return true;
+        } catch (Exception ex) {
+            logger.warn("Gradle build task(s) {} failed for {}: {}", Arrays.toString(tasks), projectRoot,
+                    ex.getMessage(), ex);
+            return false;
         }
     }
 
@@ -422,7 +428,7 @@ public class GradleProjectImporter implements ProjectImporter {
                 runCompileTasks(connection, gradleRoot);
             } catch (Exception e) {
                 logger.warn("Failed to compile sources for Gradle root {}: {}",
-                        gradleRoot, e.getMessage());
+                        gradleRoot, e.getMessage(), e);
             }
         }
     }
@@ -436,17 +442,17 @@ public class GradleProjectImporter implements ProjectImporter {
     private void runCompileTasks(ProjectConnection connection, Path projectRoot) {
         try {
             connection.newBuild()
-                    .forTasks("classes", "testClasses")
-                    .setStandardOutput(newLogOutputStream())
-                    .setStandardError(newLogOutputStream())
+                    .forTasks(TASK_CLASSES, TASK_TEST_CLASSES)
+                    .setStandardOutput(parser.newLogOutputStream())
+                    .setStandardError(parser.newLogOutputStream())
                     .run();
         } catch (Exception buildEx) {
             logger.warn("Could not run compile tasks for project {}: {}", projectRoot, buildEx.getMessage());
             try {
                 connection.newBuild()
-                        .forTasks("classes")
-                        .setStandardOutput(newLogOutputStream())
-                        .setStandardError(newLogOutputStream())
+                        .forTasks(TASK_CLASSES)
+                        .setStandardOutput(parser.newLogOutputStream())
+                        .setStandardError(parser.newLogOutputStream())
                         .run();
             } catch (Exception ex) {
                 logger.warn("Could not run 'classes' task for project {}: {}", projectRoot, ex.getMessage());
@@ -480,7 +486,7 @@ public class GradleProjectImporter implements ProjectImporter {
     private Path findGradleRoot(Path projectDir) {
         Path dir = projectDir;
         Path lastSettingsDir = null;
-        Path bound = workspaceBound;
+        Path bound = workspaceBound.get();
         while (dir != null) {
             if (Files.isRegularFile(dir.resolve("settings.gradle"))
                     || Files.isRegularFile(dir.resolve("settings.gradle.kts"))) {
@@ -493,6 +499,14 @@ public class GradleProjectImporter implements ProjectImporter {
             dir = dir.getParent();
         }
         return lastSettingsDir != null ? lastSettingsDir : projectDir;
+    }
+
+    private void addDiscoveredClassDirs(List<String> classpath, Path projectRoot) {
+        try {
+            classpath.addAll(discoverClassDirs(projectRoot));
+        } catch (IOException e) {
+            logger.warn("Could not discover class dirs for {}: {}", projectRoot, e.getMessage());
+        }
     }
 
     /**
@@ -515,7 +529,7 @@ public class GradleProjectImporter implements ProjectImporter {
                 .forProjectDirectory(gradleRoot.toFile());
         Path initScript = null;
         try (ProjectConnection connection = connector.connect()) {
-            initScript = TempFileUtils.createSecureTempFile("groovyls-sources-init", ".gradle");
+            initScript = TempFileUtils.createSecureTempFile("groovyls-sources-init", INIT_SCRIPT_EXTENSION);
             String initScriptContent =
                 "allprojects {\n" +
                 "    tasks.register('_groovyLSDownloadSources') {\n" +
@@ -550,23 +564,24 @@ public class GradleProjectImporter implements ProjectImporter {
                 "        }\n" +
                 "    }\n" +
                 "}\n";
-            Files.write(initScript, initScriptContent.getBytes("UTF-8"));
+            Files.write(initScript, initScriptContent.getBytes(StandardCharsets.UTF_8));
 
             connection.newBuild()
                     .forTasks("_groovyLSDownloadSources")
-                    .withArguments("--init-script", initScript.toString())
-                    .setStandardOutput(newLogOutputStream())
-                    .setStandardError(newLogOutputStream())
+                    .withArguments(INIT_SCRIPT_ARGUMENT, initScript.toString())
+                    .setStandardOutput(parser.newLogOutputStream())
+                    .setStandardError(parser.newLogOutputStream())
                     .run();
 
             logger.info("Background source JAR download completed for {}", gradleRoot);
         } catch (Exception e) {
-            logger.warn("Background source JAR download failed for {}: {}", gradleRoot, e.getMessage());
+            logger.warn("Background source JAR download failed for {}: {}", gradleRoot, e.getMessage(), e);
         } finally {
             if (initScript != null) {
                 try {
                     Files.deleteIfExists(initScript);
                 } catch (IOException ignored) {
+                    // Temporary script cleanup is best-effort.
                 }
             }
         }
@@ -604,7 +619,7 @@ public class GradleProjectImporter implements ProjectImporter {
         Map<String, Set<String>> testByProject = new LinkedHashMap<>();
         Path initScript = null;
         try {
-            initScript = TempFileUtils.createSecureTempFile("groovyls-init", ".gradle");
+            initScript = TempFileUtils.createSecureTempFile("groovyls-init", INIT_SCRIPT_EXTENSION);
             // Resolve main configs first, then test configs, each tagged separately.
             // This lets the Java parser differentiate main vs test-only entries.
             String initScriptContent =
@@ -656,77 +671,29 @@ public class GradleProjectImporter implements ProjectImporter {
                 "        }\n" +
                 "    }\n" +
                 "}\n";
-            Files.write(initScript, initScriptContent.getBytes("UTF-8"));
+            Files.write(initScript, initScriptContent.getBytes(StandardCharsets.UTF_8));
 
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            connection.newBuild()
-                    .forTasks("_groovyLSResolveClasspath")
-                    .withArguments("--init-script", initScript.toString())
-                    .setStandardOutput(baos)
-                    .setStandardError(newLogOutputStream())
-                    .run();
+            try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+                connection.newBuild()
+                        .forTasks("_groovyLSResolveClasspath")
+                        .withArguments(INIT_SCRIPT_ARGUMENT, initScript.toString())
+                        .setStandardOutput(baos)
+                        .setStandardError(parser.newLogOutputStream())
+                        .run();
 
-            String output = baos.toString("UTF-8");
-            for (String line : output.split("\\r?\\n")) {
-                line = line.trim();
-                boolean isMain = line.startsWith("GROOVYLS_CP_MAIN:");
-                boolean isTest = line.startsWith("GROOVYLS_CP_TEST:");
-                boolean isGroovyVersion = line.startsWith("GROOVYLS_GROOVY_VERSION:");
-                // Backward compat: also accept old untagged format
-                boolean isLegacy = !isMain && !isTest && line.startsWith("GROOVYLS_CP:");
-                if (!isMain && !isTest && !isLegacy && !isGroovyVersion) {
-                    continue;
-                }
-                String prefix = isMain ? "GROOVYLS_CP_MAIN:"
-                               : isTest ? "GROOVYLS_CP_TEST:"
-                               : isGroovyVersion ? "GROOVYLS_GROOVY_VERSION:"
-                               : "GROOVYLS_CP:";
-                String rest = line.substring(prefix.length());
-                // Format: <projectDir>:<classpathEntry>
-                // On Windows, projectDir contains ":" (e.g. C:\...), so we
-                // split carefully: find the last path separator pattern
-                int separatorIdx = findProjectDirSeparator(rest);
-                if (separatorIdx < 0) {
-                    continue;
-                }
-                String projectDir = normalise(rest.substring(0, separatorIdx));
-                String value = rest.substring(separatorIdx + 1);
-                if (isGroovyVersion) {
-                    if (!value.isEmpty()) {
-                        detectedGroovyVersionByProject.merge(projectDir, value,
-                                this::pickHigherGroovyVersion);
-                    }
-                    continue;
-                }
-                String cpEntry = value;
-                if (new File(cpEntry).exists()) {
-                    // Canonicalize to handle Windows drive-letter casing (C:\ vs c:\)
-                    try {
-                        cpEntry = new File(cpEntry).getCanonicalPath();
-                    } catch (IOException ignored) {
-                        // fall back to original string
-                    }
-                    if (isTest) {
-                        testByProject
-                                .computeIfAbsent(projectDir, k -> new LinkedHashSet<>())
-                                .add(cpEntry);
-                    } else {
-                        mainByProject
-                                .computeIfAbsent(projectDir, k -> new LinkedHashSet<>())
-                                .add(cpEntry);
-                    }
-                }
+                parser.processBatchClasspathOutput(baos.toString(StandardCharsets.UTF_8), mainByProject, testByProject);
             }
 
             logger.info("Resolved classpaths for {} project(s) via batch init script",
                     mainByProject.size());
         } catch (Exception e) {
-            logger.warn("Could not resolve classpaths via batch init script: {}", e.getMessage());
+            logger.warn("Could not resolve classpaths via batch init script: {}", e.getMessage(), e);
         } finally {
             if (initScript != null) {
                 try {
                     Files.deleteIfExists(initScript);
                 } catch (IOException ignored) {
+                    // Temporary script cleanup is best-effort.
                 }
             }
         }
@@ -780,7 +747,7 @@ public class GradleProjectImporter implements ProjectImporter {
         Map<String, Set<String>> dedupByProject = new LinkedHashMap<>();
         Path initScript = null;
         try {
-            initScript = TempFileUtils.createSecureTempFile("groovyls-single-init", ".gradle");
+            initScript = TempFileUtils.createSecureTempFile("groovyls-single-init", INIT_SCRIPT_EXTENSION);
             // Escape backslashes, single quotes, and strip newlines for the
             // Groovy single-quoted string in the init script to prevent injection.
             String targetDir = targetProject.toAbsolutePath().normalize().toString()
@@ -842,65 +809,29 @@ public class GradleProjectImporter implements ProjectImporter {
                 "        }\n" +
                 "    }\n" +
                 "}\n";
-            Files.write(initScript, initScriptContent.getBytes("UTF-8"));
+            Files.write(initScript, initScriptContent.getBytes(StandardCharsets.UTF_8));
 
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            connection.newBuild()
-                    .forTasks("_groovyLSResolveSingleClasspath")
-                    .withArguments("--init-script", initScript.toString())
-                    .setStandardOutput(baos)
-                    .setStandardError(newLogOutputStream())
-                    .run();
+            try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+                connection.newBuild()
+                        .forTasks("_groovyLSResolveSingleClasspath")
+                        .withArguments(INIT_SCRIPT_ARGUMENT, initScript.toString())
+                        .setStandardOutput(baos)
+                        .setStandardError(parser.newLogOutputStream())
+                        .run();
 
-            String output = baos.toString("UTF-8");
-            for (String line : output.split("\\r?\\n")) {
-                line = line.trim();
-                boolean isMain = line.startsWith("GROOVYLS_CP_MAIN:");
-                boolean isTest = line.startsWith("GROOVYLS_CP_TEST:");
-                boolean isGroovyVersion = line.startsWith("GROOVYLS_GROOVY_VERSION:");
-                boolean isLegacy = !isMain && !isTest && line.startsWith("GROOVYLS_CP:");
-                if (!isMain && !isTest && !isLegacy && !isGroovyVersion) {
-                    continue;
-                }
-                String prefix = isMain ? "GROOVYLS_CP_MAIN:"
-                               : isTest ? "GROOVYLS_CP_TEST:"
-                               : isGroovyVersion ? "GROOVYLS_GROOVY_VERSION:"
-                               : "GROOVYLS_CP:";
-                String rest = line.substring(prefix.length());
-                int separatorIdx = findProjectDirSeparator(rest);
-                if (separatorIdx < 0) {
-                    continue;
-                }
-                String projectDir = normalise(rest.substring(0, separatorIdx));
-                String value = rest.substring(separatorIdx + 1);
-                if (isGroovyVersion) {
-                    if (!value.isEmpty()) {
-                        detectedGroovyVersionByProject.merge(projectDir, value,
-                                this::pickHigherGroovyVersion);
-                    }
-                    continue;
-                }
-                String cpEntry = value;
-                if (new File(cpEntry).exists()) {
-                    try {
-                        cpEntry = new File(cpEntry).getCanonicalPath();
-                    } catch (IOException ignored) {
-                    }
-                    dedupByProject
-                            .computeIfAbsent(projectDir, k -> new LinkedHashSet<>())
-                            .add(cpEntry);
-                }
+                parser.processSingleClasspathOutput(baos.toString(StandardCharsets.UTF_8), dedupByProject);
             }
 
             logger.info("Single-project init script resolved classpath for {} project(s)",
                     dedupByProject.size());
         } catch (Exception e) {
-            logger.warn("Could not resolve single-project classpath via init script: {}", e.getMessage());
+            logger.warn("Could not resolve single-project classpath via init script: {}", e.getMessage(), e);
         } finally {
             if (initScript != null) {
                 try {
                     Files.deleteIfExists(initScript);
                 } catch (IOException ignored) {
+                    // Temporary script cleanup is best-effort.
                 }
             }
         }
@@ -909,47 +840,6 @@ public class GradleProjectImporter implements ProjectImporter {
             classpathsByProject.put(entry.getKey(), new ArrayList<>(entry.getValue()));
         }
         return classpathsByProject;
-    }
-
-    private String pickHigherGroovyVersion(String left, String right) {
-        Optional<String> detected = GroovyVersionDetector.detect(Arrays.asList(
-                "/fake/groovy-" + left + ".jar",
-                "/fake/groovy-" + right + ".jar"));
-        return detected.orElse(right);
-    }
-
-    /**
-     * In the output {@code <projectDir>:<cpEntry>}, find the colon that separates
-     * the two paths. On Windows both paths contain {@code :} after the drive letter,
-     * so we look for {@code :<drive-letter>:\} or {@code :<drive-letter>:/} as the
-     * separator. On Unix the first {@code :} is the separator.
-     */
-    private int findProjectDirSeparator(String rest) {
-        boolean isWindows = File.separatorChar == '\\';
-        if (isWindows) {
-            // Look for pattern `:X:\` or `:X:/` where X is a drive letter
-            // starting from position 2 (skip the first drive letter of projectDir)
-            for (int i = 3; i < rest.length() - 2; i++) {
-                if (rest.charAt(i) == ':'
-                        && Character.isLetter(rest.charAt(i + 1))
-                        && (rest.charAt(i + 2) == ':')) {
-                    return i;
-                }
-            }
-            return -1;
-        } else {
-            return rest.indexOf(':');
-        }
-    }
-
-    /** Normalise a path string for comparison (resolve to absolute, normalise separators). */
-    private String normalise(Path path) {
-        return path.toAbsolutePath().normalize().toString().replace('\\', '/').toLowerCase();
-    }
-
-    /** Normalise a path string for comparison. */
-    private String normalise(String pathStr) {
-        return Path.of(pathStr).toAbsolutePath().normalize().toString().replace('\\', '/').toLowerCase();
     }
 
     /**
@@ -993,54 +883,6 @@ public class GradleProjectImporter implements ProjectImporter {
         return classDirs;
     }
 
-    /**
-     * Creates an OutputStream that routes each line of output to the SLF4J
-        * logger at TRACE level, instead of dumping to System.out/System.err.
-     */
-    private OutputStream newLogOutputStream() {
-        return new OutputStream() {
-            private final ByteArrayOutputStream buffer = new ByteArrayOutputStream();
-
-            @Override
-            public void write(int b) {
-                if (b == '\n') {
-                    flush();
-                } else {
-                    buffer.write(b);
-                }
-            }
-
-            @Override
-            public void write(byte[] bytes, int off, int len) {
-                int start = off;
-                for (int i = off; i < off + len; i++) {
-                    if (bytes[i] == '\n') {
-                        buffer.write(bytes, start, i - start);
-                        flush();
-                        start = i + 1;
-                    }
-                }
-                if (start < off + len) {
-                    buffer.write(bytes, start, off + len - start);
-                }
-            }
-
-            @Override
-            public void flush() {
-                String line = buffer.toString(StandardCharsets.UTF_8).stripTrailing();
-                if (!line.isEmpty()) {
-                    logger.trace("[Gradle] {}", line);
-                }
-                buffer.reset();
-            }
-
-            @Override
-            public void close() {
-                flush();
-            }
-        };
-    }
-
     // ----------------------------------------------------------------
     // Gradle wrapper integrity validation
     // ----------------------------------------------------------------
@@ -1080,7 +922,7 @@ public class GradleProjectImporter implements ProjectImporter {
         try (InputStream in = Files.newInputStream(propsFile)) {
             props.load(in);
         } catch (IOException e) {
-            logger.warn("Could not read {}: {}", propsFile, e.getMessage());
+            logger.warn("Could not read {}: {}", propsFile, e.getMessage(), e);
             return;
         }
 

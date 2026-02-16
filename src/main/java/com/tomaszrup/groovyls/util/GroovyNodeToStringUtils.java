@@ -34,22 +34,40 @@ import com.tomaszrup.groovyls.compiler.util.GroovyASTUtils;
 
 public class GroovyNodeToStringUtils {
 	private static final String JAVA_OBJECT = "java.lang.Object";
+	private static final String PUBLIC_MODIFIER = "public ";
 
-	public static String classToString(ClassNode classNode, ASTNodeVisitor ast) {
+	private GroovyNodeToStringUtils() {
+	}
+
+	public static String classToString(ClassNode classNode) {
 		StringBuilder builder = new StringBuilder();
+		appendPackageDeclaration(builder, classNode);
+		appendClassModifiers(builder, classNode);
+		boolean isTrait = Traits.isTrait(classNode);
+		appendClassKind(builder, classNode, isTrait);
+		builder.append(classNode.getNameWithoutPackage());
+		appendSuperClass(builder, classNode);
+		appendInterfaces(builder, classNode, isTrait);
+		return builder.toString();
+	}
+
+	private static void appendPackageDeclaration(StringBuilder builder, ClassNode classNode) {
 		String packageName = classNode.getPackageName();
-		if (packageName != null && packageName.length() > 0) {
-			builder.append("package ");
-			builder.append(packageName);
-			builder.append("\n");
+		if (packageName != null && !packageName.isEmpty()) {
+			builder.append("package ").append(packageName).append("\n");
 		}
+	}
+
+	private static void appendClassModifiers(StringBuilder builder, ClassNode classNode) {
 		if (!classNode.isSyntheticPublic()) {
-			builder.append("public ");
+			builder.append(PUBLIC_MODIFIER);
 		}
 		if (classNode.isAbstract()) {
 			builder.append("abstract ");
 		}
-		boolean isTrait = Traits.isTrait(classNode);
+	}
+
+	private static void appendClassKind(StringBuilder builder, ClassNode classNode, boolean isTrait) {
 		if (isTrait) {
 			builder.append("trait ");
 		} else if (classNode.isInterface()) {
@@ -59,20 +77,26 @@ public class GroovyNodeToStringUtils {
 		} else {
 			builder.append("class ");
 		}
-		builder.append(classNode.getNameWithoutPackage());
+	}
 
-		ClassNode superClass = null;
+	private static void appendSuperClass(StringBuilder builder, ClassNode classNode) {
+		ClassNode superClass = resolveSuperClass(classNode);
+		if (superClass != null && !JAVA_OBJECT.equals(superClass.getName())) {
+			builder.append(" extends ").append(superClass.getNameWithoutPackage());
+		}
+	}
+
+	private static ClassNode resolveSuperClass(ClassNode classNode) {
 		try {
-			superClass = classNode.getSuperClass();
+			return classNode.getSuperClass();
 		} catch (NoClassDefFoundError e) {
-			// this is fine, we'll just treat it as null
+			return null;
 		}
-		if (superClass != null && !superClass.getName().equals(JAVA_OBJECT)) {
-			builder.append(" extends ");
-			builder.append(superClass.getNameWithoutPackage());
-		}
+	}
+
+	private static void appendInterfaces(StringBuilder builder, ClassNode classNode, boolean isTrait) {
 		ClassNode[] interfaces = classNode.getInterfaces();
-		if ((interfaces == null || interfaces.length == 0)) {
+		if (interfaces == null || interfaces.length == 0) {
 			interfaces = classNode.getUnresolvedInterfaces();
 		}
 		if (interfaces != null && interfaces.length > 0) {
@@ -84,7 +108,6 @@ public class GroovyNodeToStringUtils {
 				builder.append(interfaces[i].getNameWithoutPackage());
 			}
 		}
-		return builder.toString();
 	}
 
 	public static String constructorToString(ConstructorNode constructorNode, ASTNodeVisitor ast) {
@@ -103,7 +126,7 @@ public class GroovyNodeToStringUtils {
 		StringBuilder builder = new StringBuilder();
 		if (methodNode.isPublic()) {
 			if (!methodNode.isSyntheticPublic()) {
-				builder.append("public ");
+				builder.append(PUBLIC_MODIFIER);
 			}
 		} else if (methodNode.isProtected()) {
 			builder.append("protected ");
@@ -145,7 +168,7 @@ public class GroovyNodeToStringUtils {
 		if (variable instanceof FieldNode) {
 			FieldNode fieldNode = (FieldNode) variable;
 			if (fieldNode.isPublic()) {
-				builder.append("public ");
+				builder.append(PUBLIC_MODIFIER);
 			}
 			if (fieldNode.isProtected()) {
 				builder.append("protected ");

@@ -25,6 +25,9 @@ import java.util.Comparator;
 import org.eclipse.lsp4j.Position;
 
 public class Positions {
+	private Positions() {
+	}
+
 	public static final Comparator<Position> COMPARATOR = (Position p1, Position p2) -> {
 		if (p1.getLine() != p2.getLine()) {
 			return p1.getLine() - p2.getLine();
@@ -40,43 +43,43 @@ public class Positions {
 		if (string == null || position == null || !valid(position)) {
 			return -1;
 		}
-		int line = position.getLine();
+		int lineStartOffset = findLineStartOffset(string, position.getLine());
+		if (lineStartOffset < 0) {
+			return -1;
+		}
+		int lineEndOffset = findLineEndOffset(string, lineStartOffset);
 		int character = position.getCharacter();
-
-		int currentLine = 0;
-		int lineStartOffset = 0;
-
-		// Find requested line start offset.
-		if (line > 0) {
-			for (int i = 0; i < string.length(); i++) {
-				if (string.charAt(i) == '\n') {
-					currentLine++;
-					lineStartOffset = i + 1;
-					if (currentLine == line) {
-						break;
-					}
-				}
-			}
-			if (currentLine != line) {
-				return -1;
-			}
-		}
-
-		// Find line end (exclusive of line break chars).
-		int lineEndOffset = string.length();
-		for (int i = lineStartOffset; i < string.length(); i++) {
-			char c = string.charAt(i);
-			if (c == '\n' || c == '\r') {
-				lineEndOffset = i;
-				break;
-			}
-		}
-
 		int lineLength = lineEndOffset - lineStartOffset;
 		if (character < 0 || character > lineLength) {
 			return -1;
 		}
 
 		return lineStartOffset + character;
+	}
+
+	private static int findLineStartOffset(String string, int line) {
+		if (line == 0) {
+			return 0;
+		}
+		int currentLine = 0;
+		for (int i = 0; i < string.length(); i++) {
+			if (string.charAt(i) == '\n') {
+				currentLine++;
+				if (currentLine == line) {
+					return i + 1;
+				}
+			}
+		}
+		return -1;
+	}
+
+	private static int findLineEndOffset(String string, int lineStartOffset) {
+		for (int i = lineStartOffset; i < string.length(); i++) {
+			char c = string.charAt(i);
+			if (c == '\n' || c == '\r') {
+				return i;
+			}
+		}
+		return string.length();
 	}
 }

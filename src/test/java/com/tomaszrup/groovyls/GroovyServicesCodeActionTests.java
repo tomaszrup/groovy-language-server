@@ -11,6 +11,7 @@ import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 
 import javax.tools.JavaCompiler;
 import javax.tools.ToolProvider;
@@ -220,6 +221,7 @@ class GroovyServicesCodeActionTests {
 		services.connect(new org.eclipse.lsp4j.services.LanguageClient() {
 			@Override
 			public void telemetryEvent(Object object) {
+				// no-op for test client
 			}
 
 			@Override
@@ -230,14 +232,17 @@ class GroovyServicesCodeActionTests {
 
 			@Override
 			public void showMessage(org.eclipse.lsp4j.MessageParams messageParams) {
+				// no-op for test client
 			}
 
 			@Override
 			public void publishDiagnostics(org.eclipse.lsp4j.PublishDiagnosticsParams diagnostics) {
+				// no-op for test client
 			}
 
 			@Override
 			public void logMessage(org.eclipse.lsp4j.MessageParams message) {
+				// no-op for test client
 			}
 
 			@Override
@@ -292,7 +297,8 @@ class GroovyServicesCodeActionTests {
 
 		Assertions.assertTrue(javaMoveLatch.await(5, TimeUnit.SECONDS),
 				"Expected Java move watcher events to trigger recompile callback");
-		Thread.sleep(300);
+		Assertions.assertTrue(waitUntil(() -> classExists(classesDir.resolve("com/other/SomeClass.class")), 5_000),
+				"Expected moved Java class to be compiled before requesting code actions");
 
 		Diagnostic diagnostic = new Diagnostic();
 		diagnostic.setRange(new Range(new Position(3, 2), new Position(3, 11)));
@@ -361,7 +367,8 @@ class GroovyServicesCodeActionTests {
 		events.add(new FileEvent(newJavaPath.toUri().toString(), FileChangeType.Created));
 		services.didChangeWatchedFiles(new DidChangeWatchedFilesParams(events));
 
-		Thread.sleep(300);
+		Assertions.assertTrue(waitUntil(() -> classExists(classesDir.resolve("com/xddd/Frame.class")), 5_000),
+				"Expected moved Java class to be compiled before requesting code actions");
 
 		Diagnostic diagnostic = new Diagnostic();
 		diagnostic.setRange(new Range(new Position(3, 2), new Position(3, 7)));
@@ -408,6 +415,7 @@ class GroovyServicesCodeActionTests {
 		services.connect(new org.eclipse.lsp4j.services.LanguageClient() {
 			@Override
 			public void telemetryEvent(Object object) {
+				// no-op for test client
 			}
 
 			@Override
@@ -418,14 +426,17 @@ class GroovyServicesCodeActionTests {
 
 			@Override
 			public void showMessage(org.eclipse.lsp4j.MessageParams messageParams) {
+				// no-op for test client
 			}
 
 			@Override
 			public void publishDiagnostics(org.eclipse.lsp4j.PublishDiagnosticsParams diagnostics) {
+				// no-op for test client
 			}
 
 			@Override
 			public void logMessage(org.eclipse.lsp4j.MessageParams message) {
+				// no-op for test client
 			}
 
 			@Override
@@ -2201,5 +2212,20 @@ class GroovyServicesCodeActionTests {
 
 		Assertions.assertTrue(hasRemoveUnused,
 				"Should detect unused HashMap import while preserving aliased ArrayList import");
+	}
+
+	private static boolean waitUntil(BooleanSupplier condition, long timeoutMillis) {
+		long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+		while (System.nanoTime() < deadline) {
+			if (condition.getAsBoolean()) {
+				return true;
+			}
+			Thread.onSpinWait();
+		}
+		return condition.getAsBoolean();
+	}
+
+	private static boolean classExists(Path classFile) {
+		return Files.exists(classFile);
 	}
 }

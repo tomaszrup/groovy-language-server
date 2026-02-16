@@ -22,6 +22,7 @@ package com.tomaszrup.groovyls.config;
 
 import java.net.URI;
 import java.nio.file.Path;
+import java.util.Collections;
 import java.util.List;
 import java.util.Set;
 
@@ -70,7 +71,7 @@ public interface ICompilationUnitFactory {
 	 * Returns test-only classpath entries, or {@code null} if not separated.
 	 */
 	default List<String> getTestOnlyClasspathList() {
-		return null;
+		return Collections.emptyList();
 	}
 
 	/**

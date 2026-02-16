@@ -45,7 +45,7 @@ public class ImplementationProvider {
         this.ast = ast;
     }
 
-    public CompletableFuture<Either<List<? extends Location>, List<? extends LocationLink>>> provideImplementation(
+    public CompletableFuture<Either<List<Location>, List<LocationLink>>> provideImplementation(
             TextDocumentIdentifier textDocument, Position position) {
         if (ast == null) {
             return CompletableFuture.completedFuture(Either.forLeft(Collections.emptyList()));
@@ -99,59 +99,77 @@ public class ImplementationProvider {
     private List<Location> findMethodImplementations(MethodNode targetMethod, ClassNode declaringClass) {
         List<Location> locations = new ArrayList<>();
         String methodName = targetMethod.getName();
+        int targetParameterCount = targetMethod.getParameters().length;
 
         for (ClassNode classNode : ast.getClassNodes()) {
-            if (classNode.equals(declaringClass)) {
+            if (!isMethodOwnerCandidate(classNode, declaringClass)) {
                 continue;
             }
-            if (!isImplementationOf(classNode, declaringClass)) {
-                continue;
-            }
-            List<MethodNode> methods = classNode.getMethods(methodName);
-            for (MethodNode method : methods) {
-                if (method.getParameters().length == targetMethod.getParameters().length) {
-                    URI methodURI = ast.getURI(method);
-                    if (methodURI != null && method.getLineNumber() != -1) {
-                        Location location = GroovyLanguageServerUtils.astNodeToLocation(method, methodURI);
-                        if (location != null) {
-                            locations.add(location);
-                        }
-                    }
-                }
-            }
+            addMatchingMethodLocations(locations, classNode.getMethods(methodName), targetParameterCount);
         }
         return locations;
     }
 
+    private void addMatchingMethodLocations(List<Location> locations, List<MethodNode> methods,
+            int targetParameterCount) {
+        for (MethodNode method : methods) {
+            if (method.getParameters().length != targetParameterCount) {
+                continue;
+            }
+            URI methodURI = ast.getURI(method);
+            if (methodURI != null && method.getLineNumber() != -1) {
+                Location location = GroovyLanguageServerUtils.astNodeToLocation(method, methodURI);
+                if (location != null) {
+                    locations.add(location);
+                }
+            }
+        }
+    }
+
+    private boolean isMethodOwnerCandidate(ClassNode classNode, ClassNode declaringClass) {
+        return !classNode.equals(declaringClass) && isImplementationOf(classNode, declaringClass);
+    }
+
     private boolean isImplementationOf(ClassNode candidate, ClassNode target) {
-        // Check direct interfaces
         ClassNode[] interfaces = candidate.getInterfaces();
-        if (interfaces != null) {
-            for (ClassNode iface : interfaces) {
-                if (iface.equals(target) || iface.getName().equals(target.getName())) {
-                    return true;
-                }
-            }
+        return hasDirectInterfaceMatch(interfaces, target)
+                || hasSuperClassMatch(candidate, target)
+                || hasTransitiveInterfaceMatch(interfaces, target);
+    }
+
+    private boolean hasDirectInterfaceMatch(ClassNode[] interfaces, ClassNode target) {
+        if (interfaces == null) {
+            return false;
         }
-        // Check superclass hierarchy
-        ClassNode superClass = candidate.getSuperClass();
-        if (superClass != null && !superClass.getName().equals("java.lang.Object")) {
-            if (superClass.equals(target) || superClass.getName().equals(target.getName())) {
+        for (ClassNode iface : interfaces) {
+            if (matchesTarget(iface, target)) {
                 return true;
-            }
-            // Check if superclass transitively implements the target
-            if (isImplementationOf(superClass, target)) {
-                return true;
-            }
-        }
-        // Check transitive interfaces
-        if (interfaces != null) {
-            for (ClassNode iface : interfaces) {
-                if (isImplementationOf(iface, target)) {
-                    return true;
-                }
             }
         }
         return false;
+    }
+
+    private boolean hasSuperClassMatch(ClassNode candidate, ClassNode target) {
+        ClassNode superClass = candidate.getSuperClass();
+        if (superClass == null || "java.lang.Object".equals(superClass.getName())) {
+            return false;
+        }
+        return matchesTarget(superClass, target) || isImplementationOf(superClass, target);
+    }
+
+    private boolean hasTransitiveInterfaceMatch(ClassNode[] interfaces, ClassNode target) {
+        if (interfaces == null) {
+            return false;
+        }
+        for (ClassNode iface : interfaces) {
+            if (isImplementationOf(iface, target)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean matchesTarget(ClassNode candidate, ClassNode target) {
+        return candidate.equals(target) || candidate.getName().equals(target.getName());
     }
 }

@@ -69,7 +69,38 @@ public class FormattingProvider {
 		DOLLAR_SLASH_STRING     // $/regex/$
 	}
 
-	public CompletableFuture<List<? extends TextEdit>> provideFormatting(
+	private static final class LineFormattingResult {
+		private final String line;
+		private final int consecutiveBlankLines;
+
+		private LineFormattingResult(String line, int consecutiveBlankLines) {
+			this.line = line;
+			this.consecutiveBlankLines = consecutiveBlankLines;
+		}
+	}
+
+	private static final class LexStep {
+		private final LexState state;
+		private final int nextIndex;
+
+		private LexStep(LexState state, int nextIndex) {
+			this.state = state;
+			this.nextIndex = nextIndex;
+		}
+	}
+
+	private static final class LineContext {
+		private int lineStart;
+		private LexState[] charStates;
+		private String singleIndent;
+		private int braceDepth;
+		private int groupingDepth;
+		private int consecutiveBlankLines;
+		private boolean lineInString;
+		private boolean lineInBlockComment;
+	}
+
+	public CompletableFuture<List<TextEdit>> provideFormatting(
 			DocumentFormattingParams params, String sourceText) {
 		if (sourceText == null || sourceText.isEmpty()) {
 			return CompletableFuture.completedFuture(new ArrayList<>());
@@ -103,25 +134,42 @@ public class FormattingProvider {
 
 		int origLen = origLines.length;
 		int fmtLen = fmtLines.length;
-
-		int top = 0;
-		int minLen = Math.min(origLen, fmtLen);
-		while (top < minLen && origLines[top].equals(fmtLines[top])) {
-			top++;
-		}
+		int top = findFirstDifferentLine(origLines, fmtLines, origLen, fmtLen);
 
 		if (top == origLen && top == fmtLen) {
 			return edits;
 		}
 
+		int[] bottoms = findLastDifferentLine(origLines, fmtLines, top, origLen, fmtLen);
+		int origBottom = bottoms[0];
+		int fmtBottom = bottoms[1];
+
+		String replacement = buildReplacementText(fmtLines, top, fmtBottom);
+		TextEdit edit = createMinimalEdit(origLines, top, origBottom, fmtBottom, replacement);
+		edits.add(edit);
+		return edits;
+	}
+
+	private static int findFirstDifferentLine(String[] origLines, String[] fmtLines, int origLen, int fmtLen) {
+		int top = 0;
+		int minLen = Math.min(origLen, fmtLen);
+		while (top < minLen && origLines[top].equals(fmtLines[top])) {
+			top++;
+		}
+		return top;
+	}
+
+	private static int[] findLastDifferentLine(String[] origLines, String[] fmtLines, int top, int origLen, int fmtLen) {
 		int origBottom = origLen - 1;
 		int fmtBottom = fmtLen - 1;
-		while (origBottom >= top && fmtBottom >= top
-				&& origLines[origBottom].equals(fmtLines[fmtBottom])) {
+		while (origBottom >= top && fmtBottom >= top && origLines[origBottom].equals(fmtLines[fmtBottom])) {
 			origBottom--;
 			fmtBottom--;
 		}
+		return new int[] {origBottom, fmtBottom};
+	}
 
+	private static String buildReplacementText(String[] fmtLines, int top, int fmtBottom) {
 		StringBuilder replacement = new StringBuilder();
 		for (int j = top; j <= fmtBottom; j++) {
 			if (j > top) {
@@ -129,7 +177,12 @@ public class FormattingProvider {
 			}
 			replacement.append(fmtLines[j]);
 		}
+		return replacement.toString();
+	}
 
+	private static TextEdit createMinimalEdit(String[] origLines, int top, int origBottom, int fmtBottom,
+			String replacementText) {
+		String adjustedReplacement = replacementText;
 		Position start;
 		Position end;
 
@@ -138,13 +191,13 @@ public class FormattingProvider {
 				start = new Position(0, 0);
 				end = new Position(0, 0);
 				if (fmtBottom >= top) {
-					replacement.append("\n");
+					adjustedReplacement = adjustedReplacement + "\n";
 				}
 			} else {
 				start = new Position(top - 1, origLines[top - 1].length());
 				end = new Position(top - 1, origLines[top - 1].length());
 				if (fmtBottom >= top) {
-					replacement.insert(0, "\n");
+					adjustedReplacement = "\n" + adjustedReplacement;
 				}
 			}
 		} else {
@@ -152,8 +205,7 @@ public class FormattingProvider {
 			end = new Position(origBottom, origLines[origBottom].length());
 		}
 
-		edits.add(new TextEdit(new Range(start, end), replacement.toString()));
-		return edits;
+		return new TextEdit(new Range(start, end), adjustedReplacement);
 	}
 
 	/**
@@ -177,7 +229,6 @@ public class FormattingProvider {
 
 		for (int i = 0; i < lines.length; i++) {
 			String line = lines[i];
-			String originalLine = line;
 			int lineStart = charOffset;
 			int lineEnd = lineStart + line.length();
 
@@ -188,76 +239,30 @@ public class FormattingProvider {
 			boolean lineStartsInString = lineStart < charStates.length
 					&& isStringState(charStates[lineStart]);
 
-			if (lineInMultiLineString || lineStartsInString) {
-				// Don't modify lines inside multi-line strings at all
-				result.append(line);
+			LineContext lineContext = new LineContext();
+			lineContext.lineStart = lineStart;
+			lineContext.charStates = charStates;
+			lineContext.singleIndent = singleIndent;
+			lineContext.braceDepth = braceDepth;
+			lineContext.groupingDepth = groupingDepth;
+			lineContext.consecutiveBlankLines = consecutiveBlankLines;
+			lineContext.lineInString = lineInMultiLineString || lineStartsInString;
+			lineContext.lineInBlockComment = lineInBlockComment;
+			LineFormattingResult lineResult = processLine(line, lineContext);
+			consecutiveBlankLines = lineResult.consecutiveBlankLines;
+			if (lineResult.line != null) {
+				result.append(lineResult.line);
 				if (i < lines.length - 1) {
 					result.append("\n");
 				}
-				consecutiveBlankLines = 0;
-				charOffset = lineEnd + 1; // +1 for \n
-				continue;
 			}
 
-			String trimmedLine = originalLine.trim();
-
-			if (lineInBlockComment) {
-				// Re-indent block comment lines at current depth
-				if (!trimmedLine.isEmpty()) {
-					line = buildIndent(singleIndent, braceDepth) + " " + trimmedLine;
-				} else {
-					line = "";
-				}
-				result.append(line);
-				if (i < lines.length - 1) {
-					result.append("\n");
-				}
-				consecutiveBlankLines = 0;
-				charOffset = lineEnd + 1;
-				continue;
-			}
-
-			// Handle blank lines — collapse 3+ to 2
-			if (trimmedLine.isEmpty()) {
-				consecutiveBlankLines++;
-				if (consecutiveBlankLines <= 2) {
-					if (i < lines.length - 1) {
-						result.append("\n");
-					}
-				}
-				charOffset = lineEnd + 1;
-				continue;
-			}
-			consecutiveBlankLines = 0;
-
-			// Apply spacing fixes only on code portions of the line
-			int firstNonWhitespaceOffset = findFirstNonWhitespace(originalLine, lineStart);
-			trimmedLine = fixSpacing(trimmedLine, charStates, firstNonWhitespaceOffset);
-
-			// Determine indent level for this line
-			int lineDepth = braceDepth + groupingDepth;
-			int leadingClosers = countLeadingClosers(trimmedLine, charStates, firstNonWhitespaceOffset);
-			lineDepth = Math.max(0, lineDepth - leadingClosers);
-			if (isContinuationMemberAccessLine(trimmedLine)) {
-				lineDepth++;
-			}
-
-			line = buildIndent(singleIndent, lineDepth) + trimmedLine;
-			result.append(line);
-			if (i < lines.length - 1) {
-				result.append("\n");
-			}
-
-			// Update braceDepth based on code-only braces.
-			// Use trimmedLine (pre-indentation) with the original offset of the
-			// trimmed content so that character positions align with charStates.
-			braceDepth += countNetBraces(trimmedLine, charStates, firstNonWhitespaceOffset);
-			if (braceDepth < 0) {
-				braceDepth = 0;
-			}
-			groupingDepth += countNetGroupingDelimiters(trimmedLine, charStates, firstNonWhitespaceOffset);
-			if (groupingDepth < 0) {
-				groupingDepth = 0;
+			if (!lineContext.lineInString && !lineContext.lineInBlockComment && !line.trim().isEmpty()) {
+				int firstNonWhitespaceOffset = findFirstNonWhitespace(line, lineStart);
+				String trimmedLine = fixSpacing(line.trim(), charStates, firstNonWhitespaceOffset);
+				braceDepth = Math.max(0, braceDepth + countNetBraces(trimmedLine, charStates, firstNonWhitespaceOffset));
+				groupingDepth = Math.max(0,
+						groupingDepth + countNetGroupingDelimiters(trimmedLine, charStates, firstNonWhitespaceOffset));
 			}
 
 			charOffset = lineEnd + 1;
@@ -277,172 +282,231 @@ public class FormattingProvider {
 		LexState state = LexState.CODE;
 		int gstringBraceDepth = 0;
 
-		for (int i = 0; i < text.length(); i++) {
+		int i = 0;
+		while (i < text.length()) {
 			char c = text.charAt(i);
-			char next = (i + 1 < text.length()) ? text.charAt(i + 1) : 0;
-			char next2 = (i + 2 < text.length()) ? text.charAt(i + 2) : 0;
-
-			switch (state) {
-				case CODE:
-					if (c == '/' && next == '/') {
-						state = LexState.LINE_COMMENT;
-						states[i] = LexState.LINE_COMMENT;
-					} else if (c == '/' && next == '*') {
-						state = LexState.BLOCK_COMMENT;
-						states[i] = LexState.BLOCK_COMMENT;
-					} else if (c == '\'' && next == '\'' && next2 == '\'') {
-						state = LexState.TRIPLE_SINGLE_QUOTED;
-						states[i] = LexState.TRIPLE_SINGLE_QUOTED;
-						if (i + 1 < text.length()) { states[i + 1] = LexState.TRIPLE_SINGLE_QUOTED; }
-						if (i + 2 < text.length()) { states[i + 2] = LexState.TRIPLE_SINGLE_QUOTED; }
-						i += 2;
-					} else if (c == '"' && next == '"' && next2 == '"') {
-						state = LexState.TRIPLE_DOUBLE_QUOTED;
-						states[i] = LexState.TRIPLE_DOUBLE_QUOTED;
-						if (i + 1 < text.length()) { states[i + 1] = LexState.TRIPLE_DOUBLE_QUOTED; }
-						if (i + 2 < text.length()) { states[i + 2] = LexState.TRIPLE_DOUBLE_QUOTED; }
-						i += 2;
-					} else if (c == '\'') {
-						state = LexState.SINGLE_QUOTED;
-						states[i] = LexState.SINGLE_QUOTED;
-					} else if (c == '"') {
-						state = LexState.DOUBLE_QUOTED;
-						states[i] = LexState.DOUBLE_QUOTED;
-					} else if (c == '$' && next == '/') {
-						state = LexState.DOLLAR_SLASH_STRING;
-						states[i] = LexState.DOLLAR_SLASH_STRING;
-					} else {
-						states[i] = LexState.CODE;
-					}
-					break;
-
-				case LINE_COMMENT:
-					states[i] = LexState.LINE_COMMENT;
-					if (c == '\n') {
-						state = LexState.CODE;
-					}
-					break;
-
-				case BLOCK_COMMENT:
-					states[i] = LexState.BLOCK_COMMENT;
-					if (c == '*' && next == '/') {
-						states[i] = LexState.BLOCK_COMMENT;
-						if (i + 1 < text.length()) { states[i + 1] = LexState.BLOCK_COMMENT; }
-						i++;
-						state = LexState.CODE;
-					}
-					break;
-
-				case SINGLE_QUOTED:
-					states[i] = LexState.SINGLE_QUOTED;
-					if (c == '\\') {
-						// Skip escaped character
-						if (i + 1 < text.length()) { states[i + 1] = LexState.SINGLE_QUOTED; }
-						i++;
-					} else if (c == '\'') {
-						state = LexState.CODE;
-					}
-					break;
-
-				case DOUBLE_QUOTED:
-					states[i] = LexState.DOUBLE_QUOTED;
-					if (c == '\\') {
-						if (i + 1 < text.length()) { states[i + 1] = LexState.DOUBLE_QUOTED; }
-						i++;
-					} else if (c == '$' && next == '{') {
-						// GString expression
-						states[i] = LexState.DOUBLE_QUOTED;
-						if (i + 1 < text.length()) { states[i + 1] = LexState.DOUBLE_QUOTED; }
-						i++;
-						state = LexState.GSTRING_EXPR;
-						gstringBraceDepth = 1;
-					} else if (c == '"') {
-						state = LexState.CODE;
-					}
-					break;
-
-				case TRIPLE_SINGLE_QUOTED:
-					states[i] = LexState.TRIPLE_SINGLE_QUOTED;
-					if (c == '\\') {
-						if (i + 1 < text.length()) { states[i + 1] = LexState.TRIPLE_SINGLE_QUOTED; }
-						i++;
-					} else if (c == '\'' && next == '\'' && next2 == '\'') {
-						states[i] = LexState.TRIPLE_SINGLE_QUOTED;
-						if (i + 1 < text.length()) { states[i + 1] = LexState.TRIPLE_SINGLE_QUOTED; }
-						if (i + 2 < text.length()) { states[i + 2] = LexState.TRIPLE_SINGLE_QUOTED; }
-						i += 2;
-						state = LexState.CODE;
-					}
-					break;
-
-				case TRIPLE_DOUBLE_QUOTED:
-					states[i] = LexState.TRIPLE_DOUBLE_QUOTED;
-					if (c == '\\') {
-						if (i + 1 < text.length()) { states[i + 1] = LexState.TRIPLE_DOUBLE_QUOTED; }
-						i++;
-					} else if (c == '$' && next == '{') {
-						states[i] = LexState.TRIPLE_DOUBLE_QUOTED;
-						if (i + 1 < text.length()) { states[i + 1] = LexState.TRIPLE_DOUBLE_QUOTED; }
-						i++;
-						state = LexState.GSTRING_EXPR;
-						gstringBraceDepth = 1;
-					} else if (c == '"' && next == '"' && next2 == '"') {
-						states[i] = LexState.TRIPLE_DOUBLE_QUOTED;
-						if (i + 1 < text.length()) { states[i + 1] = LexState.TRIPLE_DOUBLE_QUOTED; }
-						if (i + 2 < text.length()) { states[i + 2] = LexState.TRIPLE_DOUBLE_QUOTED; }
-						i += 2;
-						state = LexState.CODE;
-					}
-					break;
-
-				case GSTRING_EXPR:
-					states[i] = LexState.CODE; // Code inside ${...} is treated as code
-					if (c == '{') {
-						gstringBraceDepth++;
-					} else if (c == '}') {
-						gstringBraceDepth--;
-						if (gstringBraceDepth == 0) {
-							states[i] = LexState.DOUBLE_QUOTED;
-							// Return to the enclosing string state
-							// We need to check what the previous string state was
-							state = findEnclosingStringState(states, i);
-						}
-					}
-					break;
-
-				case DOLLAR_SLASH_STRING:
-					states[i] = LexState.DOLLAR_SLASH_STRING;
-					if (c == '/' && next == '$') {
-						states[i] = LexState.DOLLAR_SLASH_STRING;
-						if (i + 1 < text.length()) { states[i + 1] = LexState.DOLLAR_SLASH_STRING; }
-						i++;
-						state = LexState.CODE;
-					} else if (c == '$' && next == '/') {
-						// Escaped slash in dollar-slash string
-						states[i] = LexState.DOLLAR_SLASH_STRING;
-						if (i + 1 < text.length()) { states[i + 1] = LexState.DOLLAR_SLASH_STRING; }
-						i++;
-					} else if (c == '$' && next == '$') {
-						// Escaped dollar in dollar-slash string
-						states[i] = LexState.DOLLAR_SLASH_STRING;
-						if (i + 1 < text.length()) { states[i + 1] = LexState.DOLLAR_SLASH_STRING; }
-						i++;
-					}
-					break;
-
-				case SLASH_STRING:
-					states[i] = LexState.SLASH_STRING;
-					if (c == '\\') {
-						// Skip escaped character
-						if (i + 1 < text.length()) { states[i + 1] = LexState.SLASH_STRING; }
-						i++;
-					} else if (c == '/') {
-						state = LexState.CODE;
-					}
-					break;
+			LexStep step = applyLexStep(text, states, state, i, gstringBraceDepth);
+			state = step.state;
+			if (state == LexState.GSTRING_EXPR && c == '{') {
+				gstringBraceDepth++;
+			} else if (c == '}' && gstringBraceDepth > 0 && states[i] == LexState.DOUBLE_QUOTED) {
+				gstringBraceDepth = 0;
+			} else if (state == LexState.GSTRING_EXPR && c == '}') {
+				gstringBraceDepth--;
 			}
+			i = step.nextIndex;
 		}
 		return states;
+	}
+
+	private LineFormattingResult processLine(String line, LineContext context) {
+		if (context.lineInString) {
+			return new LineFormattingResult(line, 0);
+		}
+
+		String trimmedLine = line.trim();
+		if (context.lineInBlockComment) {
+			String indentedComment = trimmedLine.isEmpty()
+					? ""
+					: buildIndent(context.singleIndent, context.braceDepth) + " " + trimmedLine;
+			return new LineFormattingResult(indentedComment, 0);
+		}
+
+		if (trimmedLine.isEmpty()) {
+			int updatedBlankLines = context.consecutiveBlankLines + 1;
+			if (updatedBlankLines > 2) {
+				return new LineFormattingResult(null, updatedBlankLines);
+			}
+			return new LineFormattingResult("", updatedBlankLines);
+		}
+
+		int firstNonWhitespaceOffset = findFirstNonWhitespace(line, context.lineStart);
+		String spacedLine = fixSpacing(trimmedLine, context.charStates, firstNonWhitespaceOffset);
+		int lineDepth = computeLineDepth(spacedLine, context.charStates, firstNonWhitespaceOffset,
+				context.braceDepth, context.groupingDepth);
+		String formattedLine = buildIndent(context.singleIndent, lineDepth) + spacedLine;
+		return new LineFormattingResult(formattedLine, 0);
+	}
+
+	private int computeLineDepth(String trimmedLine, LexState[] charStates, int firstNonWhitespaceOffset,
+			int braceDepth, int groupingDepth) {
+		int lineDepth = braceDepth + groupingDepth;
+		int leadingClosers = countLeadingClosers(trimmedLine, charStates, firstNonWhitespaceOffset);
+		lineDepth = Math.max(0, lineDepth - leadingClosers);
+		if (isContinuationMemberAccessLine(trimmedLine)) {
+			lineDepth++;
+		}
+		return lineDepth;
+	}
+
+	private LexStep applyLexStep(String text, LexState[] states, LexState state, int index, int gstringBraceDepth) {
+		char c = text.charAt(index);
+		char next = (index + 1 < text.length()) ? text.charAt(index + 1) : 0;
+		char next2 = (index + 2 < text.length()) ? text.charAt(index + 2) : 0;
+		switch (state) {
+			case CODE:
+				return applyCodeStateLexing(states, index, c, next, next2);
+			case LINE_COMMENT:
+				return handleLineComment(states, index, c);
+			case BLOCK_COMMENT:
+				return handleBlockComment(states, index, c, next);
+			case SINGLE_QUOTED:
+				return handleSingleQuoted(states, index, c);
+			case DOUBLE_QUOTED:
+				return applyDoubleQuotedLexing(states, index, c, next);
+			case TRIPLE_SINGLE_QUOTED:
+				return applyTripleSingleQuotedLexing(states, index, c, next, next2);
+			case TRIPLE_DOUBLE_QUOTED:
+				return applyTripleDoubleQuotedLexing(states, index, c, next, next2);
+			case GSTRING_EXPR:
+				return handleGStringExpression(states, index, c, gstringBraceDepth);
+			case DOLLAR_SLASH_STRING:
+				return applyDollarSlashLexing(states, index, c, next);
+			case SLASH_STRING:
+				return handleSlashString(states, index, c);
+			default:
+				states[index] = LexState.CODE;
+				return new LexStep(LexState.CODE, index + 1);
+		}
+	}
+
+	private LexStep handleLineComment(LexState[] states, int index, char c) {
+		states[index] = LexState.LINE_COMMENT;
+		return new LexStep(c == '\n' ? LexState.CODE : LexState.LINE_COMMENT, index + 1);
+	}
+
+	private LexStep handleBlockComment(LexState[] states, int index, char c, char next) {
+		states[index] = LexState.BLOCK_COMMENT;
+		if (c == '*' && next == '/') {
+			markState(states, index + 1, LexState.BLOCK_COMMENT);
+			return new LexStep(LexState.CODE, index + 2);
+		}
+		return new LexStep(LexState.BLOCK_COMMENT, index + 1);
+	}
+
+	private LexStep handleSingleQuoted(LexState[] states, int index, char c) {
+		states[index] = LexState.SINGLE_QUOTED;
+		if (c == '\\') {
+			markState(states, index + 1, LexState.SINGLE_QUOTED);
+			return new LexStep(LexState.SINGLE_QUOTED, index + 2);
+		}
+		return new LexStep(c == '\'' ? LexState.CODE : LexState.SINGLE_QUOTED, index + 1);
+	}
+
+	private LexStep handleGStringExpression(LexState[] states, int index, char c, int gstringBraceDepth) {
+		states[index] = LexState.CODE;
+		if (c == '}' && gstringBraceDepth == 1) {
+			states[index] = LexState.DOUBLE_QUOTED;
+			return new LexStep(findEnclosingStringState(states, index), index + 1);
+		}
+		return new LexStep(LexState.GSTRING_EXPR, index + 1);
+	}
+
+	private LexStep handleSlashString(LexState[] states, int index, char c) {
+		states[index] = LexState.SLASH_STRING;
+		if (c == '\\') {
+			markState(states, index + 1, LexState.SLASH_STRING);
+			return new LexStep(LexState.SLASH_STRING, index + 2);
+		}
+		return new LexStep(c == '/' ? LexState.CODE : LexState.SLASH_STRING, index + 1);
+	}
+
+	private LexStep applyCodeStateLexing(LexState[] states, int index, char c, char next, char next2) {
+		if (c == '/' && next == '/') {
+			states[index] = LexState.LINE_COMMENT;
+			return new LexStep(LexState.LINE_COMMENT, index + 1);
+		}
+		if (c == '/' && next == '*') {
+			states[index] = LexState.BLOCK_COMMENT;
+			return new LexStep(LexState.BLOCK_COMMENT, index + 1);
+		}
+		if (c == '\'' && next == '\'' && next2 == '\'') {
+			markState(states, index, LexState.TRIPLE_SINGLE_QUOTED);
+			markState(states, index + 1, LexState.TRIPLE_SINGLE_QUOTED);
+			markState(states, index + 2, LexState.TRIPLE_SINGLE_QUOTED);
+			return new LexStep(LexState.TRIPLE_SINGLE_QUOTED, index + 3);
+		}
+		if (c == '"' && next == '"' && next2 == '"') {
+			markState(states, index, LexState.TRIPLE_DOUBLE_QUOTED);
+			markState(states, index + 1, LexState.TRIPLE_DOUBLE_QUOTED);
+			markState(states, index + 2, LexState.TRIPLE_DOUBLE_QUOTED);
+			return new LexStep(LexState.TRIPLE_DOUBLE_QUOTED, index + 3);
+		}
+		if (c == '\'') {
+			states[index] = LexState.SINGLE_QUOTED;
+			return new LexStep(LexState.SINGLE_QUOTED, index + 1);
+		}
+		if (c == '"') {
+			states[index] = LexState.DOUBLE_QUOTED;
+			return new LexStep(LexState.DOUBLE_QUOTED, index + 1);
+		}
+		if (c == '$' && next == '/') {
+			states[index] = LexState.DOLLAR_SLASH_STRING;
+			return new LexStep(LexState.DOLLAR_SLASH_STRING, index + 1);
+		}
+		states[index] = LexState.CODE;
+		return new LexStep(LexState.CODE, index + 1);
+	}
+
+	private LexStep applyDoubleQuotedLexing(LexState[] states, int index, char c, char next) {
+		states[index] = LexState.DOUBLE_QUOTED;
+		if (c == '\\') {
+			markState(states, index + 1, LexState.DOUBLE_QUOTED);
+			return new LexStep(LexState.DOUBLE_QUOTED, index + 2);
+		}
+		if (c == '$' && next == '{') {
+			markState(states, index + 1, LexState.DOUBLE_QUOTED);
+			return new LexStep(LexState.GSTRING_EXPR, index + 2);
+		}
+		return new LexStep(c == '"' ? LexState.CODE : LexState.DOUBLE_QUOTED, index + 1);
+	}
+
+	private LexStep applyTripleSingleQuotedLexing(LexState[] states, int index, char c, char next, char next2) {
+		states[index] = LexState.TRIPLE_SINGLE_QUOTED;
+		if (c == '\\') {
+			markState(states, index + 1, LexState.TRIPLE_SINGLE_QUOTED);
+			return new LexStep(LexState.TRIPLE_SINGLE_QUOTED, index + 2);
+		}
+		if (c == '\'' && next == '\'' && next2 == '\'') {
+			markState(states, index + 1, LexState.TRIPLE_SINGLE_QUOTED);
+			markState(states, index + 2, LexState.TRIPLE_SINGLE_QUOTED);
+			return new LexStep(LexState.CODE, index + 3);
+		}
+		return new LexStep(LexState.TRIPLE_SINGLE_QUOTED, index + 1);
+	}
+
+	private LexStep applyTripleDoubleQuotedLexing(LexState[] states, int index, char c, char next, char next2) {
+		states[index] = LexState.TRIPLE_DOUBLE_QUOTED;
+		if (c == '\\') {
+			markState(states, index + 1, LexState.TRIPLE_DOUBLE_QUOTED);
+			return new LexStep(LexState.TRIPLE_DOUBLE_QUOTED, index + 2);
+		}
+		if (c == '$' && next == '{') {
+			markState(states, index + 1, LexState.TRIPLE_DOUBLE_QUOTED);
+			return new LexStep(LexState.GSTRING_EXPR, index + 2);
+		}
+		if (c == '"' && next == '"' && next2 == '"') {
+			markState(states, index + 1, LexState.TRIPLE_DOUBLE_QUOTED);
+			markState(states, index + 2, LexState.TRIPLE_DOUBLE_QUOTED);
+			return new LexStep(LexState.CODE, index + 3);
+		}
+		return new LexStep(LexState.TRIPLE_DOUBLE_QUOTED, index + 1);
+	}
+
+	private LexStep applyDollarSlashLexing(LexState[] states, int index, char c, char next) {
+		states[index] = LexState.DOLLAR_SLASH_STRING;
+		if ((c == '/' && next == '$') || (c == '$' && next == '/') || (c == '$' && next == '$')) {
+			markState(states, index + 1, LexState.DOLLAR_SLASH_STRING);
+			LexState nextState = (c == '/' && next == '$') ? LexState.CODE : LexState.DOLLAR_SLASH_STRING;
+			return new LexStep(nextState, index + 2);
+		}
+		return new LexStep(LexState.DOLLAR_SLASH_STRING, index + 1);
+	}
+
+	private void markState(LexState[] states, int index, LexState state) {
+		if (index >= 0 && index < states.length) {
+			states[index] = state;
+		}
 	}
 
 	/**
@@ -651,13 +715,14 @@ public class FormattingProvider {
 		int closers = 0;
 		for (int i = 0; i < trimmedLine.length(); i++) {
 			char c = trimmedLine.charAt(i);
-			if (c != '}' && c != ']') {
-				break;
+			boolean isCloser = c == '}' || c == ']';
+			if (!isCloser) {
+				return closers;
 			}
 			int statePos = lineStartOffset + i;
 			LexState state = (statePos < charStates.length) ? charStates[statePos] : LexState.CODE;
 			if (state != LexState.CODE) {
-				break;
+				return closers;
 			}
 			closers++;
 		}

@@ -40,6 +40,8 @@ import java.util.List;
  * UnsupportedOperationException(); }}).</p>
  */
 public class ClassNodeDecompiler {
+	private ClassNodeDecompiler() {
+	}
 
     /**
      * Generate a synthetic Java source for the given ClassNode.
@@ -50,86 +52,13 @@ public class ClassNodeDecompiler {
     public static List<String> decompile(ClassNode classNode) {
         List<String> lines = new ArrayList<>();
 
-        // Package declaration
-        String packageName = classNode.getPackageName();
-        if (packageName != null && !packageName.isEmpty()) {
-            lines.add("package " + packageName + ";");
-            lines.add("");
-        }
-
-        // File header comment
-        lines.add("// Decompiled from bytecode — source not available");
+        addPackageDeclaration(classNode, lines);
+        addFileHeader(lines);
+        lines.add(buildClassDeclaration(classNode));
         lines.add("");
-
-        // Class declaration
-        StringBuilder classDecl = new StringBuilder();
-        classDecl.append(Modifier.toString(classNode.getModifiers() & ~Modifier.SYNCHRONIZED));
-        if (classDecl.length() > 0) {
-            classDecl.append(' ');
-        }
-        if (classNode.isInterface()) {
-            classDecl.append("interface ");
-        } else if (classNode.isEnum()) {
-            classDecl.append("enum ");
-        } else {
-            classDecl.append("class ");
-        }
-        classDecl.append(classNode.getNameWithoutPackage());
-
-        // Superclass
-        ClassNode superClass = classNode.getSuperClass();
-        if (superClass != null && !superClass.getName().equals("java.lang.Object")
-                && !classNode.isInterface() && !classNode.isEnum()) {
-            classDecl.append(" extends ").append(simpleTypeName(superClass));
-        }
-
-        // Interfaces
-        ClassNode[] interfaces = classNode.getInterfaces();
-        if (interfaces != null && interfaces.length > 0) {
-            classDecl.append(classNode.isInterface() ? " extends " : " implements ");
-            for (int i = 0; i < interfaces.length; i++) {
-                if (i > 0) classDecl.append(", ");
-                classDecl.append(simpleTypeName(interfaces[i]));
-            }
-        }
-
-        classDecl.append(" {");
-        lines.add(classDecl.toString());
-        lines.add("");
-
-        // Fields
-        List<FieldNode> fields = classNode.getFields();
-        if (fields != null) {
-            for (FieldNode field : fields) {
-                if (field.isSynthetic()) continue;
-                String fieldLine = "    " + fieldToString(field) + ";";
-                lines.add(fieldLine);
-            }
-            if (!fields.isEmpty()) {
-                lines.add("");
-            }
-        }
-
-        // Constructors
-        List<ConstructorNode> constructors = classNode.getDeclaredConstructors();
-        if (constructors != null) {
-            for (ConstructorNode ctor : constructors) {
-                if (ctor.isSynthetic()) continue;
-                lines.add("    " + constructorToString(ctor, classNode) + " { }");
-                lines.add("");
-            }
-        }
-
-        // Methods
-        List<MethodNode> methods = classNode.getMethods();
-        if (methods != null) {
-            for (MethodNode method : methods) {
-                if (method.isSynthetic()) continue;
-                if ("<init>".equals(method.getName()) || "<clinit>".equals(method.getName())) continue;
-                lines.add("    " + methodToString(method) + " { }");
-                lines.add("");
-            }
-        }
+        addFieldDeclarations(classNode, lines);
+        addConstructorDeclarations(classNode, lines);
+        addMethodDeclarations(classNode, lines);
 
         lines.add("}");
         return lines;
@@ -157,13 +86,118 @@ public class ClassNodeDecompiler {
         List<String> lines = decompile(classNode);
         for (int i = 0; i < lines.size(); i++) {
             String line = lines.get(i).trim();
-            if (line.contains(" " + methodName + "(") || line.startsWith(methodName + "(")) {
-                if (paramCount < 0 || matchesParamCount(line, paramCount)) {
-                    return i;
-                }
+            if ((line.contains(" " + methodName + "(") || line.startsWith(methodName + "("))
+                    && (paramCount < 0 || matchesParamCount(line, paramCount))) {
+                return i;
             }
         }
         return getClassDeclarationLine(classNode);
+    }
+
+    private static void addPackageDeclaration(ClassNode classNode, List<String> lines) {
+        String packageName = classNode.getPackageName();
+        if (packageName == null || packageName.isEmpty()) {
+            return;
+        }
+        lines.add("package " + packageName + ";");
+        lines.add("");
+    }
+
+    private static void addFileHeader(List<String> lines) {
+        lines.add("// Decompiled from bytecode — source not available");
+        lines.add("");
+    }
+
+    private static String buildClassDeclaration(ClassNode classNode) {
+        StringBuilder classDecl = new StringBuilder();
+        classDecl.append(Modifier.toString(classNode.getModifiers() & ~Modifier.SYNCHRONIZED));
+        if (classDecl.length() > 0) {
+            classDecl.append(' ');
+        }
+        if (classNode.isInterface()) {
+            classDecl.append("interface ");
+        } else if (classNode.isEnum()) {
+            classDecl.append("enum ");
+        } else {
+            classDecl.append("class ");
+        }
+        classDecl.append(classNode.getNameWithoutPackage());
+
+        appendSuperclass(classNode, classDecl);
+        appendInterfaces(classNode, classDecl);
+        classDecl.append(" {");
+        return classDecl.toString();
+    }
+
+    private static void appendSuperclass(ClassNode classNode, StringBuilder classDecl) {
+        ClassNode superClass = classNode.getSuperClass();
+        if (superClass != null && !superClass.getName().equals("java.lang.Object")
+                && !classNode.isInterface() && !classNode.isEnum()) {
+            classDecl.append(" extends ").append(simpleTypeName(superClass));
+        }
+    }
+
+    private static void appendInterfaces(ClassNode classNode, StringBuilder classDecl) {
+        ClassNode[] interfaces = classNode.getInterfaces();
+        if (interfaces == null || interfaces.length == 0) {
+            return;
+        }
+        classDecl.append(classNode.isInterface() ? " extends " : " implements ");
+        for (int i = 0; i < interfaces.length; i++) {
+            if (i > 0) {
+                classDecl.append(", ");
+            }
+            classDecl.append(simpleTypeName(interfaces[i]));
+        }
+    }
+
+    private static void addFieldDeclarations(ClassNode classNode, List<String> lines) {
+        List<FieldNode> fields = classNode.getFields();
+        if (fields == null) {
+            return;
+        }
+        boolean addedAnyField = false;
+        for (FieldNode field : fields) {
+            if (!field.isSynthetic()) {
+                lines.add("    " + fieldToString(field) + ";");
+                addedAnyField = true;
+            }
+        }
+        if (addedAnyField) {
+            lines.add("");
+        }
+    }
+
+    private static void addConstructorDeclarations(ClassNode classNode, List<String> lines) {
+        List<ConstructorNode> constructors = classNode.getDeclaredConstructors();
+        if (constructors == null) {
+            return;
+        }
+        for (ConstructorNode ctor : constructors) {
+            if (!ctor.isSynthetic()) {
+                lines.add("    " + constructorToString(ctor, classNode) + " { }");
+                lines.add("");
+            }
+        }
+    }
+
+    private static void addMethodDeclarations(ClassNode classNode, List<String> lines) {
+        List<MethodNode> methods = classNode.getMethods();
+        if (methods == null) {
+            return;
+        }
+        for (MethodNode method : methods) {
+            if (isDecompilableMethod(method)) {
+                lines.add("    " + methodToString(method) + " { }");
+                lines.add("");
+            }
+        }
+    }
+
+    private static boolean isDecompilableMethod(MethodNode method) {
+        return !method.isSynthetic()
+                && !"<init>".equals(method.getName())
+                && !"<clinit>".equals(method.getName());
     }
 
     /**

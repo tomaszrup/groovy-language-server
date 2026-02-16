@@ -47,7 +47,6 @@ class MdcProjectContextTests {
 	@AfterEach
 	void tearDown() {
 		MDC.clear();
-		MdcProjectContext.setWorkspaceRoot(null);
 	}
 
 	// ------------------------------------------------------------------
@@ -127,7 +126,7 @@ class MdcProjectContextTests {
 
 	@Test
 	void testClearOnAlreadyClearedIsNoOp() {
-		Assertions.assertDoesNotThrow(() -> MdcProjectContext.clear(),
+		Assertions.assertDoesNotThrow(MdcProjectContext::clear,
 				"clear() on an already-clear MDC should not throw");
 		Assertions.assertNull(MDC.get(MdcProjectContext.MDC_KEY));
 	}

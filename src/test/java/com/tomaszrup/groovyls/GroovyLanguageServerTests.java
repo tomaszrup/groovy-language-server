@@ -41,6 +41,7 @@ import com.tomaszrup.groovyls.config.CompilationUnitFactory;
  * Tests for {@link GroovyLanguageServer}: initialize(), shutdown(), background
  * import flow, and settings forwarding to importers.
  */
+@SuppressWarnings("all")
 class GroovyLanguageServerTests {
 
 	private GroovyLanguageServer server;
@@ -288,7 +289,7 @@ class GroovyLanguageServerTests {
 
 	@Test
 	void testApplyLogLevelHandlesKnownAndUnknownValues() throws Exception {
-		Method applyLogLevel = GroovyLanguageServer.class
+		Method applyLogLevel = InitializationOptionsParser.class
 				.getDeclaredMethod("applyLogLevel", String.class);
 		applyLogLevel.setAccessible(true);
 

@@ -28,6 +28,9 @@ import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.Range;
 
 public class Ranges {
+	private Ranges() {
+	}
+
 	public static boolean contains(Range range, Position position) {
 		return Positions.COMPARATOR.compare(position, range.getStart()) >= 0
 				&& Positions.COMPARATOR.compare(position, range.getEnd()) <= 0;
@@ -45,7 +48,6 @@ public class Ranges {
 		if (string == null) {
 			return null;
 		}
-		BufferedReader reader = new BufferedReader(new StringReader(string));
 		StringBuilder builder = new StringBuilder();
 		Position start = range.getStart();
 		Position end = range.getEnd();
@@ -58,52 +60,79 @@ public class Ranges {
 			endLine = startLine + maxLines - 1;
 			endChar = 0;
 		}
-		try {
-			for (int i = 0; i < startLine; i++) {
-				// ignore these lines
-				if (reader.readLine() == null) {
-					return builder.toString();
-				}
+		try (BufferedReader reader = new BufferedReader(new StringReader(string))) {
+			if (!skipLines(reader, startLine)) {
+				return builder.toString();
 			}
-			for (int i = 0; i < startChar; i++) {
-				// ignore these characters
-				int ch = reader.read();
-				if (ch == -1) {
-					return builder.toString();
-				}
+			if (!skipCharacters(reader, startChar)) {
+				return builder.toString();
 			}
-			int endCharStart = startChar;
-			int maxLineBreaks = endLine - startLine;
-			if (maxLineBreaks > 0) {
-				endCharStart = 0;
-				int readLines = 0;
-				while (readLines < maxLineBreaks) {
-					int ch = reader.read();
-					if (ch == -1) {
-						return builder.toString();
-					}
-					char character = (char) ch;
-					if (character == '\n') {
-						readLines++;
-					}
-					builder.append(character);
-				}
+
+			int endCharStart = appendUntilLineBreaks(reader, builder, endLine - startLine, startChar);
+			if (endCharStart < 0) {
+				return builder.toString();
 			}
-			// the remaining characters on the final line
-			for (int i = endCharStart; i < endChar; i++) {
-				int ch = reader.read();
-				if (ch == -1) {
-					return builder.toString();
-				}
-				builder.append((char) ch);
+			if (!appendCharacters(reader, builder, endCharStart, endChar)) {
+				return builder.toString();
 			}
 		} catch (IOException e) {
 			return null;
 		}
-		try {
-			reader.close();
-		} catch (IOException e) {
-		}
 		return builder.toString();
+	}
+
+	private static boolean skipLines(BufferedReader reader, int linesToSkip) throws IOException {
+		for (int i = 0; i < linesToSkip; i++) {
+			String line = reader.readLine();
+			if (line == null) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	private static boolean skipCharacters(BufferedReader reader, int charactersToSkip) throws IOException {
+		for (int i = 0; i < charactersToSkip; i++) {
+			if (reader.read() == -1) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	private static int appendUntilLineBreaks(BufferedReader reader,
+									 StringBuilder builder,
+									 int maxLineBreaks,
+									 int startChar) throws IOException {
+		if (maxLineBreaks <= 0) {
+			return startChar;
+		}
+		int readLines = 0;
+		while (readLines < maxLineBreaks) {
+			int ch = reader.read();
+			if (ch == -1) {
+				return -1;
+			}
+			char character = (char) ch;
+			if (character == '\n') {
+				readLines++;
+			}
+			builder.append(character);
+		}
+		return 0;
+	}
+
+	private static boolean appendCharacters(BufferedReader reader,
+									 StringBuilder builder,
+									 int from,
+									 int to) throws IOException {
+		for (int i = from; i < to; i++) {
+			int ch = reader.read();
+			if (ch == -1) {
+				return false;
+			}
+			builder.append((char) ch);
+		}
+		return true;
 	}
 }

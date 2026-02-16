@@ -26,6 +26,7 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -65,13 +66,13 @@ public class ProjectScope {
 	 * Writers produce a <em>new</em> visitor via copy-on-write rather than
 	 * mutating this reference in place.
 	 */
-	private volatile ASTNodeVisitor astVisitor;
+	private final AtomicReference<ASTNodeVisitor> astVisitor = new AtomicReference<>();
 
 	private Map<URI, List<Diagnostic>> prevDiagnosticsByFile;
 
 	/** Published via volatile write when the classloader changes. */
-	private volatile ScanResult classGraphScanResult;
-	private volatile ClasspathSymbolIndex classpathSymbolIndex;
+	private final AtomicReference<ScanResult> classGraphScanResult = new AtomicReference<>();
+	private final AtomicReference<ClasspathSymbolIndex> classpathSymbolIndex = new AtomicReference<>();
 
 	/**
 	 * When the {@link #classGraphScanResult} is a shared superset (obtained
@@ -84,12 +85,12 @@ public class ProjectScope {
 	 * <p>{@code null} when the scan result is an exact match for this
 	 * scope's classpath (no filtering needed).</p>
 	 */
-	private volatile Set<File> classGraphClasspathFiles;
-	private volatile Set<String> classpathSymbolClasspathElements;
+	private final AtomicReference<Set<File>> classGraphClasspathFiles = new AtomicReference<>();
+	private final AtomicReference<Set<String>> classpathSymbolClasspathElements = new AtomicReference<>();
 
 	private GroovyClassLoader classLoader;
-	private volatile URI previousContext;
-	private volatile JavaSourceLocator javaSourceLocator;
+	private final AtomicReference<URI> previousContext = new AtomicReference<>();
+	private final AtomicReference<JavaSourceLocator> javaSourceLocator = new AtomicReference<>();
 	private final DependencyGraph dependencyGraph = new DependencyGraph();
 
 	/**
@@ -161,9 +162,12 @@ public class ProjectScope {
 	public ProjectScope(Path projectRoot, ICompilationUnitFactory factory) {
 		this.projectRoot = projectRoot;
 		this.compilationUnitFactory = factory;
-		this.javaSourceLocator = new JavaSourceLocator();
+		this.javaSourceLocator.set(new JavaSourceLocator());
 		if (projectRoot != null) {
-			this.javaSourceLocator.addProjectRoot(projectRoot);
+			JavaSourceLocator locator = this.javaSourceLocator.get();
+			if (locator != null) {
+				locator.addProjectRoot(projectRoot);
+			}
 		}
 	}
 
@@ -186,11 +190,11 @@ public class ProjectScope {
 	}
 
 	public ASTNodeVisitor getAstVisitor() {
-		return astVisitor;
+		return astVisitor.get();
 	}
 
 	public void setAstVisitor(ASTNodeVisitor astVisitor) {
-		this.astVisitor = astVisitor;
+		this.astVisitor.set(astVisitor);
 	}
 
 	public Map<URI, List<Diagnostic>> getPrevDiagnosticsByFile() {
@@ -202,26 +206,26 @@ public class ProjectScope {
 	}
 
 	public ScanResult getClassGraphScanResult() {
-		return classGraphScanResult;
+		return classGraphScanResult.get();
 	}
 
 	public void setClassGraphScanResult(ScanResult classGraphScanResult) {
-		this.classGraphScanResult = classGraphScanResult;
-		this.classGraphClasspathFiles = null; // clear filter when result changes externally
+		this.classGraphScanResult.set(classGraphScanResult);
+		this.classGraphClasspathFiles.set(null); // clear filter when result changes externally
 	}
 
 	public ClasspathSymbolIndex getClasspathSymbolIndex() {
-		return classpathSymbolIndex;
+		return classpathSymbolIndex.get();
 	}
 
 	public Set<String> getClasspathSymbolClasspathElements() {
-		return classpathSymbolClasspathElements;
+		return classpathSymbolClasspathElements.get();
 	}
 
 	public void clearClasspathIndexes() {
-		classpathSymbolIndex = null;
-		classpathSymbolClasspathElements = null;
-		classGraphClasspathFiles = null;
+		classpathSymbolIndex.set(null);
+		classpathSymbolClasspathElements.set(null);
+		classGraphClasspathFiles.set(null);
 	}
 
 	/**
@@ -229,7 +233,7 @@ public class ProjectScope {
 	 * {@code null} if the scan result is an exact match (no filtering needed).
 	 */
 	public Set<File> getClassGraphClasspathFiles() {
-		return classGraphClasspathFiles;
+		return classGraphClasspathFiles.get();
 	}
 
 	public GroovyClassLoader getClassLoader() {
@@ -241,15 +245,15 @@ public class ProjectScope {
 	}
 
 	public URI getPreviousContext() {
-		return previousContext;
+		return previousContext.get();
 	}
 
 	public void setPreviousContext(URI previousContext) {
-		this.previousContext = previousContext;
+		this.previousContext.set(previousContext);
 	}
 
 	public JavaSourceLocator getJavaSourceLocator() {
-		return javaSourceLocator;
+		return javaSourceLocator.get();
 	}
 
 	public DependencyGraph getDependencyGraph() {
@@ -327,8 +331,9 @@ public class ProjectScope {
 	 *         not yet available
 	 */
 	public ScanResult ensureClassGraphScanned() {
-		if (classGraphScanResult != null) {
-			return classGraphScanResult;
+		ScanResult scanResult = classGraphScanResult.get();
+		if (scanResult != null) {
+			return scanResult;
 		}
 		lock.writeLock().lock();
 		try {
@@ -343,8 +348,9 @@ public class ProjectScope {
 	 * already holds the write lock.
 	 */
 	public ScanResult ensureClassGraphScannedUnsafe() {
-		if (classGraphScanResult != null) {
-			return classGraphScanResult;
+		ScanResult scanResult = classGraphScanResult.get();
+		if (scanResult != null) {
+			return scanResult;
 		}
 		GroovyClassLoader cl = classLoader;
 		if (cl == null) {
@@ -356,26 +362,27 @@ public class ProjectScope {
 			com.tomaszrup.groovyls.compiler.SharedClassGraphCache.AcquireResult ar =
 					sharedCache.acquireWithResult(cl);
 			if (ar != null) {
-				classGraphScanResult = ar.getScanResult();
-				classGraphClasspathFiles = ar.getOwnClasspathFiles();
+				classGraphScanResult.set(ar.getScanResult());
+				classGraphClasspathFiles.set(ar.getOwnClasspathFiles());
 			} else {
-				classGraphScanResult = null;
-				classGraphClasspathFiles = null;
+				classGraphScanResult.set(null);
+				classGraphClasspathFiles.set(null);
 			}
 		} catch (VirtualMachineError e) {
 			org.slf4j.LoggerFactory.getLogger(ProjectScope.class)
 					.error("ClassGraph scan failed with {}: {} — classpath type suggestions "
 							+ "will be unavailable for {}", e.getClass().getSimpleName(),
 						e.getMessage(), projectRoot);
-			classGraphScanResult = null;
-			classGraphClasspathFiles = null;
+			classGraphScanResult.set(null);
+			classGraphClasspathFiles.set(null);
 		}
-		return classGraphScanResult;
+		return classGraphScanResult.get();
 	}
 
 	public ClasspathSymbolIndex ensureClasspathSymbolIndex() {
-		if (classpathSymbolIndex != null) {
-			return classpathSymbolIndex;
+		ClasspathSymbolIndex index = classpathSymbolIndex.get();
+		if (index != null) {
+			return index;
 		}
 		lock.writeLock().lock();
 		try {
@@ -386,8 +393,9 @@ public class ProjectScope {
 	}
 
 	public ClasspathSymbolIndex ensureClasspathSymbolIndexUnsafe() {
-		if (classpathSymbolIndex != null) {
-			return classpathSymbolIndex;
+		ClasspathSymbolIndex index = classpathSymbolIndex.get();
+		if (index != null) {
+			return index;
 		}
 		GroovyClassLoader cl = classLoader;
 		if (cl == null) {
@@ -397,21 +405,21 @@ public class ProjectScope {
 			SharedClasspathIndexCache.AcquireResult ar =
 					SharedClasspathIndexCache.getInstance().acquireWithResult(cl);
 			if (ar != null) {
-				classpathSymbolIndex = ar.getIndex();
-				classpathSymbolClasspathElements = ar.getOwnClasspathElementPaths();
+				classpathSymbolIndex.set(ar.getIndex());
+				classpathSymbolClasspathElements.set(ar.getOwnClasspathElementPaths());
 			} else {
-				classpathSymbolIndex = null;
-				classpathSymbolClasspathElements = null;
+				classpathSymbolIndex.set(null);
+				classpathSymbolClasspathElements.set(null);
 			}
 		} catch (VirtualMachineError e) {
 			org.slf4j.LoggerFactory.getLogger(ProjectScope.class)
 					.error("Classpath symbol index build failed with {}: {} — classpath type suggestions "
 							+ "will be unavailable for {}", e.getClass().getSimpleName(),
 						e.getMessage(), projectRoot);
-			classpathSymbolIndex = null;
-			classpathSymbolClasspathElements = null;
+			classpathSymbolIndex.set(null);
+			classpathSymbolClasspathElements.set(null);
 		}
-		return classpathSymbolIndex;
+		return classpathSymbolIndex.get();
 	}
 
 	/**
@@ -420,8 +428,9 @@ public class ProjectScope {
 	 * This should be called whenever the classpath is resolved or updated.
 	 */
 	void updateSourceLocatorClasspath(List<String> classpathEntries) {
-		if (classpathEntries != null && !classpathEntries.isEmpty() && javaSourceLocator != null) {
-			javaSourceLocator.addClasspathJars(classpathEntries);
+		JavaSourceLocator locator = javaSourceLocator.get();
+		if (classpathEntries != null && !classpathEntries.isEmpty() && locator != null) {
+			locator.addClasspathJars(classpathEntries);
 		}
 	}
 
@@ -452,14 +461,14 @@ public class ProjectScope {
 		long usedBefore = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
 
 		// Release ClassGraph scan result
-		ScanResult sr = classGraphScanResult;
+		ScanResult sr = classGraphScanResult.get();
 		if (sr != null) {
 			com.tomaszrup.groovyls.compiler.SharedClassGraphCache.getInstance().release(sr);
-			classGraphScanResult = null;
-			classGraphClasspathFiles = null;
+			classGraphScanResult.set(null);
+			classGraphClasspathFiles.set(null);
 		}
-		classpathSymbolIndex = null;
-		classpathSymbolClasspathElements = null;
+		classpathSymbolIndex.set(null);
+		classpathSymbolClasspathElements.set(null);
 
 		// Close classloader
 		GroovyClassLoader cl = classLoader;
@@ -473,7 +482,7 @@ public class ProjectScope {
 		}
 
 		// Clear AST data and compilation unit
-		astVisitor = null;
+		astVisitor.set(null);
 		compilationUnit = null;
 		prevDiagnosticsByFile = null;
 
@@ -509,15 +518,15 @@ public class ProjectScope {
 	 */
 	public void dispose() {
 		// Release ClassGraph scan result
-		ScanResult sr = classGraphScanResult;
+		ScanResult sr = classGraphScanResult.get();
 		if (sr != null) {
 			com.tomaszrup.groovyls.compiler.SharedClassGraphCache.getInstance().release(sr);
-			classGraphScanResult = null;
-			classGraphClasspathFiles = null;
+			classGraphScanResult.set(null);
+			classGraphClasspathFiles.set(null);
 		}
 
 		// Dispose source locator (releases shared source-JAR index)
-		JavaSourceLocator locator = javaSourceLocator;
+		JavaSourceLocator locator = javaSourceLocator.get();
 		if (locator != null) {
 			locator.dispose();
 		}
@@ -534,7 +543,7 @@ public class ProjectScope {
 		}
 
 		// Clear AST data
-		astVisitor = null;
+		astVisitor.set(null);
 		compilationUnit = null;
 		prevDiagnosticsByFile = null;
 	}

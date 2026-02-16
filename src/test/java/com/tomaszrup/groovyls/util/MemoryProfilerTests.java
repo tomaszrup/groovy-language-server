@@ -102,14 +102,12 @@ class MemoryProfilerTests {
 
 	@Test
 	void testLogProfileWithNullScopes() {
-		// Should not throw
-		MemoryProfiler.logProfile(null);
+		Assertions.assertDoesNotThrow(() -> MemoryProfiler.logProfile(null));
 	}
 
 	@Test
 	void testLogProfileWithEmptyScopes() {
-		// Should not throw
-		MemoryProfiler.logProfile(Collections.emptyList());
+		Assertions.assertDoesNotThrow(() -> MemoryProfiler.logProfile(Collections.emptyList()));
 	}
 
 	@Test
@@ -128,8 +126,7 @@ class MemoryProfilerTests {
 
 		List<ProjectScope> scopes = List.of(scopeA, scopeB, scopeC);
 
-		// Should not throw regardless of enabled state
-		MemoryProfiler.logProfile(scopes);
+		Assertions.assertDoesNotThrow(() -> MemoryProfiler.logProfile(scopes));
 	}
 
 	@Test
@@ -169,8 +166,7 @@ class MemoryProfilerTests {
 		CompilationUnitFactory factoryC = new CompilationUnitFactory();
 		ProjectScope empty = new ProjectScope(PROJECT_C, factoryC);
 
-		// Should handle mix of active, evicted, and empty scopes
-		MemoryProfiler.logProfile(List.of(active, evicted, empty));
+		Assertions.assertDoesNotThrow(() -> MemoryProfiler.logProfile(List.of(active, evicted, empty)));
 	}
 
 	// --- Top-3 ranking ---
@@ -210,8 +206,7 @@ class MemoryProfilerTests {
 			scopes.add(new ProjectScope(roots[i], factory));
 		}
 
-		// Should not throw and should only report top 3
-		MemoryProfiler.logProfile(scopes);
+		Assertions.assertDoesNotThrow(() -> MemoryProfiler.logProfile(scopes));
 	}
 
 	@Test
@@ -219,8 +214,7 @@ class MemoryProfilerTests {
 		CompilationUnitFactory factory = new CompilationUnitFactory();
 		ProjectScope scope = new ProjectScope(null, factory);
 
-		// Should handle null project root gracefully
-		MemoryProfiler.logProfile(List.of(scope));
+		Assertions.assertDoesNotThrow(() -> MemoryProfiler.logProfile(List.of(scope)));
 	}
 
 	// --- isEnabled ---

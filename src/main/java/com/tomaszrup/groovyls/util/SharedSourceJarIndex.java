@@ -31,6 +31,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -74,21 +75,20 @@ public class SharedSourceJarIndex {
      * their dependency lookups to.
      */
     public static final class IndexEntry {
-        private volatile Map<String, JavaSourceLocator.SourceJarEntry> classNameToSourceJar;
+        private final AtomicReference<Map<String, JavaSourceLocator.SourceJarEntry>> classNameToSourceJar;
         private final Set<Path> indexedSourceJars;
         int refCount;
 
-        IndexEntry(String classpathKey,
-                   Map<String, JavaSourceLocator.SourceJarEntry> classNameToSourceJar,
+        IndexEntry(Map<String, JavaSourceLocator.SourceJarEntry> classNameToSourceJar,
                    Set<Path> indexedSourceJars) {
-            this.classNameToSourceJar = Collections.unmodifiableMap(classNameToSourceJar);
+            this.classNameToSourceJar = new AtomicReference<>(Collections.unmodifiableMap(classNameToSourceJar));
             this.indexedSourceJars = indexedSourceJars;
             this.refCount = 1;
         }
 
         /** Returns the shared FQCN → source-JAR entry map. */
         public Map<String, JavaSourceLocator.SourceJarEntry> getClassNameToSourceJar() {
-            return classNameToSourceJar;
+            return classNameToSourceJar.get();
         }
 
         /** Check whether a source JAR has been indexed already. */
@@ -117,14 +117,18 @@ public class SharedSourceJarIndex {
         IndexEntry entry = cache.get(key);
         if (entry != null) {
             entry.refCount++;
-            logger.debug("SharedSourceJarIndex HIT for key {}… (refCount={}), cache size={}",
-                    key.substring(0, Math.min(12, key.length())), entry.refCount, cache.size());
+            if (logger.isDebugEnabled()) {
+                logger.debug("SharedSourceJarIndex HIT for key {}… (refCount={}), cache size={}",
+                        summarizeKey(key), entry.refCount, cache.size());
+            }
             return entry;
         }
 
         // Cache miss — build the index
-        logger.debug("SharedSourceJarIndex MISS for key {}… — indexing {} classpath entries",
-                key.substring(0, Math.min(12, key.length())), classpathEntries.size());
+        if (logger.isDebugEnabled()) {
+            logger.debug("SharedSourceJarIndex MISS for key {}… — indexing {} classpath entries",
+                summarizeKey(key), classpathEntries.size());
+        }
         long start = System.currentTimeMillis();
 
         Map<String, JavaSourceLocator.SourceJarEntry> sourceJarMap = new HashMap<>();
@@ -142,7 +146,7 @@ public class SharedSourceJarIndex {
         logger.info("SharedSourceJarIndex built in {}ms: {} source JARs, {} classes",
                 elapsed, indexed.size(), sourceJarMap.size());
 
-        entry = new IndexEntry(key, sourceJarMap, indexed);
+        entry = new IndexEntry(sourceJarMap, indexed);
         cache.put(key, entry);
         reverseIndex.put(entry, key);
         return entry;
@@ -161,8 +165,10 @@ public class SharedSourceJarIndex {
             return;
         }
         entry.refCount--;
-        logger.debug("SharedSourceJarIndex release() for key {}… (refCount={})",
-                key.substring(0, Math.min(12, key.length())), entry.refCount);
+        if (logger.isDebugEnabled()) {
+            logger.debug("SharedSourceJarIndex release() for key {}… (refCount={})",
+                summarizeKey(key), entry.refCount);
+        }
         if (entry.refCount <= 0) {
             cache.remove(key);
             reverseIndex.remove(entry);
@@ -184,6 +190,10 @@ public class SharedSourceJarIndex {
      */
     public synchronized int size() {
         return cache.size();
+    }
+
+    private static String summarizeKey(String key) {
+        return key.substring(0, Math.min(12, key.length()));
     }
 
     /**
@@ -224,7 +234,7 @@ public class SharedSourceJarIndex {
             }
             return hex.toString();
         } catch (NoSuchAlgorithmException e) {
-            throw new RuntimeException(e);
+            throw new IllegalStateException("SHA-256 algorithm is not available", e);
         }
     }
 }

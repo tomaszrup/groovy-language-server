@@ -30,6 +30,7 @@ import java.nio.file.Path;
 import java.util.Comparator;
 import java.util.List;
 
+@SuppressWarnings("all")
 class StaleClassFileCleanerTests {
 
     private Path tempDir;

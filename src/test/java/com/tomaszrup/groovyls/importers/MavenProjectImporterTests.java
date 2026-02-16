@@ -48,9 +48,7 @@ class MavenProjectImporterTests {
         if (tempDir != null && Files.exists(tempDir)) {
             Files.walk(tempDir)
                     .sorted(Comparator.reverseOrder())
-                    .forEach(p -> {
-                        try { Files.deleteIfExists(p); } catch (IOException ignored) {}
-                    });
+                    .forEach(this::deletePathQuietly);
         }
     }
 
@@ -105,25 +103,16 @@ class MavenProjectImporterTests {
     // --- discoverProjects tests ---
 
     @Test
-    void testDiscoverProjectsFindsMavenProjectWithJavaSrc() throws IOException {
-        Path project = tempDir.resolve("myproject");
-        Files.createDirectories(project.resolve("src/main/java"));
-        Files.createFile(project.resolve("pom.xml"));
+    void testDiscoverProjectsFindsMavenProjectWithJvmSrc() throws IOException {
+        for (String sourceDir : new String[] {"src/main/java", "src/main/groovy", "src/test/java", "src/test/groovy"}) {
+            Path caseRoot = tempDir.resolve("case-" + sourceDir.replace('/', '-'));
+            Files.createDirectories(caseRoot.resolve(sourceDir));
+            Files.createFile(caseRoot.resolve("pom.xml"));
 
-        List<Path> discovered = importer.discoverProjects(tempDir);
-        Assertions.assertEquals(1, discovered.size());
-        Assertions.assertEquals(project, discovered.get(0));
-    }
-
-    @Test
-    void testDiscoverProjectsFindsMavenProjectWithGroovySrc() throws IOException {
-        Path project = tempDir.resolve("myproject");
-        Files.createDirectories(project.resolve("src/main/groovy"));
-        Files.createFile(project.resolve("pom.xml"));
-
-        List<Path> discovered = importer.discoverProjects(tempDir);
-        Assertions.assertEquals(1, discovered.size());
-        Assertions.assertEquals(project, discovered.get(0));
+            List<Path> discovered = importer.discoverProjects(caseRoot);
+            Assertions.assertEquals(1, discovered.size());
+            Assertions.assertEquals(caseRoot, discovered.get(0));
+        }
     }
 
     @Test
@@ -188,28 +177,6 @@ class MavenProjectImporterTests {
         // Only the child should be discovered (parent has no src dirs)
         Assertions.assertEquals(1, discovered.size());
         Assertions.assertEquals(child, discovered.get(0));
-    }
-
-    @Test
-    void testDiscoverProjectsFindsTestJavaSrcDir() throws IOException {
-        Path project = tempDir.resolve("testonly");
-        Files.createDirectories(project.resolve("src/test/java"));
-        Files.createFile(project.resolve("pom.xml"));
-
-        List<Path> discovered = importer.discoverProjects(tempDir);
-        Assertions.assertEquals(1, discovered.size());
-        Assertions.assertEquals(project, discovered.get(0));
-    }
-
-    @Test
-    void testDiscoverProjectsFindsTestGroovySrcDir() throws IOException {
-        Path project = tempDir.resolve("testgroovy");
-        Files.createDirectories(project.resolve("src/test/groovy"));
-        Files.createFile(project.resolve("pom.xml"));
-
-        List<Path> discovered = importer.discoverProjects(tempDir);
-        Assertions.assertEquals(1, discovered.size());
-        Assertions.assertEquals(project, discovered.get(0));
     }
 
     // --- importProject: discoverClassDirs tests ---
@@ -461,5 +428,13 @@ class MavenProjectImporterTests {
             project.resolve("target/test-classes").toString());
 
         Assertions.assertTrue(importer.shouldMarkClasspathResolved(project, classpath));
+        }
+
+        private void deletePathQuietly(Path path) {
+        try {
+            Files.deleteIfExists(path);
+        } catch (IOException ignored) {
+            // best-effort cleanup for temporary test files
+        }
         }
 }

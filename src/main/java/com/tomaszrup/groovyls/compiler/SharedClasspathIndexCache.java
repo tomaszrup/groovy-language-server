@@ -242,10 +242,12 @@ public class SharedClasspathIndexCache {
 				return normalizePath(Paths.get(uri));
 			}
 		} catch (Exception ignored) {
+			// Ignore malformed/non-file URI strings and fall back to plain-path parsing.
 		}
 		try {
 			return normalizePath(Paths.get(url));
 		} catch (Exception ignored) {
+			// Ignore invalid path strings.
 			return null;
 		}
 	}
@@ -272,7 +274,7 @@ public class SharedClasspathIndexCache {
 
 	private static Set<String> toCanonicalPathSet(Set<File> files) {
 		if (files == null || files.isEmpty()) {
-			return null;
+			return Collections.emptySet();
 		}
 		Set<String> result = new HashSet<>(files.size() * 2);
 		for (File file : files) {
@@ -290,7 +292,7 @@ public class SharedClasspathIndexCache {
 
 	private static Set<String> urlStringsToCanonicalPathSet(Set<String> urls) {
 		if (urls == null || urls.isEmpty()) {
-			return null;
+			return Collections.emptySet();
 		}
 		Set<String> paths = new HashSet<>(urls.size() * 2);
 		for (String url : urls) {
@@ -302,6 +304,7 @@ public class SharedClasspathIndexCache {
 				try {
 					paths.add(new File(url).getCanonicalFile().getPath());
 				} catch (Exception ignored) {
+					// Ignore entries that cannot be represented as local filesystem paths.
 				}
 			}
 		}

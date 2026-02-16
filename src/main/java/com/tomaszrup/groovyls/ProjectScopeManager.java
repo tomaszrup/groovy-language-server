@@ -31,8 +31,8 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
+
+import java.util.concurrent.atomic.AtomicReference;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
@@ -46,7 +46,7 @@ import com.tomaszrup.groovyls.config.CompilationUnitFactory;
 import com.tomaszrup.groovyls.config.ICompilationUnitFactory;
 import com.tomaszrup.groovyls.util.FileContentsTracker;
 import com.tomaszrup.groovyls.util.GroovyVersionDetector;
-import com.tomaszrup.groovyls.util.MemoryProfiler;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -57,6 +57,12 @@ import org.slf4j.LoggerFactory;
  */
 public class ProjectScopeManager {
 	private static final Logger logger = LoggerFactory.getLogger(ProjectScopeManager.class);
+	private static final String KEY_GROOVY = "groovy";
+	private static final String KEY_CLASSPATH = "classpath";
+	private static final String KEY_ENABLED = "enabled";
+	private static final String KEY_FORMATTING = "formatting";
+	private static final String KEY_SEMANTIC_HIGHLIGHTING = "semanticHighlighting";
+	private static final String KEY_ORGANIZE_IMPORTS = "organizeImports";
 
 	public enum ClasspathUpdateResult {
 		IGNORED_PROJECT_SCOPES,
@@ -65,14 +71,15 @@ public class ProjectScopeManager {
 		UPDATED
 	}
 
-	private volatile Path workspaceRoot;
+	private final AtomicReference<Path> workspaceRoot = new AtomicReference<>();
 
 	// Default scope (used when no build-tool projects are registered, e.g. in tests)
-	private volatile ProjectScope defaultScope;
+	private final AtomicReference<ProjectScope> defaultScope = new AtomicReference<>();
 	// Per-project scopes, sorted by path length desc for longest-prefix match.
 	// Volatile reference to an effectively-immutable list; swapped atomically
 	// in addProjects(). Reads are lock-free.
-	private volatile List<ProjectScope> projectScopes = Collections.emptyList();
+	private final AtomicReference<List<ProjectScope>> projectScopes =
+			new AtomicReference<>(Collections.emptyList());
 	// True while a background project import (Gradle/Maven) is in progress.
 	// When true, didOpen/didChange/didClose skip compilation on the defaultScope
 	// to avoid wrong diagnostics (no classpath, entire workspace scanned).
@@ -107,46 +114,33 @@ public class ProjectScopeManager {
 	private final FileContentsTracker fileContentsTracker;
 
 	/** Supplier of language client — set after server connects. */
-	private volatile LanguageClient languageClient;
+	private final AtomicReference<LanguageClient> languageClient = new AtomicReference<>();
 
-	/**
-	 * TTL in seconds for scope eviction. When a scope hasn't been accessed
-	 * for longer than this duration, its heavy state is evicted. 0 disables.
-	 */
-	private volatile long scopeEvictionTTLSeconds = 300;
-
-	/**
-	 * Heap usage ratio (0.0–1.0) above which emergency scope eviction is
-	 * triggered. Default: 0.75 (75%). Can be lowered to evict sooner under
-	 * memory pressure, or raised to allow more aggressive memory use.
-	 */
-	private volatile double memoryPressureThreshold = 0.75;
-
-	/** Handle for the periodic eviction sweep, cancelled on shutdown. */
-	private volatile ScheduledFuture<?> evictionFuture;
+	private final ScopeEvictionManager evictionManager;
 
 	public ProjectScopeManager(ICompilationUnitFactory defaultFactory, FileContentsTracker fileContentsTracker) {
 		this.fileContentsTracker = fileContentsTracker;
-		this.defaultScope = new ProjectScope(null, defaultFactory);
+		this.evictionManager = new ScopeEvictionManager(projectScopes::get, fileContentsTracker);
+		this.defaultScope.set(new ProjectScope(null, defaultFactory));
 		// The default scope is not managed by a build tool, so its classpath
 		// is always "resolved" (user-configured or empty).
-		this.defaultScope.setClasspathResolved(true);
+		this.defaultScope.get().setClasspathResolved(true);
 	}
 
 	// --- Accessors ---
 
 	public Path getWorkspaceRoot() {
-		return workspaceRoot;
+		return workspaceRoot.get();
 	}
 
 	public void setWorkspaceRoot(Path workspaceRoot) {
 		synchronized (scopesMutationLock) {
-			this.workspaceRoot = workspaceRoot;
-			ProjectScope ds = new ProjectScope(workspaceRoot, defaultScope.getCompilationUnitFactory());
+			this.workspaceRoot.set(workspaceRoot);
+			ProjectScope ds = new ProjectScope(workspaceRoot, defaultScope.get().getCompilationUnitFactory());
 			ds.setCompiled(false);
 			ds.setFullyCompiled(false);
 			ds.setClasspathResolved(true);
-			this.defaultScope = ds;
+			this.defaultScope.set(ds);
 			scopeCache.clear();
 		}
 	}
@@ -172,15 +166,15 @@ public class ProjectScopeManager {
 	}
 
 	public void setLanguageClient(LanguageClient client) {
-		this.languageClient = client;
+		this.languageClient.set(client);
 	}
 
 	public ProjectScope getDefaultScope() {
-		return defaultScope;
+		return defaultScope.get();
 	}
 
 	public List<ProjectScope> getProjectScopes() {
-		return projectScopes;
+		return projectScopes.get();
 	}
 
 	/**
@@ -188,7 +182,7 @@ public class ProjectScopeManager {
 	 * Active = compiled and not evicted. Thread-safe snapshot.
 	 */
 	public int[] getScopeCounts() {
-		List<ProjectScope> scopes = projectScopes;
+		List<ProjectScope> scopes = projectScopes.get();
 		int total = scopes.size();
 		int active = 0;
 		int evicted = 0;
@@ -211,61 +205,68 @@ public class ProjectScopeManager {
 	 * doesn't belong to any of them.
 	 */
 	public ProjectScope findProjectScope(URI uri) {
-		if (!projectScopes.isEmpty() && uri != null) {
-			// Fast path: check the cache first to avoid repeated linear scans
-			ProjectScope cached = scopeCache.get(uri);
-			if (cached != null) {
-				cached.touchAccess();
-				logger.debug("findProjectScope({}) cache-hit -> {}", uri, cached.getProjectRoot());
-				return cached;
-			}
+		List<ProjectScope> scopes = projectScopes.get();
+		if (scopes.isEmpty() || uri == null) {
+			return defaultScope.get();
+		}
 
-			Path filePath = toFilePath(uri);
-			if (filePath != null) {
-				ProjectScope matched = findScopeByFilePath(filePath);
-				if (matched != null) {
-					scopeCache.put(uri, matched);
-					matched.touchAccess();
-					logger.debug("findProjectScope({}) -> {}", uri, matched.getProjectRoot());
-					return matched;
-				}
-			}
+		ProjectScope cached = scopeCache.get(uri);
+		if (cached != null) {
+			return cacheAndTouch(uri, cached, "cache-hit");
+		}
 
-			if (filePath == null) {
-				ProjectScope virtualMatched = findScopeForVirtualUri(uri);
-				if (virtualMatched != null) {
-					scopeCache.put(uri, virtualMatched);
-					virtualMatched.touchAccess();
-					logger.debug("findProjectScope({}) virtual-uri match -> {}", uri, virtualMatched.getProjectRoot());
-					return virtualMatched;
-				}
-			}
+		Path filePath = toFilePath(uri);
+		ProjectScope resolved = resolveScopeForUri(uri, filePath, scopes);
+		if (resolved != null) {
+			return resolved;
+		}
 
-			if (filePath == null && projectScopes.size() == 1) {
-				ProjectScope onlyScope = projectScopes.get(0);
-				scopeCache.put(uri, onlyScope);
-				onlyScope.touchAccess();
-				logger.debug("findProjectScope({}) non-file fallback -> {}", uri, onlyScope.getProjectRoot());
-				return onlyScope;
-			}
+		logNoMatchingProjectScope(uri, scopes);
+		return null;
+	}
 
-			StringBuilder candidates = new StringBuilder();
-			int limit = Math.min(projectScopes.size(), 5);
-			for (int i = 0; i < limit; i++) {
-				if (i > 0) {
-					candidates.append(", ");
-				}
-				candidates.append(projectScopes.get(i).getProjectRoot());
+	private ProjectScope resolveScopeForUri(URI uri, Path filePath, List<ProjectScope> scopes) {
+		if (filePath != null) {
+			ProjectScope matched = findScopeByFilePath(filePath);
+			if (matched != null) {
+				return cacheAndTouch(uri, matched, "path-match");
 			}
-			logger.warn("findProjectScope({}) -> no matching project scope found. candidateRoots=[{}] totalRoots={}",
-					uri, candidates, projectScopes.size());
 			return null;
 		}
-		return defaultScope;
+
+		ProjectScope virtualMatched = findScopeForVirtualUri(uri);
+		if (virtualMatched != null) {
+			return cacheAndTouch(uri, virtualMatched, "virtual-uri match");
+		}
+
+		if (scopes.size() == 1) {
+			return cacheAndTouch(uri, scopes.get(0), "non-file fallback");
+		}
+		return null;
+	}
+
+	private ProjectScope cacheAndTouch(URI uri, ProjectScope scope, String reason) {
+		scopeCache.put(uri, scope);
+		scope.touchAccess();
+		logger.debug("findProjectScope({}) {} -> {}", uri, reason, scope.getProjectRoot());
+		return scope;
+	}
+
+	private void logNoMatchingProjectScope(URI uri, List<ProjectScope> scopes) {
+		StringBuilder candidates = new StringBuilder();
+		int limit = Math.min(scopes.size(), 5);
+		for (int i = 0; i < limit; i++) {
+			if (i > 0) {
+				candidates.append(", ");
+			}
+			candidates.append(scopes.get(i).getProjectRoot());
+		}
+		logger.warn("findProjectScope({}) -> no matching project scope found. candidateRoots=[{}] totalRoots={}",
+				uri, candidates, scopes.size());
 	}
 
 	private ProjectScope findScopeByFilePath(Path filePath) {
-		for (ProjectScope scope : projectScopes) {
+		for (ProjectScope scope : projectScopes.get()) {
 			if (scope.getProjectRoot() != null && filePath.startsWith(scope.getProjectRoot())) {
 				return scope;
 			}
@@ -274,10 +275,7 @@ public class ProjectScopeManager {
 	}
 
 	private ProjectScope findScopeForVirtualUri(URI uri) {
-		if (uri == null) {
-			return null;
-		}
-		if (!"jar".equalsIgnoreCase(uri.getScheme())) {
+		if (!isJarUri(uri)) {
 			return null;
 		}
 
@@ -290,20 +288,9 @@ public class ProjectScopeManager {
 				: sourceJarName;
 
 		List<ProjectScope> candidates = new ArrayList<>();
-		for (ProjectScope scope : projectScopes) {
-			List<String> classpath = scope.getCompilationUnitFactory().getAdditionalClasspathList();
-			if (classpath == null || classpath.isEmpty()) {
-				continue;
-			}
-			for (String entry : classpath) {
-				String fileName = fileNameOfClasspathEntry(entry);
-				if (fileName == null) {
-					continue;
-				}
-				if (binaryJarName.equalsIgnoreCase(fileName) || sourceJarName.equalsIgnoreCase(fileName)) {
-					candidates.add(scope);
-					break;
-				}
+		for (ProjectScope scope : projectScopes.get()) {
+			if (hasMatchingClasspathJar(scope, sourceJarName, binaryJarName)) {
+				candidates.add(scope);
 			}
 		}
 
@@ -313,6 +300,29 @@ public class ProjectScopeManager {
 		return candidates.stream()
 				.max(Comparator.comparingLong(ProjectScope::getLastAccessedAt))
 				.orElse(null);
+	}
+
+	private boolean isJarUri(URI uri) {
+		return uri != null && "jar".equalsIgnoreCase(uri.getScheme());
+	}
+
+	private boolean hasMatchingClasspathJar(ProjectScope scope, String sourceJarName, String binaryJarName) {
+		List<String> classpath = scope.getCompilationUnitFactory().getAdditionalClasspathList();
+		if (classpath == null || classpath.isEmpty()) {
+			return false;
+		}
+		for (String entry : classpath) {
+			if (matchesJarName(entry, sourceJarName, binaryJarName)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private boolean matchesJarName(String classpathEntry, String sourceJarName, String binaryJarName) {
+		String fileName = fileNameOfClasspathEntry(classpathEntry);
+		return fileName != null
+				&& (binaryJarName.equalsIgnoreCase(fileName) || sourceJarName.equalsIgnoreCase(fileName));
 	}
 
 	private String extractSourceJarName(URI uri) {
@@ -351,33 +361,45 @@ public class ProjectScopeManager {
 			return null;
 		}
 		String scheme = uri.getScheme();
-		if (scheme == null || "file".equalsIgnoreCase(scheme)) {
-			try {
-				return Paths.get(uri);
-			} catch (Exception ignored) {
-				return null;
-			}
+		if (isFileScheme(scheme)) {
+			return pathFromUri(uri);
 		}
-
-		if ("jar".equalsIgnoreCase(scheme)) {
-			String ssp = uri.getSchemeSpecificPart();
-			if (ssp != null) {
-				int separator = ssp.indexOf("!/");
-				if (separator > 0) {
-					String outer = ssp.substring(0, separator);
-					try {
-						URI outerUri = URI.create(outer);
-						if ("file".equalsIgnoreCase(outerUri.getScheme())) {
-							return Paths.get(outerUri);
-						}
-					} catch (Exception ignored) {
-						return null;
-					}
-				}
-			}
+		if (!"jar".equalsIgnoreCase(scheme)) {
+			return null;
 		}
+		URI outerUri = extractOuterJarUri(uri);
+		if (outerUri == null || !"file".equalsIgnoreCase(outerUri.getScheme())) {
+			return null;
+		}
+		return pathFromUri(outerUri);
+	}
 
-		return null;
+	private boolean isFileScheme(String scheme) {
+		return scheme == null || "file".equalsIgnoreCase(scheme);
+	}
+
+	private Path pathFromUri(URI uri) {
+		try {
+			return Paths.get(uri);
+		} catch (Exception ignored) {
+			return null;
+		}
+	}
+
+	private URI extractOuterJarUri(URI jarUri) {
+		String ssp = jarUri.getSchemeSpecificPart();
+		if (ssp == null) {
+			return null;
+		}
+		int separator = ssp.indexOf("!/");
+		if (separator <= 0) {
+			return null;
+		}
+		try {
+			return URI.create(ssp.substring(0, separator));
+		} catch (Exception ignored) {
+			return null;
+		}
 	}
 
 	/**
@@ -405,10 +427,11 @@ public class ProjectScopeManager {
 	 * otherwise just the default scope.
 	 */
 	public List<ProjectScope> getAllScopes() {
-		if (!projectScopes.isEmpty()) {
-			return projectScopes;
+		List<ProjectScope> scopes = projectScopes.get();
+		if (!scopes.isEmpty()) {
+			return scopes;
 		}
-		return Collections.singletonList(defaultScope);
+		return Collections.singletonList(defaultScope.get());
 	}
 
 	/**
@@ -424,11 +447,7 @@ public class ProjectScopeManager {
 	 * {@code requestResolution()} call is never reached.
 	 */
 	public boolean isImportPendingFor(ProjectScope scope) {
-		// Pre-discovery phase: only the default scope exists and import is running
-		if (importInProgress && scope == defaultScope && projectScopes.isEmpty()) {
-			return true;
-		}
-		return false;
+		return importInProgress && scope == defaultScope.get() && projectScopes.get().isEmpty();
 	}
 
 	/**
@@ -486,7 +505,7 @@ public class ProjectScopeManager {
 			}
 
 			newScopes.sort((a, b) -> b.getProjectRoot().toString().length() - a.getProjectRoot().toString().length());
-			projectScopes = Collections.unmodifiableList(newScopes);
+			projectScopes.set(Collections.unmodifiableList(newScopes));
 			scopeCache.clear();
 		}
 
@@ -520,46 +539,50 @@ public class ProjectScopeManager {
 									 Map<Path, String> projectGroovyVersions,
 									 Map<Path, Boolean> projectResolvedStates) {
 		logger.info("updateProjectClasspaths called with {} projects", projectClasspaths.size());
-		List<ProjectScope> scopes = projectScopes;
+		List<ProjectScope> scopes = projectScopes.get();
 
 		for (ProjectScope scope : scopes) {
 			List<String> classpath = projectClasspaths.get(scope.getProjectRoot());
-			if (classpath != null) {
-				boolean markResolved = projectResolvedStates.getOrDefault(scope.getProjectRoot(), true);
-				String detectedGroovyVersion = projectGroovyVersions.get(scope.getProjectRoot());
-				if (detectedGroovyVersion == null || detectedGroovyVersion.isEmpty()) {
-					detectedGroovyVersion = GroovyVersionDetector.detect(classpath).orElse(null);
-				}
-				// Clean stale .class files before applying the classpath so
-				// deleted source files don't remain visible to the compiler.
-				if (scope.getProjectRoot() != null) {
-					com.tomaszrup.groovyls.util.StaleClassFileCleaner
-							.cleanClasspathEntries(scope.getProjectRoot(), classpath);
-				}
-				scope.getLock().writeLock().lock();
-				try {
-					scope.getCompilationUnitFactory()
-							.setAdditionalClasspathList(classpath);
-					scope.setClasspathResolved(markResolved);
-					scope.setDetectedGroovyVersion(detectedGroovyVersion);
-					// Index dependency source JARs for Go to Definition
-					scope.updateSourceLocatorClasspath(classpath);
-					// Classpath changed — evict stale Javadoc cache entries
-					JavadocResolver.clearCache();
-
-					if (scope.isCompiled()) {
-						logger.info("Forcing recompilation of {} with resolved classpath",
-								scope.getProjectRoot());
-						scope.setCompiled(false);					scope.setFullyCompiled(false);						scope.setCompilationUnit(null);
-						scope.setAstVisitor(null);
-					}
-				} finally {
-					scope.getLock().writeLock().unlock();
-				}
-				if (!markResolved) {
-					logger.info("Applied classpath for {} but keeping scope unresolved", scope.getProjectRoot());
-				}
+			if (classpath == null) {
+				continue;
 			}
+			applyProjectClasspathUpdate(scope, classpath,
+					projectGroovyVersions.get(scope.getProjectRoot()),
+					projectResolvedStates.getOrDefault(scope.getProjectRoot(), true));
+		}
+	}
+
+	private void applyProjectClasspathUpdate(ProjectScope scope,
+									List<String> classpath,
+									String groovyVersion,
+									boolean markResolved) {
+		String detectedGroovyVersion = groovyVersion;
+		if (detectedGroovyVersion == null || detectedGroovyVersion.isEmpty()) {
+			detectedGroovyVersion = GroovyVersionDetector.detect(classpath).orElse(null);
+		}
+		if (scope.getProjectRoot() != null) {
+			com.tomaszrup.groovyls.util.StaleClassFileCleaner
+					.cleanClasspathEntries(scope.getProjectRoot(), classpath);
+		}
+		scope.getLock().writeLock().lock();
+		try {
+			scope.getCompilationUnitFactory().setAdditionalClasspathList(classpath);
+			scope.setClasspathResolved(markResolved);
+			scope.setDetectedGroovyVersion(detectedGroovyVersion);
+			scope.updateSourceLocatorClasspath(classpath);
+			JavadocResolver.clearCache();
+			if (scope.isCompiled()) {
+				logger.info("Forcing recompilation of {} with resolved classpath", scope.getProjectRoot());
+				scope.setCompiled(false);
+				scope.setFullyCompiled(false);
+				scope.setCompilationUnit(null);
+				scope.setAstVisitor(null);
+			}
+		} finally {
+			scope.getLock().writeLock().unlock();
+		}
+		if (!markResolved) {
+			logger.info("Applied classpath for {} but keeping scope unresolved", scope.getProjectRoot());
 		}
 	}
 
@@ -688,7 +711,7 @@ public class ProjectScopeManager {
 			}
 
 			newScopes.sort((a, b) -> b.getProjectRoot().toString().length() - a.getProjectRoot().toString().length());
-			projectScopes = Collections.unmodifiableList(newScopes);
+			projectScopes.set(Collections.unmodifiableList(newScopes));
 			scopeCache.clear();
 			logger.info("Registered {} project scope(s)", newScopes.size());
 		}
@@ -719,23 +742,23 @@ public class ProjectScopeManager {
 	// --- Configuration ---
 
 	public void updateFeatureToggles(JsonObject settings) {
-		if (!settings.has("groovy") || !settings.get("groovy").isJsonObject()) {
+		if (!settings.has(KEY_GROOVY) || !settings.get(KEY_GROOVY).isJsonObject()) {
 			return;
 		}
-		JsonObject groovy = settings.get("groovy").getAsJsonObject();
-		if (groovy.has("semanticHighlighting") && groovy.get("semanticHighlighting").isJsonObject()) {
-			JsonObject sh = groovy.get("semanticHighlighting").getAsJsonObject();
-			if (sh.has("enabled") && sh.get("enabled").isJsonPrimitive()) {
-				this.semanticHighlightingEnabled = sh.get("enabled").getAsBoolean();
+		JsonObject groovy = settings.get(KEY_GROOVY).getAsJsonObject();
+		if (groovy.has(KEY_SEMANTIC_HIGHLIGHTING) && groovy.get(KEY_SEMANTIC_HIGHLIGHTING).isJsonObject()) {
+			JsonObject sh = groovy.get(KEY_SEMANTIC_HIGHLIGHTING).getAsJsonObject();
+			if (sh.has(KEY_ENABLED) && sh.get(KEY_ENABLED).isJsonPrimitive()) {
+				this.semanticHighlightingEnabled = sh.get(KEY_ENABLED).getAsBoolean();
 			}
 		}
-		if (groovy.has("formatting") && groovy.get("formatting").isJsonObject()) {
-			JsonObject fmt = groovy.get("formatting").getAsJsonObject();
-			if (fmt.has("enabled") && fmt.get("enabled").isJsonPrimitive()) {
-				this.formattingEnabled = fmt.get("enabled").getAsBoolean();
+		if (groovy.has(KEY_FORMATTING) && groovy.get(KEY_FORMATTING).isJsonObject()) {
+			JsonObject fmt = groovy.get(KEY_FORMATTING).getAsJsonObject();
+			if (fmt.has(KEY_ENABLED) && fmt.get(KEY_ENABLED).isJsonPrimitive()) {
+				this.formattingEnabled = fmt.get(KEY_ENABLED).getAsBoolean();
 			}
-			if (fmt.has("organizeImports") && fmt.get("organizeImports").isJsonPrimitive()) {
-				this.formattingOrganizeImportsEnabled = fmt.get("organizeImports").getAsBoolean();
+			if (fmt.has(KEY_ORGANIZE_IMPORTS) && fmt.get(KEY_ORGANIZE_IMPORTS).isJsonPrimitive()) {
+				this.formattingOrganizeImportsEnabled = fmt.get(KEY_ORGANIZE_IMPORTS).getAsBoolean();
 			}
 		}
 	}
@@ -747,13 +770,11 @@ public class ProjectScopeManager {
 	public ClasspathUpdateResult updateClasspathFromSettings(JsonObject settings) {
 		List<String> classpathList = new ArrayList<>();
 
-		if (settings.has("groovy") && settings.get("groovy").isJsonObject()) {
-			JsonObject groovy = settings.get("groovy").getAsJsonObject();
-			if (groovy.has("classpath") && groovy.get("classpath").isJsonArray()) {
-				JsonArray classpath = groovy.get("classpath").getAsJsonArray();
-				classpath.forEach(element -> {
-					classpathList.add(element.getAsString());
-				});
+		if (settings.has(KEY_GROOVY) && settings.get(KEY_GROOVY).isJsonObject()) {
+			JsonObject groovy = settings.get(KEY_GROOVY).getAsJsonObject();
+			if (groovy.has(KEY_CLASSPATH) && groovy.get(KEY_CLASSPATH).isJsonArray()) {
+				JsonArray classpath = groovy.get(KEY_CLASSPATH).getAsJsonArray();
+				classpath.forEach(element -> classpathList.add(element.getAsString()));
 			}
 		}
 
@@ -765,18 +786,19 @@ public class ProjectScopeManager {
 	 * are registered).
 	 */
 	public ClasspathUpdateResult updateClasspath(List<String> classpathList) {
-		if (!projectScopes.isEmpty()) {
-			logger.debug("updateClasspath() ignored — {} project scope(s) are active", projectScopes.size());
+		List<ProjectScope> scopes = projectScopes.get();
+		if (!scopes.isEmpty()) {
+			logger.debug("updateClasspath() ignored — {} project scope(s) are active", scopes.size());
 			return ClasspathUpdateResult.IGNORED_PROJECT_SCOPES;
 		}
 		if (importInProgress) {
 			logger.info("updateClasspath() deferred — project import in progress");
-			defaultScope.getCompilationUnitFactory().setAdditionalClasspathList(classpathList);
+			defaultScope.get().getCompilationUnitFactory().setAdditionalClasspathList(classpathList);
 			return ClasspathUpdateResult.DEFERRED_IMPORT_IN_PROGRESS;
 		}
 		// Store the classpath but don't compile — the caller (CompilationService)
 		// handles compilation when needed.
-		ProjectScope ds = defaultScope;
+		ProjectScope ds = defaultScope.get();
 		if (classpathList.equals(ds.getCompilationUnitFactory().getAdditionalClasspathList())) {
 			return ClasspathUpdateResult.UNCHANGED;
 		}
@@ -791,229 +813,35 @@ public class ProjectScopeManager {
 	 * Returns true if the default scope classpath actually changed.
 	 */
 	public boolean hasClasspathChanged(List<String> classpathList) {
-		return !classpathList.equals(defaultScope.getCompilationUnitFactory().getAdditionalClasspathList());
+		return !classpathList.equals(defaultScope.get().getCompilationUnitFactory().getAdditionalClasspathList());
 	}
 
 	// --- Diagnostics helpers ---
 
-	// --- Eviction ---
+	// --- Eviction (delegated to ScopeEvictionManager) ---
 
-	/**
-	 * Set the scope eviction TTL. 0 disables eviction.
-	 */
 	public void setScopeEvictionTTLSeconds(long ttlSeconds) {
-		this.scopeEvictionTTLSeconds = ttlSeconds;
-		logger.info("Scope eviction TTL set to {} seconds", ttlSeconds);
+		evictionManager.setScopeEvictionTTLSeconds(ttlSeconds);
 	}
 
 	public long getScopeEvictionTTLSeconds() {
-		return scopeEvictionTTLSeconds;
+		return evictionManager.getScopeEvictionTTLSeconds();
 	}
 
-	/**
-	 * Set the heap usage ratio above which emergency scope eviction triggers.
-	 * Valid range: 0.3–0.95. Values outside this range are clamped.
-	 */
 	public void setMemoryPressureThreshold(double threshold) {
-		this.memoryPressureThreshold = Math.max(0.3, Math.min(0.95, threshold));
-		logger.info("Memory pressure threshold set to {} %", (int) (this.memoryPressureThreshold * 100));
+		evictionManager.setMemoryPressureThreshold(threshold);
 	}
 
 	public double getMemoryPressureThreshold() {
-		return memoryPressureThreshold;
+		return evictionManager.getMemoryPressureThreshold();
 	}
 
-	/**
-	 * Start the periodic eviction scheduler. Should be called once after
-	 * the server is fully initialized.
-	 *
-	 * @param schedulingPool the shared scheduling pool from ExecutorPools
-	 */
 	public void startEvictionScheduler(ScheduledExecutorService schedulingPool) {
-		if (scopeEvictionTTLSeconds <= 0) {
-			logger.info("Scope eviction disabled (TTL=0)");
-			return;
-		}
-		// Run sweep every 60 seconds
-		long sweepIntervalSeconds = Math.max(30, scopeEvictionTTLSeconds / 5);
-		evictionFuture = schedulingPool.scheduleAtFixedRate(
-				this::performEvictionSweep,
-				sweepIntervalSeconds,
-				sweepIntervalSeconds,
-				TimeUnit.SECONDS);
-		logger.info("Scope eviction scheduler started (TTL={}s, sweep interval={}s)",
-				scopeEvictionTTLSeconds, sweepIntervalSeconds);
+		evictionManager.startEvictionScheduler(schedulingPool);
 	}
 
-	/**
-	 * Periodic sweep that evicts heavy state from inactive scopes and
-	 * cleans up expired entries from the closed-file cache.
-	 *
-	 * <p>In addition to TTL-based eviction, this sweep also performs
-	 * <b>memory-pressure eviction</b>: when heap usage exceeds the
-	 * configured {@link #memoryPressureThreshold}, the least-recently-accessed
-	 * compiled scope (without open files) is evicted immediately regardless
-	 * of TTL.  This acts as a safety valve to prevent OOM in large
-	 * multi-project workspaces.</p>
-	 *
-	 * <p><b>Dynamic TTL scaling</b>: when heap usage is between 60% and the
-	 * pressure threshold, the effective TTL is linearly scaled down to half
-	 * its configured value. This causes idle scopes to be evicted sooner as
-	 * memory fills up, before reaching the emergency eviction trigger.</p>
-	 */
-	private void performEvictionSweep() {
-		// --- Periodic memory profiling (opt-in) ---
-		MemoryProfiler.logProfile(projectScopes);
-
-		// Sweep expired closed-file cache entries
-		int expired = fileContentsTracker.sweepExpiredClosedFileCache();
-		if (expired > 0) {
-			logger.debug("Swept {} expired closed-file cache entries", expired);
-		}
-
-		long ttlMs = scopeEvictionTTLSeconds * 1000;
-		if (ttlMs <= 0) {
-			return;
-		}
-		long now = System.currentTimeMillis();
-		Set<URI> openURIs = fileContentsTracker.getOpenURIs();
-
-		// --- Memory-pressure eviction ---
-		Runtime rt = Runtime.getRuntime();
-		long usedBytes = rt.totalMemory() - rt.freeMemory();
-		long maxBytes = rt.maxMemory();
-		double heapUsageRatio = (double) usedBytes / maxBytes;
-		double threshold = memoryPressureThreshold;
-
-		if (heapUsageRatio > threshold) {
-			logger.warn("High memory pressure: heap at {}/{} MB ({} %, threshold {} %). "
-					+ "Attempting emergency scope eviction.",
-					usedBytes / (1024 * 1024), maxBytes / (1024 * 1024),
-					(int) (heapUsageRatio * 100), (int) (threshold * 100));
-			evictLeastRecentScope(openURIs, now);
-		}
-
-		// --- Dynamic TTL scaling ---
-		// When heap usage is between 60% and the pressure threshold, linearly
-		// scale TTL down to 50% of its configured value. This evicts idle
-		// scopes sooner as memory fills up, reducing peak usage.
-		long effectiveTtlMs = ttlMs;
-		double scalingFloor = 0.60;
-		if (heapUsageRatio > scalingFloor && heapUsageRatio <= threshold) {
-			double scaleFactor = 1.0 - 0.5 * ((heapUsageRatio - scalingFloor) / (threshold - scalingFloor));
-			effectiveTtlMs = (long) (ttlMs * scaleFactor);
-			logger.debug("Dynamic TTL scaling: heap at {} %, effective TTL reduced to {}s (base {}s)",
-					(int) (heapUsageRatio * 100), effectiveTtlMs / 1000, scopeEvictionTTLSeconds);
-
-			// Also shed reference indexes — they're large, lazily-rebuilt,
-			// and only needed for Find References / Rename operations.
-			for (ProjectScope scope : projectScopes) {
-				if (scope.getAstVisitor() != null) {
-					scope.getAstVisitor().clearReferenceIndex();
-				}
-			}
-		}
-
-		// --- Standard TTL-based eviction ---
-		for (ProjectScope scope : projectScopes) {
-			if (scope.isEvicted() || !scope.isCompiled()) {
-				continue;
-			}
-
-			long idleMs = now - scope.getLastAccessedAt();
-			if (idleMs < effectiveTtlMs) {
-				continue;
-			}
-
-			// Don't evict scopes that have open files
-			if (hasOpenFilesInScope(scope, openURIs)) {
-				continue;
-			}
-
-			// Evict under write lock
-			scope.getLock().writeLock().lock();
-			try {
-				// Double-check under lock
-				if (!scope.isEvicted() && scope.isCompiled()
-						&& (now - scope.getLastAccessedAt()) >= ttlMs
-						&& !hasOpenFilesInScope(scope, openURIs)) {
-					logger.info("Evicting scope {} (idle for {}s)",
-							scope.getProjectRoot(), idleMs / 1000);
-					scope.evictHeavyState();
-				}
-			} finally {
-				scope.getLock().writeLock().unlock();
-			}
-		}
-	}
-
-	/**
-	 * Evicts the least-recently-accessed compiled scope that has no open
-	 * files.  Used as an emergency memory-pressure relief.
-	 */
-	private void evictLeastRecentScope(Set<URI> openURIs, long now) {
-		ProjectScope lruScope = null;
-		long oldestAccess = Long.MAX_VALUE;
-
-		for (ProjectScope scope : projectScopes) {
-			if (scope.isEvicted() || !scope.isCompiled()) {
-				continue;
-			}
-			if (hasOpenFilesInScope(scope, openURIs)) {
-				continue;
-			}
-			if (scope.getLastAccessedAt() < oldestAccess) {
-				oldestAccess = scope.getLastAccessedAt();
-				lruScope = scope;
-			}
-		}
-
-		if (lruScope != null) {
-			lruScope.getLock().writeLock().lock();
-			try {
-				if (!lruScope.isEvicted() && lruScope.isCompiled()
-						&& !hasOpenFilesInScope(lruScope, openURIs)) {
-					long idleMs = now - lruScope.getLastAccessedAt();
-					logger.info("Memory-pressure eviction: scope {} (idle for {}s)",
-							lruScope.getProjectRoot(), idleMs / 1000);
-					lruScope.evictHeavyState();
-				}
-			} finally {
-				lruScope.getLock().writeLock().unlock();
-			}
-		} else {
-			logger.warn("Memory-pressure eviction: no eligible scopes to evict");
-		}
-	}
-
-	/**
-	 * Returns true if any of the given open URIs belong to the given scope.
-	 */
-	private boolean hasOpenFilesInScope(ProjectScope scope, Set<URI> openURIs) {
-		if (openURIs.isEmpty() || scope.getProjectRoot() == null) {
-			return false;
-		}
-		for (URI uri : openURIs) {
-			try {
-				if (Paths.get(uri).startsWith(scope.getProjectRoot())) {
-					return true;
-				}
-			} catch (Exception e) {
-				// ignore URIs that can't be converted to Path
-			}
-		}
-		return false;
-	}
-
-	/**
-	 * Stop the eviction scheduler. Called on server shutdown.
-	 */
 	public void stopEvictionScheduler() {
-		ScheduledFuture<?> f = evictionFuture;
-		if (f != null) {
-			f.cancel(false);
-			evictionFuture = null;
-		}
+		evictionManager.stopEvictionScheduler();
 	}
 
 	// --- Diagnostics helpers ---
@@ -1023,12 +851,14 @@ public class ProjectScopeManager {
 	 * reported errors on, so the client clears them.
 	 */
 	public void clearDefaultScopeDiagnostics() {
-		if (defaultScope.getPrevDiagnosticsByFile() != null && languageClient != null) {
-			for (URI uri : defaultScope.getPrevDiagnosticsByFile().keySet()) {
-				languageClient.publishDiagnostics(
+		ProjectScope ds = defaultScope.get();
+		LanguageClient client = languageClient.get();
+		if (ds.getPrevDiagnosticsByFile() != null && client != null) {
+			for (URI uri : ds.getPrevDiagnosticsByFile().keySet()) {
+				client.publishDiagnostics(
 						new PublishDiagnosticsParams(uri.toString(), new ArrayList<>()));
 			}
-			defaultScope.setPrevDiagnosticsByFile(null);
+			ds.setPrevDiagnosticsByFile(null);
 		}
 	}
 }

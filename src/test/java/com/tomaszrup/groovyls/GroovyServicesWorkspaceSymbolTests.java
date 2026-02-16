@@ -247,7 +247,6 @@ class GroovyServicesWorkspaceSymbolTests {
 		services.didOpen(new DidOpenTextDocumentParams(new TextDocumentItem(uriA, LANGUAGE_GROOVY, 1, contentA)));
 
 		Path fileB = projectBSrc.resolve("OnlyB.groovy");
-		String uriB = fileB.toUri().toString();
 		String contentB = "class OnlyB { void fromB() {} }";
 		Files.writeString(fileB, contentB);
 
@@ -276,6 +275,7 @@ class GroovyServicesWorkspaceSymbolTests {
 				try {
 					Files.deleteIfExists(path);
 				} catch (Exception ignored) {
+					// Best-effort cleanup in tests; ignore deletions blocked by file locks.
 				}
 			});
 		}

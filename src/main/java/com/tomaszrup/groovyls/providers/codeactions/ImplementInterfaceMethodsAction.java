@@ -50,6 +50,8 @@ import com.tomaszrup.groovyls.util.GroovyLanguageServerUtils;
  */
 public class ImplementInterfaceMethodsAction {
 
+    private static final String JAVA_LANG_OBJECT = "java.lang.Object";
+
     private ASTNodeVisitor ast;
 
     public ImplementInterfaceMethodsAction(ASTNodeVisitor ast) {
@@ -102,54 +104,62 @@ public class ImplementInterfaceMethodsAction {
      * that are not already implemented by the given class.
      */
     private List<MethodNode> collectUnimplementedMethods(ClassNode classNode) {
-        Set<String> implementedSignatures = new HashSet<>();
+        Set<String> implementedSignatures = collectImplementedSignatures(classNode);
+        List<MethodNode> unimplemented = new ArrayList<>();
+        Set<String> addedSignatures = new HashSet<>();
+        addUnimplementedFromInterfaces(classNode, implementedSignatures, addedSignatures, unimplemented);
+        addUnimplementedFromSuperClasses(classNode, implementedSignatures, addedSignatures, unimplemented);
+        return unimplemented;
+    }
 
-        // Collect signatures of methods already implemented
+    private Set<String> collectImplementedSignatures(ClassNode classNode) {
+        Set<String> implementedSignatures = new HashSet<>();
         for (MethodNode method : classNode.getMethods()) {
             if (!method.isAbstract()) {
                 implementedSignatures.add(getMethodSignature(method));
             }
         }
+        return implementedSignatures;
+    }
 
-        List<MethodNode> unimplemented = new ArrayList<>();
-        Set<String> addedSignatures = new HashSet<>();
-
-        // Walk interfaces
+    private void addUnimplementedFromInterfaces(ClassNode classNode, Set<String> implementedSignatures,
+            Set<String> addedSignatures, List<MethodNode> unimplemented) {
         for (ClassNode iface : classNode.getAllInterfaces()) {
             for (MethodNode method : iface.getMethods()) {
                 if (method.isAbstract() || iface.isInterface()) {
-                    String sig = getMethodSignature(method);
-                    if (!implementedSignatures.contains(sig) && addedSignatures.add(sig)) {
-                        unimplemented.add(method);
-                    }
+                    addIfUnimplemented(method, implementedSignatures, addedSignatures, unimplemented);
                 }
             }
         }
+    }
 
-        // Walk abstract superclass chain
-        ClassNode superClass = null;
-        try {
-            superClass = classNode.getSuperClass();
-        } catch (NoClassDefFoundError e) {
-            // ignore
-        }
-        while (superClass != null && !superClass.getName().equals("java.lang.Object")) {
+    private void addUnimplementedFromSuperClasses(ClassNode classNode, Set<String> implementedSignatures,
+            Set<String> addedSignatures, List<MethodNode> unimplemented) {
+        ClassNode superClass = safeGetSuperClass(classNode);
+        while (superClass != null && !JAVA_LANG_OBJECT.equals(superClass.getName())) {
             for (MethodNode method : superClass.getMethods()) {
                 if (method.isAbstract()) {
-                    String sig = getMethodSignature(method);
-                    if (!implementedSignatures.contains(sig) && addedSignatures.add(sig)) {
-                        unimplemented.add(method);
-                    }
+                    addIfUnimplemented(method, implementedSignatures, addedSignatures, unimplemented);
                 }
             }
-            try {
-                superClass = superClass.getSuperClass();
-            } catch (NoClassDefFoundError e) {
-                break;
-            }
+            superClass = safeGetSuperClass(superClass);
         }
+    }
 
-        return unimplemented;
+    private void addIfUnimplemented(MethodNode method, Set<String> implementedSignatures,
+            Set<String> addedSignatures, List<MethodNode> unimplemented) {
+        String signature = getMethodSignature(method);
+        if (!implementedSignatures.contains(signature) && addedSignatures.add(signature)) {
+            unimplemented.add(method);
+        }
+    }
+
+    private ClassNode safeGetSuperClass(ClassNode classNode) {
+        try {
+            return classNode.getSuperClass();
+        } catch (NoClassDefFoundError e) {
+            return null;
+        }
     }
 
     private String getMethodSignature(MethodNode method) {

@@ -35,6 +35,7 @@ import java.util.Set;
  * shared across classloaders with identical classpaths, reference-counted
  * correctly, and evicted when all references are released.
  */
+@SuppressWarnings("all")
 class SharedClassGraphCacheTests {
 
 	private SharedClassGraphCache cache;

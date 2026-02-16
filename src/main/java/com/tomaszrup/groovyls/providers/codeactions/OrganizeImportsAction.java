@@ -56,6 +56,11 @@ import com.tomaszrup.groovyls.util.GroovyLanguageServerUtils;
  */
 public class OrganizeImportsAction {
 
+    private static final String IMPORT_JAVA_PREFIX = "import java.";
+    private static final String IMPORT_JAVAX_PREFIX = "import javax.";
+    private static final Set<String> PRIMITIVE_TYPE_NAMES = Set.of(
+            "void", "boolean", "int", "long", "float", "double", "byte", "short", "char");
+
     private ASTNodeVisitor ast;
 
     public OrganizeImportsAction(ASTNodeVisitor ast) {
@@ -63,60 +68,25 @@ public class OrganizeImportsAction {
     }
 
     public List<CodeAction> provideCodeActions(CodeActionParams params) {
-        if (ast == null) {
+        ModuleContext context = resolveModuleContext(params);
+        if (context == null || context.imports == null || context.imports.isEmpty()) {
             return Collections.emptyList();
         }
 
-        URI uri = URI.create(params.getTextDocument().getUri());
-
-        // Find the ModuleNode for this file
-        ModuleNode moduleNode = findModuleNode(uri);
-        if (moduleNode == null) {
-            return Collections.emptyList();
-        }
-
-        List<ImportNode> imports = moduleNode.getImports();
-        if (imports == null || imports.isEmpty()) {
-            return Collections.emptyList();
-        }
-
-        // Collect all type names referenced in the file's AST
-        Set<String> referencedTypes = collectReferencedTypes(uri, moduleNode);
-
-        // Find unused imports
-        List<ImportNode> unusedImports = new ArrayList<>();
-        List<ImportNode> usedImports = new ArrayList<>();
-        for (ImportNode importNode : imports) {
-            String className = importNode.getClassName();
-            String simpleName = className;
-            int lastDot = className.lastIndexOf('.');
-            if (lastDot >= 0) {
-                simpleName = className.substring(lastDot + 1);
-            }
-            // An import with an alias uses the alias name
-            String alias = importNode.getAlias();
-            String nameToCheck = (alias != null && !alias.equals(simpleName)) ? alias : simpleName;
-
-            if (referencedTypes.contains(nameToCheck) || referencedTypes.contains(className)) {
-                usedImports.add(importNode);
-            } else {
-                unusedImports.add(importNode);
-            }
-        }
+        ImportUsage importUsage = splitImportUsage(context.imports,
+            collectReferencedTypes(context.uri));
 
         List<CodeAction> actions = new ArrayList<>();
-
-        // "Remove Unused Imports" action
-        if (!unusedImports.isEmpty()) {
-            CodeAction removeAction = createRemoveUnusedImportsAction(uri, moduleNode, imports, usedImports,
-                    unusedImports);
+        if (!importUsage.unusedImports.isEmpty()) {
+                CodeAction removeAction = createRemoveUnusedImportsAction(context.uri,
+                    context.imports, importUsage.usedImports, importUsage.unusedImports);
             if (removeAction != null) {
                 actions.add(removeAction);
             }
         }
 
-        // "Organize Imports" action (sort + remove unused)
-        CodeAction organizeAction = createOrganizeImportsAction(uri, moduleNode, imports, usedImports);
+        CodeAction organizeAction = createOrganizeImportsAction(context.uri,
+                context.imports, importUsage.usedImports);
         if (organizeAction != null) {
             actions.add(organizeAction);
         }
@@ -143,26 +113,69 @@ public class OrganizeImportsAction {
             return null;
         }
 
-        Set<String> referencedTypes = collectReferencedTypes(uri, moduleNode);
+        ImportUsage importUsage = splitImportUsage(imports, collectReferencedTypes(uri));
+        String sortedBlock = buildImportBlock(importUsage.usedImports, true);
+        return createImportBlockEdit(imports, sortedBlock);
+    }
 
-        List<ImportNode> usedImports = new ArrayList<>();
-        for (ImportNode importNode : imports) {
-            String className = importNode.getClassName();
-            String simpleName = className;
-            int lastDot = className.lastIndexOf('.');
-            if (lastDot >= 0) {
-                simpleName = className.substring(lastDot + 1);
-            }
-            String alias = importNode.getAlias();
-            String nameToCheck = (alias != null && !alias.equals(simpleName)) ? alias : simpleName;
+    private static class ModuleContext {
+        final URI uri;
+        final List<ImportNode> imports;
 
-            if (referencedTypes.contains(nameToCheck) || referencedTypes.contains(className)) {
-                usedImports.add(importNode);
-            }
+        ModuleContext(URI uri, List<ImportNode> imports) {
+            this.uri = uri;
+            this.imports = imports;
+        }
+    }
+
+    private static class ImportUsage {
+        final List<ImportNode> usedImports;
+        final List<ImportNode> unusedImports;
+
+        ImportUsage(List<ImportNode> usedImports, List<ImportNode> unusedImports) {
+            this.usedImports = usedImports;
+            this.unusedImports = unusedImports;
+        }
+    }
+
+    private ModuleContext resolveModuleContext(CodeActionParams params) {
+        if (ast == null) {
+            return null;
         }
 
-        String sortedBlock = buildImportBlock(usedImports, true);
-        return createImportBlockEdit(moduleNode, imports, sortedBlock);
+        URI uri = URI.create(params.getTextDocument().getUri());
+        ModuleNode moduleNode = findModuleNode(uri);
+        if (moduleNode == null) {
+            return null;
+        }
+
+        return new ModuleContext(uri, moduleNode.getImports());
+    }
+
+    private ImportUsage splitImportUsage(List<ImportNode> imports, Set<String> referencedTypes) {
+        List<ImportNode> usedImports = new ArrayList<>();
+        List<ImportNode> unusedImports = new ArrayList<>();
+        for (ImportNode importNode : imports) {
+            if (isImportUsed(importNode, referencedTypes)) {
+                usedImports.add(importNode);
+            } else {
+                unusedImports.add(importNode);
+            }
+        }
+        return new ImportUsage(usedImports, unusedImports);
+    }
+
+    private boolean isImportUsed(ImportNode importNode, Set<String> referencedTypes) {
+        String className = importNode.getClassName();
+        String simpleName = className;
+        int lastDot = className.lastIndexOf('.');
+        if (lastDot >= 0) {
+            simpleName = className.substring(lastDot + 1);
+        }
+
+        String alias = importNode.getAlias();
+        String nameToCheck = (alias != null && !alias.equals(simpleName)) ? alias : simpleName;
+        return referencedTypes.contains(nameToCheck) || referencedTypes.contains(className);
     }
 
     private ModuleNode findModuleNode(URI uri) {
@@ -180,97 +193,127 @@ public class OrganizeImportsAction {
      * in the file. Includes class declarations, superclass/interface references,
      * field types, variable types, constructor calls, class expressions, etc.
      */
-    private Set<String> collectReferencedTypes(URI uri, ModuleNode moduleNode) {
+    private Set<String> collectReferencedTypes(URI uri) {
         Set<String> types = new HashSet<>();
 
         List<ASTNode> nodes = ast.getNodes(uri);
         for (ASTNode node : nodes) {
-            // Skip the import nodes themselves
-            if (node instanceof ImportNode) {
-                continue;
-            }
-
-            if (node instanceof ClassNode) {
-                ClassNode classNode = (ClassNode) node;
-                // Add superclass and interfaces
-                addClassNodeType(types, classNode.getUnresolvedSuperClass());
-                for (ClassNode iface : classNode.getUnresolvedInterfaces()) {
-                    addClassNodeType(types, iface);
-                }
-            } else if (node instanceof AnnotationNode) {
-                AnnotationNode annotationNode = (AnnotationNode) node;
-                addClassNodeType(types, annotationNode.getClassNode());
-            } else if (node instanceof ClassExpression) {
-                ClassExpression expr = (ClassExpression) node;
-                addClassNodeType(types, expr.getType());
-            } else if (node instanceof ConstructorCallExpression) {
-                ConstructorCallExpression expr = (ConstructorCallExpression) node;
-                addClassNodeType(types, expr.getType());
-            } else if (node instanceof VariableExpression) {
-                VariableExpression expr = (VariableExpression) node;
-                if (expr.getOriginType() != null && !expr.isDynamicTyped()) {
-                    addClassNodeType(types, expr.getOriginType());
-                }
-            }
+            addDirectTypeReferences(types, node);
         }
 
-        // Also scan class nodes for field/property/method return/parameter types
         for (ASTNode node : nodes) {
-            if (node instanceof org.codehaus.groovy.ast.FieldNode) {
-                org.codehaus.groovy.ast.FieldNode field = (org.codehaus.groovy.ast.FieldNode) node;
-                addClassNodeType(types, field.getOriginType());
-            } else if (node instanceof org.codehaus.groovy.ast.PropertyNode) {
-                org.codehaus.groovy.ast.PropertyNode prop = (org.codehaus.groovy.ast.PropertyNode) node;
-                addClassNodeType(types, prop.getOriginType());
-            } else if (node instanceof org.codehaus.groovy.ast.MethodNode) {
-                org.codehaus.groovy.ast.MethodNode method = (org.codehaus.groovy.ast.MethodNode) node;
-                addClassNodeType(types, method.getReturnType());
-                for (org.codehaus.groovy.ast.Parameter param : method.getParameters()) {
-                    addClassNodeType(types, param.getOriginType());
-                }
-            }
+            addMemberTypeReferences(types, node);
         }
 
         return types;
+    }
+
+    private void addDirectTypeReferences(Set<String> types, ASTNode node) {
+        if (node instanceof ImportNode) {
+            return;
+        }
+
+        if (node instanceof ClassNode) {
+            ClassNode classNode = (ClassNode) node;
+            addClassNodeType(types, classNode.getUnresolvedSuperClass());
+            for (ClassNode iface : classNode.getUnresolvedInterfaces()) {
+                addClassNodeType(types, iface);
+            }
+            return;
+        }
+
+        if (node instanceof AnnotationNode) {
+            addClassNodeType(types, ((AnnotationNode) node).getClassNode());
+            return;
+        }
+
+        if (node instanceof ClassExpression) {
+            addClassNodeType(types, ((ClassExpression) node).getType());
+            return;
+        }
+
+        if (node instanceof ConstructorCallExpression) {
+            addClassNodeType(types, ((ConstructorCallExpression) node).getType());
+            return;
+        }
+
+        if (node instanceof VariableExpression) {
+            VariableExpression expr = (VariableExpression) node;
+            if (expr.getOriginType() != null && !expr.isDynamicTyped()) {
+                addClassNodeType(types, expr.getOriginType());
+            }
+        }
+    }
+
+    private void addMemberTypeReferences(Set<String> types, ASTNode node) {
+        if (node instanceof org.codehaus.groovy.ast.FieldNode) {
+            addClassNodeType(types, ((org.codehaus.groovy.ast.FieldNode) node).getOriginType());
+            return;
+        }
+
+        if (node instanceof org.codehaus.groovy.ast.PropertyNode) {
+            addClassNodeType(types, ((org.codehaus.groovy.ast.PropertyNode) node).getOriginType());
+            return;
+        }
+
+        if (node instanceof org.codehaus.groovy.ast.MethodNode) {
+            org.codehaus.groovy.ast.MethodNode method = (org.codehaus.groovy.ast.MethodNode) node;
+            addClassNodeType(types, method.getReturnType());
+            for (org.codehaus.groovy.ast.Parameter param : method.getParameters()) {
+                addClassNodeType(types, param.getOriginType());
+            }
+        }
     }
 
     private void addClassNodeType(Set<String> types, ClassNode classNode) {
         if (classNode == null) {
             return;
         }
+
         String name = classNode.getName();
-        if (name == null || name.equals("java.lang.Object") || name.startsWith("java.lang.")
-                || name.equals("void") || name.equals("boolean") || name.equals("int")
-                || name.equals("long") || name.equals("float") || name.equals("double")
-                || name.equals("byte") || name.equals("short") || name.equals("char")) {
-            // Skip primitives and auto-imported java.lang types
-        } else {
+        if (!isSkippableTypeName(name)) {
             types.add(name);
             String simpleName = classNode.getNameWithoutPackage();
             if (simpleName != null) {
                 types.add(simpleName);
             }
         }
-        // Handle generics
-        if (classNode.getGenericsTypes() != null) {
-            for (org.codehaus.groovy.ast.GenericsType gt : classNode.getGenericsTypes()) {
-                addClassNodeType(types, gt.getType());
-                if (gt.getUpperBounds() != null) {
-                    for (ClassNode bound : gt.getUpperBounds()) {
-                        addClassNodeType(types, bound);
-                    }
-                }
-                if (gt.getLowerBound() != null) {
-                    addClassNodeType(types, gt.getLowerBound());
-                }
-            }
+
+        addGenericTypeReferences(types, classNode);
+    }
+
+    private boolean isSkippableTypeName(String name) {
+        return name == null
+                || "java.lang.Object".equals(name)
+                || name.startsWith("java.lang.")
+                || PRIMITIVE_TYPE_NAMES.contains(name);
+    }
+
+    private void addGenericTypeReferences(Set<String> types, ClassNode classNode) {
+        if (classNode.getGenericsTypes() == null) {
+            return;
+        }
+
+        for (org.codehaus.groovy.ast.GenericsType gt : classNode.getGenericsTypes()) {
+            addClassNodeType(types, gt.getType());
+            addBounds(types, gt.getUpperBounds());
+            addClassNodeType(types, gt.getLowerBound());
         }
     }
 
-    private CodeAction createRemoveUnusedImportsAction(URI uri, ModuleNode moduleNode,
+    private void addBounds(Set<String> types, ClassNode[] bounds) {
+        if (bounds == null) {
+            return;
+        }
+        for (ClassNode bound : bounds) {
+            addClassNodeType(types, bound);
+        }
+    }
+
+    private CodeAction createRemoveUnusedImportsAction(URI uri,
             List<ImportNode> allImports, List<ImportNode> usedImports, List<ImportNode> unusedImports) {
         String newImportBlock = buildImportBlock(usedImports, false);
-        TextEdit edit = createImportBlockEdit(moduleNode, allImports, newImportBlock);
+        TextEdit edit = createImportBlockEdit(allImports, newImportBlock);
         if (edit == null) {
             return null;
         }
@@ -288,18 +331,15 @@ public class OrganizeImportsAction {
         return action;
     }
 
-    private CodeAction createOrganizeImportsAction(URI uri, ModuleNode moduleNode,
+    private CodeAction createOrganizeImportsAction(URI uri,
             List<ImportNode> allImports, List<ImportNode> usedImports) {
-        // Sort used imports
         String sortedBlock = buildImportBlock(usedImports, true);
         String currentBlock = buildImportBlock(allImports, false);
-
-        // Only offer if there's something to change
         if (sortedBlock.equals(currentBlock)) {
             return null;
         }
 
-        TextEdit edit = createImportBlockEdit(moduleNode, allImports, sortedBlock);
+        TextEdit edit = createImportBlockEdit(allImports, sortedBlock);
         if (edit == null) {
             return null;
         }
@@ -323,59 +363,75 @@ public class OrganizeImportsAction {
             return "";
         }
 
+        List<String> importLines = toImportLines(importNodes);
+        return sorted ? buildSortedImportBlock(importLines) : buildUnsortedImportBlock(importLines);
+    }
+
+    private List<String> toImportLines(List<ImportNode> importNodes) {
         List<String> importLines = new ArrayList<>();
         for (ImportNode importNode : importNodes) {
-            String alias = importNode.getAlias();
-            String className = importNode.getClassName();
-            String simpleName = className;
-            int lastDot = className.lastIndexOf('.');
-            if (lastDot >= 0) {
-                simpleName = className.substring(lastDot + 1);
-            }
-            if (alias != null && !alias.equals(simpleName)) {
-                importLines.add("import " + className + " as " + alias);
-            } else {
-                importLines.add("import " + className);
-            }
+            importLines.add(toImportLine(importNode));
+        }
+        return importLines;
+    }
+
+    private String toImportLine(ImportNode importNode) {
+        String alias = importNode.getAlias();
+        String className = importNode.getClassName();
+        String simpleName = className;
+        int lastDot = className.lastIndexOf('.');
+        if (lastDot >= 0) {
+            simpleName = className.substring(lastDot + 1);
         }
 
-        if (sorted) {
-            List<String> javaImports = importLines.stream()
-                    .filter(l -> l.startsWith("import java.") || l.startsWith("import javax."))
-                    .sorted()
-                    .collect(Collectors.toList());
-            List<String> otherImports = importLines.stream()
-                    .filter(l -> !l.startsWith("import java.") && !l.startsWith("import javax."))
-                    .sorted()
-                    .collect(Collectors.toList());
-
-            StringBuilder sb = new StringBuilder();
-            for (String line : javaImports) {
-                sb.append(line).append("\n");
-            }
-            if (!javaImports.isEmpty() && !otherImports.isEmpty()) {
-                sb.append("\n");
-            }
-            for (String line : otherImports) {
-                sb.append(line).append("\n");
-            }
-            sb.append("\n");
-            return sb.toString();
-        } else {
-            StringBuilder sb = new StringBuilder();
-            for (String line : importLines) {
-                sb.append(line).append("\n");
-            }
-            sb.append("\n");
-            return sb.toString();
+        if (alias != null && !alias.equals(simpleName)) {
+            return "import " + className + " as " + alias;
         }
+        return "import " + className;
+    }
+
+    private String buildSortedImportBlock(List<String> importLines) {
+        List<String> javaImports = importLines.stream()
+                .filter(this::isJavaImportLine)
+                .sorted()
+                .collect(Collectors.toList());
+        List<String> otherImports = importLines.stream()
+                .filter(line -> !isJavaImportLine(line))
+                .sorted()
+                .collect(Collectors.toList());
+
+        StringBuilder sb = new StringBuilder();
+        appendLines(sb, javaImports);
+        if (!javaImports.isEmpty() && !otherImports.isEmpty()) {
+            sb.append("\n");
+        }
+        appendLines(sb, otherImports);
+        sb.append("\n");
+        return sb.toString();
+    }
+
+    private String buildUnsortedImportBlock(List<String> importLines) {
+        StringBuilder sb = new StringBuilder();
+        appendLines(sb, importLines);
+        sb.append("\n");
+        return sb.toString();
+    }
+
+    private void appendLines(StringBuilder sb, List<String> lines) {
+        for (String line : lines) {
+            sb.append(line).append("\n");
+        }
+    }
+
+    private boolean isJavaImportLine(String line) {
+        return line.startsWith(IMPORT_JAVA_PREFIX) || line.startsWith(IMPORT_JAVAX_PREFIX);
     }
 
     /**
      * Creates a TextEdit that replaces the entire import block (from first import
      * to last import) with the given new text.
      */
-    private TextEdit createImportBlockEdit(ModuleNode moduleNode, List<ImportNode> allImports,
+    private TextEdit createImportBlockEdit(List<ImportNode> allImports,
             String newImportBlock) {
         if (allImports.isEmpty()) {
             return null;

@@ -24,6 +24,7 @@ import org.junit.jupiter.api.Test;
  * Unit tests for {@link SpockUtils}: block label detection, lifecycle method
  * detection, allowed successors, and description retrieval.
  */
+@SuppressWarnings("all")
 class SpockUtilsTests {
 
 	// ------------------------------------------------------------------

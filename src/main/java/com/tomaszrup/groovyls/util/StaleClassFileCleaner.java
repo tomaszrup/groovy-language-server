@@ -93,17 +93,15 @@ public final class StaleClassFileCleaner {
         Path classesRoot = projectRoot.resolve("build").resolve("classes");
         for (String entry : classpathEntries) {
             Path entryPath = Path.of(entry);
-            if (!entryPath.startsWith(classesRoot)) {
-                continue;
+            if (entryPath.startsWith(classesRoot)) {
+                Path relative = classesRoot.relativize(entryPath);
+                if (relative.getNameCount() >= 2) {
+                    String language = relative.getName(0).toString();
+                    String sourceSet = relative.getName(1).toString();
+                    Path sourceDir = projectRoot.resolve("src").resolve(sourceSet).resolve(language);
+                    cleanClassDir(entryPath, sourceDir, "." + language);
+                }
             }
-            Path relative = classesRoot.relativize(entryPath);
-            if (relative.getNameCount() < 2) {
-                continue;
-            }
-            String language = relative.getName(0).toString();
-            String sourceSet = relative.getName(1).toString();
-            Path sourceDir = projectRoot.resolve("src").resolve(sourceSet).resolve(language);
-            cleanClassDir(entryPath, sourceDir, "." + language);
         }
     }
 
@@ -141,11 +139,8 @@ public final class StaleClassFileCleaner {
 
             int deleted = 0;
             for (Path stale : toDelete) {
-                try {
-                    Files.deleteIfExists(stale);
+                if (deleteStaleClassFile(stale)) {
                     deleted++;
-                } catch (IOException e) {
-                    logger.debug("Could not delete stale class file {}: {}", stale, e.getMessage());
                 }
             }
             if (deleted > 0) {
@@ -153,6 +148,15 @@ public final class StaleClassFileCleaner {
             }
         } catch (IOException e) {
             logger.debug("Could not scan class dir {} for stale files: {}", classDir, e.getMessage());
+        }
+    }
+
+    private static boolean deleteStaleClassFile(Path stale) {
+        try {
+            return Files.deleteIfExists(stale);
+        } catch (IOException e) {
+            logger.debug("Could not delete stale class file {}: {}", stale, e.getMessage());
+            return false;
         }
     }
 }

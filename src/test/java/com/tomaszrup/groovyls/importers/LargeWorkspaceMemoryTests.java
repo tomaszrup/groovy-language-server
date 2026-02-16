@@ -151,6 +151,12 @@ class LargeWorkspaceMemoryTests {
         sharedJarDir = Files.createTempDirectory("groovyls-memory-test-jars");
         jarPathsByProject = new HashMap<>();
 
+        long requiredBytes = (long) PROJECT_COUNT * CLASSPATH_SIZE * JAR_SIZE_BYTES;
+        long availableBytes = Files.getFileStore(sharedJarDir).getUsableSpace();
+        Assumptions.assumeTrue(availableBytes > requiredBytes,
+            String.format("Insufficient disk space for LargeWorkspaceMemoryTests (required=%d bytes, available=%d bytes)",
+                requiredBytes, availableBytes));
+
         System.out.printf("Generating %,d dummy JARs in %s...%n", 
                 (long) PROJECT_COUNT * CLASSPATH_SIZE, sharedJarDir);
 
@@ -202,7 +208,8 @@ class LargeWorkspaceMemoryTests {
                     .forEach(p -> {
                         try {
                             Files.deleteIfExists(p);
-                        } catch (IOException ignored) {
+                        } catch (IOException e) {
+                            throw new RuntimeException("Failed to clean up shared jar path: " + p, e);
                         }
                     });
         }
@@ -224,7 +231,8 @@ class LargeWorkspaceMemoryTests {
                     .forEach(p -> {
                         try {
                             Files.deleteIfExists(p);
-                        } catch (IOException ignored) {
+                        } catch (IOException e) {
+                            throw new RuntimeException("Failed to clean up temp path: " + p, e);
                         }
                     });
         }
@@ -454,10 +462,7 @@ class LargeWorkspaceMemoryTests {
     private static void forceGC() {
         System.gc();
         System.gc();
-        try {
-            Thread.sleep(500);
-        } catch (InterruptedException ignored) {
-        }
+        java.util.concurrent.locks.LockSupport.parkNanos(java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(500));
     }
 
     // ---- Tests ----
@@ -750,5 +755,7 @@ class LargeWorkspaceMemoryTests {
                     projectCounts[i], heapMeasurements.get(i));
         }
         System.out.printf("╚═══════════════════════════════════════════════════════════════════════╝%n");
+        assertEquals(projectCounts.length, heapMeasurements.size(),
+            "Should collect one heap measurement per project count");
     }
 }

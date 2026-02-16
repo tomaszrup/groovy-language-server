@@ -85,55 +85,47 @@ public class UnusedImportFinder {
 
 		// Check regular imports (import com.example.Foo)
 		for (ImportNode importNode : moduleNode.getImports()) {
-			if (importNode.isStar()) {
-				continue; // star imports are not checked
-			}
-			if (importNode.getLineNumber() < 0) {
-				continue; // synthetic/implicit imports
-			}
-			ClassNode importedType = importNode.getType();
-			if (importedType == null) {
-				continue;
-			}
-
-			String simpleName = importedType.getNameWithoutPackage();
-			String alias = importNode.getAlias();
-
-			// The import is used if either its simple name or alias appears in usedClassNames
-			boolean used = usedClassNames.contains(simpleName);
-			if (!used && alias != null && !alias.equals(simpleName)) {
-				used = usedClassNames.contains(alias);
-			}
-			if (!used) {
+			if (!isSkippableRegularImport(importNode)
+					&& !isRegularImportUsed(importNode, usedClassNames)) {
 				unusedImports.add(importNode);
 			}
 		}
 
 		// Check static imports (import static com.example.Foo.bar)
 		for (ImportNode importNode : moduleNode.getStaticImports().values()) {
-			if (importNode.getLineNumber() < 0) {
-				continue; // synthetic/implicit imports
-			}
-			String fieldName = importNode.getFieldName();
-			String alias = importNode.getAlias();
-			boolean used = usedClassNames.contains(fieldName);
-			if (!used && alias != null && !alias.equals(fieldName)) {
-				used = usedClassNames.contains(alias);
-			}
-			// Also check if the class itself is used
-			if (!used) {
-				ClassNode importedType = importNode.getType();
-				if (importedType != null) {
-					String simpleName = importedType.getNameWithoutPackage();
-					used = usedClassNames.contains(simpleName);
-				}
-			}
-			if (!used) {
+			if (importNode.getLineNumber() >= 0 && !isStaticImportUsed(importNode, usedClassNames)) {
 				unusedImports.add(importNode);
 			}
 		}
 
 		return unusedImports;
+	}
+
+	private boolean isSkippableRegularImport(ImportNode importNode) {
+		return importNode.isStar() || importNode.getLineNumber() < 0 || importNode.getType() == null;
+	}
+
+	private boolean isRegularImportUsed(ImportNode importNode, Set<String> usedClassNames) {
+		ClassNode importedType = importNode.getType();
+		String simpleName = importedType.getNameWithoutPackage();
+		if (usedClassNames.contains(simpleName)) {
+			return true;
+		}
+		String alias = importNode.getAlias();
+		return alias != null && !alias.equals(simpleName) && usedClassNames.contains(alias);
+	}
+
+	private boolean isStaticImportUsed(ImportNode importNode, Set<String> usedClassNames) {
+		String fieldName = importNode.getFieldName();
+		if (usedClassNames.contains(fieldName)) {
+			return true;
+		}
+		String alias = importNode.getAlias();
+		if (alias != null && !alias.equals(fieldName) && usedClassNames.contains(alias)) {
+			return true;
+		}
+		ClassNode importedType = importNode.getType();
+		return importedType != null && usedClassNames.contains(importedType.getNameWithoutPackage());
 	}
 
 	/**
@@ -160,60 +152,62 @@ public class UnusedImportFinder {
 	}
 
 	private void collectFromClassNode(ClassNode classNode, Set<String> usedNames) {
-		// Superclass
+		collectClassHierarchy(classNode, usedNames);
+		collectClassFields(classNode, usedNames);
+		collectClassProperties(classNode, usedNames);
+		collectClassMethods(classNode, usedNames);
+		collectClassConstructors(classNode, usedNames);
+	}
+
+	private void collectClassHierarchy(ClassNode classNode, Set<String> usedNames) {
 		ClassNode superClass = classNode.getUnresolvedSuperClass();
 		if (superClass != null) {
 			addClassName(superClass, usedNames);
 		}
-
-		// Interfaces
 		for (ClassNode iface : classNode.getUnresolvedInterfaces()) {
 			addClassName(iface, usedNames);
 		}
-
-		// Annotations on the class
 		classNode.getAnnotations().forEach(ann -> addClassName(ann.getClassNode(), usedNames));
+	}
 
-		// Fields
+	private void collectClassFields(ClassNode classNode, Set<String> usedNames) {
 		for (FieldNode field : classNode.getFields()) {
-			if (field.isSynthetic()) {
-				continue;
-			}
-			addClassName(field.getType(), usedNames);
-			addGenericsTypes(field.getType(), usedNames);
-			field.getAnnotations().forEach(ann -> addClassName(ann.getClassNode(), usedNames));
-			// Visit field initializer expressions (e.g., def list = new ArrayList())
-			if (field.getInitialValueExpression() != null) {
-				UsedTypeCollectorVisitor visitor = new UsedTypeCollectorVisitor(usedNames);
-				field.getInitialValueExpression().visit(visitor);
+			if (!field.isSynthetic()) {
+				addClassName(field.getType(), usedNames);
+				addGenericsTypes(field.getType(), usedNames);
+				field.getAnnotations().forEach(ann -> addClassName(ann.getClassNode(), usedNames));
+				if (field.getInitialValueExpression() != null) {
+					UsedTypeCollectorVisitor visitor = new UsedTypeCollectorVisitor(usedNames);
+					field.getInitialValueExpression().visit(visitor);
+				}
 			}
 		}
+	}
 
-		// Properties
+	private void collectClassProperties(ClassNode classNode, Set<String> usedNames) {
 		for (PropertyNode prop : classNode.getProperties()) {
 			addClassName(prop.getType(), usedNames);
 			addGenericsTypes(prop.getType(), usedNames);
-			// Visit property initializer expressions
 			if (prop.getInitialExpression() != null) {
 				UsedTypeCollectorVisitor visitor = new UsedTypeCollectorVisitor(usedNames);
 				prop.getInitialExpression().visit(visitor);
 			}
 		}
+	}
 
-		// Methods
+	private void collectClassMethods(ClassNode classNode, Set<String> usedNames) {
 		for (MethodNode method : classNode.getMethods()) {
-			if (method.isSynthetic()) {
-				continue;
+			if (!method.isSynthetic()) {
+				collectFromMethodNode(method, usedNames);
 			}
-			collectFromMethodNode(method, usedNames);
 		}
+	}
 
-		// Constructors
+	private void collectClassConstructors(ClassNode classNode, Set<String> usedNames) {
 		for (ConstructorNode ctor : classNode.getDeclaredConstructors()) {
-			if (ctor.isSynthetic()) {
-				continue;
+			if (!ctor.isSynthetic()) {
+				collectFromMethodNode(ctor, usedNames);
 			}
-			collectFromMethodNode(ctor, usedNames);
 		}
 	}
 

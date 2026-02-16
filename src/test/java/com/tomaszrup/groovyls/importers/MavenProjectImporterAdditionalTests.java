@@ -59,9 +59,7 @@ class MavenProjectImporterAdditionalTests {
         if (tempDir != null && Files.exists(tempDir)) {
             Files.walk(tempDir)
                     .sorted(Comparator.reverseOrder())
-                    .forEach(p -> {
-                        try { Files.deleteIfExists(p); } catch (IOException ignored) {}
-                    });
+                    .forEach(this::deletePathQuietly);
         }
     }
 
@@ -71,8 +69,7 @@ class MavenProjectImporterAdditionalTests {
     void testSetImportPoolDoesNotThrow() {
         ExecutorService pool = Executors.newFixedThreadPool(2);
         try {
-            importer.setImportPool(pool);
-            // Should not throw
+            Assertions.assertDoesNotThrow(() -> importer.setImportPool(pool));
         } finally {
             pool.shutdownNow();
         }
@@ -80,9 +77,7 @@ class MavenProjectImporterAdditionalTests {
 
     @Test
     void testSetImportPoolNull() {
-        // Setting null should fall back to creating own pool
-        importer.setImportPool(null);
-        // Should not throw
+        Assertions.assertDoesNotThrow(() -> importer.setImportPool(null));
     }
 
     // --- resolveClasspaths (batch, no compile) ---
@@ -210,7 +205,15 @@ class MavenProjectImporterAdditionalTests {
 
         List<String> classpath = importer.importProject(project);
         Assertions.assertNotNull(classpath, "Should not return null");
-        // classpath may be empty (no target dirs, no mvn) — that's OK
+        Assertions.assertTrue(classpath.isEmpty() || classpath.stream().allMatch(java.util.Objects::nonNull));
+    }
+
+    private void deletePathQuietly(Path path) {
+        try {
+            Files.deleteIfExists(path);
+        } catch (IOException ignored) {
+            // best-effort cleanup for temporary test files
+        }
     }
 
     // --- resolveClasspath compiles so that target/classes exists ---

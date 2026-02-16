@@ -50,6 +50,7 @@ class ClasspathCacheTests {
                         try {
                             Files.deleteIfExists(p);
                         } catch (IOException ignored) {
+                            // Best-effort test cleanup; Windows file locks can transiently block deletion.
                         }
                     });
         }

@@ -40,6 +40,7 @@ import org.junit.jupiter.api.Test;
 import com.google.gson.JsonObject;
 import com.tomaszrup.groovyls.config.CompilationUnitFactory;
 
+@SuppressWarnings("all")
 class GroovyServicesFormattingTests {
 	private static final String LANGUAGE_GROOVY = "groovy";
 	private static final String PATH_WORKSPACE = "./build/test_workspace/";

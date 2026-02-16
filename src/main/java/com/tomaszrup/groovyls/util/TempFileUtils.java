@@ -28,6 +28,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.attribute.FileAttribute;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Utility for creating temp files in a private, user-owned directory
@@ -43,7 +44,7 @@ public final class TempFileUtils {
 
     private static final Logger logger = LoggerFactory.getLogger(TempFileUtils.class);
 
-    private static volatile Path privateTmpDir;
+    private static final AtomicReference<Path> privateTmpDir = new AtomicReference<>();
 
     private TempFileUtils() {
         // utility class
@@ -63,12 +64,12 @@ public final class TempFileUtils {
     }
 
     private static Path getPrivateTmpDir() throws IOException {
-        Path dir = privateTmpDir;
+        Path dir = privateTmpDir.get();
         if (dir != null && Files.isDirectory(dir)) {
             return dir;
         }
         synchronized (TempFileUtils.class) {
-            dir = privateTmpDir;
+            dir = privateTmpDir.get();
             if (dir != null && Files.isDirectory(dir)) {
                 return dir;
             }
@@ -86,7 +87,7 @@ public final class TempFileUtils {
                 }
                 logger.debug("Created private temp directory: {}", dir);
             }
-            privateTmpDir = dir;
+            privateTmpDir.set(dir);
             return dir;
         }
     }

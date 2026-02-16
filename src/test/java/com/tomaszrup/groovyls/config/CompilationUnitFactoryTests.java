@@ -122,8 +122,7 @@ class CompilationUnitFactoryTests {
 
 	@Test
 	void testInvalidateFileCacheDoesNotThrow() {
-		factory.invalidateFileCache();
-		// Just verifying no exception
+		Assertions.assertDoesNotThrow(() -> factory.invalidateFileCache());
 	}
 
 	@Test
@@ -248,14 +247,12 @@ class CompilationUnitFactoryTests {
 	@Test
 	void testSetExcludedSubRoots() {
 		Path subRoot = tempDir.resolve("subproject");
-		factory.setExcludedSubRoots(Arrays.asList(subRoot));
-		// Just verify no exception; the exclusion logic is tested via file scanning
+		Assertions.assertDoesNotThrow(() -> factory.setExcludedSubRoots(Arrays.asList(subRoot)));
 	}
 
 	@Test
 	void testSetExcludedSubRootsNull() {
-		factory.setExcludedSubRoots(null);
-		// Should not throw
+		Assertions.assertDoesNotThrow(() -> factory.setExcludedSubRoots(null));
 	}
 
 	// --- Separate sub-project detection ---

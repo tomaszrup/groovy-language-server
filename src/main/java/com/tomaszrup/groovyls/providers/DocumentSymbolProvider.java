@@ -23,6 +23,7 @@ package com.tomaszrup.groovyls.providers;
 import java.net.URI;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 
@@ -59,72 +60,101 @@ public class DocumentSymbolProvider {
 		}
 		URI uri = URI.create(textDocument.getUri());
 		List<ASTNode> nodes = ast.getNodes(uri);
-		List<Either<SymbolInformation, DocumentSymbol>> symbols = nodes.stream().filter(node -> {
-			return node instanceof ClassNode || node instanceof MethodNode || node instanceof FieldNode
-					|| node instanceof PropertyNode;
-		}).map(node -> {
-			if (node instanceof ClassNode) {
-				ClassNode classNode = (ClassNode) node;
-				Range range = GroovyLanguageServerUtils.astNodeToRange(classNode);
-				if (range == null) {
-					return null;
-				}
-				SymbolKind symbolKind = GroovyLanguageServerUtils.astNodeToSymbolKind(classNode);
-				String symbolName = classNode.getName();
-				if (SpockUtils.isSpockSpecification(classNode)) {
-					// Mark Spock specifications with a distinct name prefix
-					symbolName = "\u2731 " + symbolName;
-				}
-				return new DocumentSymbol(symbolName, symbolKind, range, range);
-			}
-			ClassNode classNode = (ClassNode) GroovyASTUtils.getEnclosingNodeOfType(node, ClassNode.class, ast);
-			if (node instanceof MethodNode) {
-				MethodNode methodNode = (MethodNode) node;
-				Range range = GroovyLanguageServerUtils.astNodeToRange(methodNode);
-				if (range == null) {
-					return null;
-				}
-				SymbolKind symbolKind = GroovyLanguageServerUtils.astNodeToSymbolKind(methodNode);
-				String symbolName = methodNode.getName();
-				if (SpockUtils.isSpockFeatureMethod(methodNode)) {
-					// Mark Spock feature methods with a test icon prefix
-					symbolName = "\u25b6 " + symbolName;
-				} else if (SpockUtils.isSpockLifecycleMethod(methodNode.getName())
-						&& SpockUtils.isSpockSpecification(classNode)) {
-					// Mark Spock lifecycle methods
-					symbolName = "\u2699 " + symbolName;
-				}
-				DocumentSymbol symbol = new DocumentSymbol(symbolName, symbolKind, range, range);
-				symbol.setDetail(classNode.getName());
-				return symbol;
-			}
-			if (node instanceof PropertyNode) {
-				PropertyNode propNode = (PropertyNode) node;
-				Range range = GroovyLanguageServerUtils.astNodeToRange(propNode);
-				if (range == null) {
-					return null;
-				}
-				DocumentSymbol symbol = new DocumentSymbol(propNode.getName(),
-						GroovyLanguageServerUtils.astNodeToSymbolKind(propNode), range, range);
-				symbol.setDetail(classNode.getName());
-				return symbol;
-			}
-			if (node instanceof FieldNode) {
-				FieldNode fieldNode = (FieldNode) node;
-				Range range = GroovyLanguageServerUtils.astNodeToRange(fieldNode);
-				if (range == null) {
-					return null;
-				}
-				DocumentSymbol symbol = new DocumentSymbol(fieldNode.getName(),
-						GroovyLanguageServerUtils.astNodeToSymbolKind(fieldNode), range, range);
-				symbol.setDetail(classNode.getName());
-				return symbol;
-			}
-			// this should never happen
-			return null;
-		}).filter(symbol -> symbol != null).map(node -> {
-			return Either.<SymbolInformation, DocumentSymbol>forRight(node);
-		}).collect(Collectors.toList());
+		List<Either<SymbolInformation, DocumentSymbol>> symbols = nodes.stream()
+				.filter(this::isSymbolNode)
+				.map(this::toDocumentSymbol)
+				.filter(Objects::nonNull)
+				.map(Either::<SymbolInformation, DocumentSymbol>forRight)
+				.collect(Collectors.toList());
 		return CompletableFuture.completedFuture(symbols);
+	}
+
+	private boolean isSymbolNode(ASTNode node) {
+		return node instanceof ClassNode
+				|| node instanceof MethodNode
+				|| node instanceof FieldNode
+				|| node instanceof PropertyNode;
+	}
+
+	private DocumentSymbol toDocumentSymbol(ASTNode node) {
+		if (node instanceof ClassNode) {
+			return toClassSymbol((ClassNode) node);
+		}
+
+		ClassNode classNode = (ClassNode) GroovyASTUtils.getEnclosingNodeOfType(node, ClassNode.class, ast);
+		if (node instanceof MethodNode) {
+			return toMethodSymbol((MethodNode) node, classNode);
+		}
+		if (node instanceof PropertyNode) {
+			return toPropertySymbol((PropertyNode) node, classNode);
+		}
+		if (node instanceof FieldNode) {
+			return toFieldSymbol((FieldNode) node, classNode);
+		}
+		return null;
+	}
+
+	private DocumentSymbol toClassSymbol(ClassNode classNode) {
+		Range range = GroovyLanguageServerUtils.astNodeToRange(classNode);
+		if (range == null) {
+			return null;
+		}
+
+		String symbolName = classNode.getName();
+		if (SpockUtils.isSpockSpecification(classNode)) {
+			symbolName = "\u2731 " + symbolName;
+		}
+		SymbolKind symbolKind = GroovyLanguageServerUtils.astNodeToSymbolKind(classNode);
+		return new DocumentSymbol(symbolName, symbolKind, range, range);
+	}
+
+	private DocumentSymbol toMethodSymbol(MethodNode methodNode, ClassNode classNode) {
+		Range range = GroovyLanguageServerUtils.astNodeToRange(methodNode);
+		if (range == null) {
+			return null;
+		}
+
+		String symbolName = methodNode.getName();
+		if (SpockUtils.isSpockFeatureMethod(methodNode)) {
+			symbolName = "\u25b6 " + symbolName;
+		} else if (SpockUtils.isSpockLifecycleMethod(methodNode.getName())
+				&& SpockUtils.isSpockSpecification(classNode)) {
+			symbolName = "\u2699 " + symbolName;
+		}
+
+		DocumentSymbol symbol = new DocumentSymbol(symbolName,
+				GroovyLanguageServerUtils.astNodeToSymbolKind(methodNode), range, range);
+		if (classNode != null) {
+			symbol.setDetail(classNode.getName());
+		}
+		return symbol;
+	}
+
+	private DocumentSymbol toPropertySymbol(PropertyNode propNode, ClassNode classNode) {
+		Range range = GroovyLanguageServerUtils.astNodeToRange(propNode);
+		if (range == null) {
+			return null;
+		}
+
+		DocumentSymbol symbol = new DocumentSymbol(propNode.getName(),
+				GroovyLanguageServerUtils.astNodeToSymbolKind(propNode), range, range);
+		if (classNode != null) {
+			symbol.setDetail(classNode.getName());
+		}
+		return symbol;
+	}
+
+	private DocumentSymbol toFieldSymbol(FieldNode fieldNode, ClassNode classNode) {
+		Range range = GroovyLanguageServerUtils.astNodeToRange(fieldNode);
+		if (range == null) {
+			return null;
+		}
+
+		DocumentSymbol symbol = new DocumentSymbol(fieldNode.getName(),
+				GroovyLanguageServerUtils.astNodeToSymbolKind(fieldNode), range, range);
+		if (classNode != null) {
+			symbol.setDetail(classNode.getName());
+		}
+		return symbol;
 	}
 }

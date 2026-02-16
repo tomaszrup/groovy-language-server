@@ -48,6 +48,7 @@ import com.tomaszrup.groovyls.config.CompilationUnitFactory;
 import com.tomaszrup.groovyls.providers.SemanticTokensProvider;
 import com.tomaszrup.groovyls.util.GroovyVersionDetector;
 
+@SuppressWarnings("all")
 class GroovyServicesSemanticTokensTests {
 	private static final String LANGUAGE_GROOVY = "groovy";
 	private static final String PATH_WORKSPACE = "./build/test_workspace/";
@@ -130,7 +131,7 @@ class GroovyServicesSemanticTokensTests {
 		ProjectScope scope = new ProjectScope(workspaceRoot, new CompilationUnitFactory());
 		scope.setDetectedGroovyVersion("4.0.30");
 
-		SemanticTokensProvider provider = services.createSemanticTokensProvider(null, scope);
+		SemanticTokensProvider provider = (SemanticTokensProvider) services.createSemanticTokensProvider(null, scope);
 		Field compatibilityField = SemanticTokensProvider.class.getDeclaredField("groovy4ColumnCompatibility");
 		compatibilityField.setAccessible(true);
 
@@ -147,7 +148,7 @@ class GroovyServicesSemanticTokensTests {
 		ProjectScope groovy5Scope = new ProjectScope(workspaceRoot, new CompilationUnitFactory());
 		groovy5Scope.setDetectedGroovyVersion("5.0.4");
 
-		SemanticTokensProvider groovy5Provider = services.createSemanticTokensProvider(null, groovy5Scope);
+		SemanticTokensProvider groovy5Provider = (SemanticTokensProvider) services.createSemanticTokensProvider(null, groovy5Scope);
 		Field compatibilityField = SemanticTokensProvider.class.getDeclaredField("groovy4ColumnCompatibility");
 		compatibilityField.setAccessible(true);
 
@@ -156,7 +157,7 @@ class GroovyServicesSemanticTokensTests {
 				"Groovy 5 projects should use runtime-appropriate column behavior");
 
 		ProjectScope unknownScope = new ProjectScope(workspaceRoot, new CompilationUnitFactory());
-		SemanticTokensProvider unknownProvider = services.createSemanticTokensProvider(null, unknownScope);
+		SemanticTokensProvider unknownProvider = (SemanticTokensProvider) services.createSemanticTokensProvider(null, unknownScope);
 		boolean unknownCompatibility = compatibilityField.getBoolean(unknownProvider);
 		Assertions.assertEquals(runtimeRequiresGroovy4Compatibility, unknownCompatibility,
 				"Unknown Groovy version should default to runtime-appropriate latest-supported behavior");

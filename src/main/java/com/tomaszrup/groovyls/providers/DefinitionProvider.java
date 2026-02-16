@@ -74,7 +74,7 @@ public class DefinitionProvider {
 		this.javaSourceLocator = javaSourceLocator;
 	}
 
-	public CompletableFuture<Either<List<? extends Location>, List<? extends LocationLink>>> provideDefinition(
+	public CompletableFuture<Either<List<Location>, List<LocationLink>>> provideDefinition(
 			TextDocumentIdentifier textDocument, Position position) {
 		if (ast == null) {
 			// this shouldn't happen, but let's avoid an exception if something
@@ -115,90 +115,112 @@ public class DefinitionProvider {
 		if (javaSourceLocator == null) {
 			return null;
 		}
-		// If strict definition returned null, try non-strict to get the node
-		if (definitionNode == null) {
-			definitionNode = GroovyASTUtils.getDefinition(offsetNode, false, ast);
-		}
-		if (definitionNode == null) {
+
+		ASTNode resolvedDefinition = definitionNode != null
+				? definitionNode
+				: GroovyASTUtils.getDefinition(offsetNode, false, ast);
+		if (resolvedDefinition == null) {
 			logger.debug("resolveJavaSource: no definition node found for {}",
 					offsetNode.getClass().getSimpleName());
 			return null;
 		}
-		if (definitionNode instanceof ClassNode) {
-			ClassNode classNode = (ClassNode) definitionNode;
-			String className = classNode.getName();
-			logger.debug("resolveJavaSource: resolving ClassNode '{}'", className);
-			Location loc = javaSourceLocator.findLocationForClass(className);
-			if (loc != null) {
-				logger.debug("resolveJavaSource: found source for '{}' at {}",
-						className, loc.getUri());
-				return loc;
-			}
-			logger.debug("resolveJavaSource: no source for '{}', falling back to decompilation",
-					className);
-			return decompileAndLocateClass(classNode);
+
+		if (resolvedDefinition instanceof ClassNode) {
+			return resolveClassDefinition((ClassNode) resolvedDefinition);
 		}
-		if (definitionNode instanceof ConstructorNode) {
-			ConstructorNode ctorNode = (ConstructorNode) definitionNode;
-			ClassNode declaringClass = ctorNode.getDeclaringClass();
-			if (declaringClass != null) {
-				String className = declaringClass.getName();
-				int paramCount = ctorNode.getParameters().length;
-				Location loc = javaSourceLocator.findLocationForConstructor(className, paramCount);
-				if (loc != null) return loc;
-				return decompileAndLocateConstructor(declaringClass, paramCount);
-			}
+		if (resolvedDefinition instanceof ConstructorNode) {
+			return resolveConstructorDefinition((ConstructorNode) resolvedDefinition);
 		}
-		if (definitionNode instanceof MethodNode) {
-			MethodNode methodNode = (MethodNode) definitionNode;
-			ClassNode declaringClass = methodNode.getDeclaringClass();
-			if (declaringClass != null) {
-				String className = declaringClass.getName();
-				int paramCount = methodNode.getParameters().length;
-				if ("<init>".equals(methodNode.getName())) {
-					Location loc = javaSourceLocator.findLocationForConstructor(className, paramCount);
-					if (loc != null) return loc;
-					return decompileAndLocateConstructor(declaringClass, paramCount);
-				}
-				String methodName = methodNode.getName();
-				Location loc = javaSourceLocator.findLocationForMethod(className, methodName, paramCount);
-				if (loc != null) return loc;
-				return decompileAndLocateMethod(declaringClass, methodName, paramCount);
-			}
+		if (resolvedDefinition instanceof MethodNode) {
+			return resolveMethodDefinition((MethodNode) resolvedDefinition);
 		}
-		if (definitionNode instanceof PropertyNode) {
-			PropertyNode propNode = (PropertyNode) definitionNode;
-			ClassNode declaringClass = propNode.getDeclaringClass();
-			if (declaringClass != null) {
-				String className = declaringClass.getName();
-				String fieldName = propNode.getName();
-				Location loc = javaSourceLocator.findLocationForField(className, fieldName);
-				if (loc != null) return loc;
-				return decompileAndLocateField(declaringClass, fieldName);
-			}
+		if (resolvedDefinition instanceof PropertyNode) {
+			return resolvePropertyDefinition((PropertyNode) resolvedDefinition);
 		}
-		if (definitionNode instanceof FieldNode) {
-			FieldNode fieldNode = (FieldNode) definitionNode;
-			ClassNode declaringClass = fieldNode.getDeclaringClass();
-			if (declaringClass != null) {
-				String className = declaringClass.getName();
-				String fieldName = fieldNode.getName();
-				Location loc = javaSourceLocator.findLocationForField(className, fieldName);
-				if (loc != null) return loc;
-				return decompileAndLocateField(declaringClass, fieldName);
-			}
+		if (resolvedDefinition instanceof FieldNode) {
+			return resolveFieldDefinition((FieldNode) resolvedDefinition);
 		}
-		if (definitionNode instanceof Variable) {
-			Variable variable = (Variable) definitionNode;
-			ClassNode originType = variable.getOriginType();
-			if (originType != null) {
-				String className = originType.getName();
-				Location loc = javaSourceLocator.findLocationForClass(className);
-				if (loc != null) return loc;
-				return decompileAndLocateClass(originType);
-			}
+		if (resolvedDefinition instanceof Variable) {
+			return resolveVariableDefinition((Variable) resolvedDefinition);
 		}
 		return null;
+	}
+
+	private Location resolveClassDefinition(ClassNode classNode) {
+		String className = classNode.getName();
+		logger.debug("resolveJavaSource: resolving ClassNode '{}'", className);
+		Location location = javaSourceLocator.findLocationForClass(className);
+		if (location != null) {
+			logger.debug("resolveJavaSource: found source for '{}' at {}", className, location.getUri());
+			return location;
+		}
+		logger.debug("resolveJavaSource: no source for '{}', falling back to decompilation", className);
+		return decompileAndLocateClass(classNode);
+	}
+
+	private Location resolveConstructorDefinition(ConstructorNode ctorNode) {
+		ClassNode declaringClass = ctorNode.getDeclaringClass();
+		if (declaringClass == null) {
+			return null;
+		}
+
+		String className = declaringClass.getName();
+		int paramCount = ctorNode.getParameters().length;
+		Location location = javaSourceLocator.findLocationForConstructor(className, paramCount);
+		return location != null ? location : decompileAndLocateConstructor(declaringClass, paramCount);
+	}
+
+	private Location resolveMethodDefinition(MethodNode methodNode) {
+		ClassNode declaringClass = methodNode.getDeclaringClass();
+		if (declaringClass == null) {
+			return null;
+		}
+
+		String className = declaringClass.getName();
+		int paramCount = methodNode.getParameters().length;
+		if ("<init>".equals(methodNode.getName())) {
+			Location location = javaSourceLocator.findLocationForConstructor(className, paramCount);
+			return location != null ? location : decompileAndLocateConstructor(declaringClass, paramCount);
+		}
+
+		String methodName = methodNode.getName();
+		Location location = javaSourceLocator.findLocationForMethod(className, methodName, paramCount);
+		return location != null ? location : decompileAndLocateMethod(declaringClass, methodName, paramCount);
+	}
+
+	private Location resolvePropertyDefinition(PropertyNode propNode) {
+		ClassNode declaringClass = propNode.getDeclaringClass();
+		if (declaringClass == null) {
+			return null;
+		}
+
+		String className = declaringClass.getName();
+		String fieldName = propNode.getName();
+		Location location = javaSourceLocator.findLocationForField(className, fieldName);
+		return location != null ? location : decompileAndLocateField(declaringClass, fieldName);
+	}
+
+	private Location resolveFieldDefinition(FieldNode fieldNode) {
+		ClassNode declaringClass = fieldNode.getDeclaringClass();
+		if (declaringClass == null) {
+			return null;
+		}
+
+		String className = declaringClass.getName();
+		String fieldName = fieldNode.getName();
+		Location location = javaSourceLocator.findLocationForField(className, fieldName);
+		return location != null ? location : decompileAndLocateField(declaringClass, fieldName);
+	}
+
+	private Location resolveVariableDefinition(Variable variable) {
+		ClassNode originType = variable.getOriginType();
+		if (originType == null) {
+			return null;
+		}
+
+		String className = originType.getName();
+		Location location = javaSourceLocator.findLocationForClass(className);
+		return location != null ? location : decompileAndLocateClass(originType);
 	}
 
 	// --- Decompilation fallback methods ---

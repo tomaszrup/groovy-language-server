@@ -112,30 +112,14 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 	private Set<Path> cachedGroovyFiles = null;
 
 	/**
-	 * Prefix used to identify synthetic Java source stub SourceUnits in the
-	 * compilation unit. These stubs allow Groovy imports to resolve Java
-	 * source classes that have not been compiled yet.
-	 */
-	private static final String JAVA_STUB_NAME_PREFIX = "[java-stub] ";
-
-	/**
-	 * Standard Gradle/Maven Java source directory names relative to a project
-	 * root. These are scanned to discover {@code .java} files for stub
-	 * generation.
-	 */
-	private static final String[][] JAVA_SOURCE_DIR_PATTERNS = {
-			{"src", "main", "java"},
-			{"src", "test", "java"},
-	};
-
-	/**
 	 * Project root used to discover Java source files and generate
 	 * synthetic stub classes so that imports resolve without waiting
 	 * for Gradle/Maven compilation.
 	 */
-	private Path projectRoot;
+	private JavaSourceStubGenerator javaStubGenerator;
 
 	public CompilationUnitFactory() {
+		// Default constructor for production wiring and tests.
 	}
 
 	/**
@@ -143,7 +127,7 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 	 * Must be called before the first {@link #create} call.
 	 */
 	public void setProjectRoot(Path projectRoot) {
-		this.projectRoot = projectRoot;
+		this.javaStubGenerator = projectRoot != null ? new JavaSourceStubGenerator(projectRoot) : null;
 	}
 
 	public void setExcludedSubRoots(List<Path> excludedSubRoots) {
@@ -151,6 +135,7 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 		logger.debug("Set excludedSubRoots: {}", this.excludedSubRoots);
 	}
 
+	@Override
 	public List<String> getAdditionalClasspathList() {
 		return additionalClasspathList;
 	}
@@ -159,6 +144,7 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 	 * Returns the combined classpath (main + test-only). This is what
 	 * the Groovy compiler needs for full compilation including test files.
 	 */
+	@Override
 	public List<String> getCombinedClasspathList() {
 		if (testOnlyClasspathList == null || testOnlyClasspathList.isEmpty()) {
 			return additionalClasspathList;
@@ -171,6 +157,7 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 		return combined;
 	}
 
+	@Override
 	public List<String> getTestOnlyClasspathList() {
 		return testOnlyClasspathList;
 	}
@@ -180,6 +167,7 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 	 * These are merged with the main classpath for compilation but can be
 	 * excluded from the ClassGraph scan for memory savings.
 	 */
+	@Override
 	public void setTestOnlyClasspathList(List<String> testOnlyClasspathList) {
 		this.testOnlyClasspathList = testOnlyClasspathList;
 		logger.debug("Set testOnlyClasspathList ({} entries)",
@@ -198,6 +186,7 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 		classLoader = null;
 	}
 
+	@Override
 	public void setAdditionalClasspathList(List<String> additionalClasspathList) {
 		this.additionalClasspathList = additionalClasspathList;
 		logger.debug("Set additionalClasspathList ({} entries)", additionalClasspathList != null ? additionalClasspathList.size() : 0);
@@ -230,6 +219,7 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 	 * recompile). This avoids expensive per-entry filesystem stat calls in
 	 * {@link #getClasspathList} on every invalidation cycle.
 	 */
+	@Override
 	public void invalidateCompilationUnit() {
 		compilationUnit = null;
 	}
@@ -242,6 +232,7 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 	 * classloader cache cannot reflect (e.g. source files deleted whose
 	 * compiled {@code .class} artefacts have been cleaned from disk).
 	 */
+	@Override
 	public void invalidateCompilationUnitFull() {
 		compilationUnit = null;
 		config = null;
@@ -260,6 +251,7 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 	 * re-walk the workspace directory. Call this when filesystem changes are
 	 * detected (e.g. files created, deleted, or renamed).
 	 */
+	@Override
 	public void invalidateFileCache() {
 		cachedGroovyFiles = null;
 	}
@@ -269,6 +261,7 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 	 * directly to the compilation unit (fresh on every {@link #create} call),
 	 * so there is no separate index to invalidate.
 	 */
+	@Override
 	public void invalidateJavaSourceIndex() {
 		// no-op: stubs are rebuilt from disk on each create() call
 	}
@@ -290,6 +283,7 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 		return cached != null ? cached.size() : 0;
 	}
 
+	@Override
 	public GroovyLSCompilationUnit create(Path workspaceRoot, FileContentsTracker fileContentsTracker) {
 		return create(workspaceRoot, fileContentsTracker, Collections.emptySet());
 	}
@@ -306,57 +300,65 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 			classLoader = new GroovyClassLoader(parentLoader, config, true);
 		}
 
-		Set<URI> changedUris = fileContentsTracker.getChangedURIs();
-		// Merge additional invalidations (dependency-driven) with content changes
-		Set<URI> effectiveChanged;
-		if (additionalInvalidations != null && !additionalInvalidations.isEmpty()) {
-			effectiveChanged = new HashSet<>(changedUris);
-			effectiveChanged.addAll(additionalInvalidations);
-		} else {
-			effectiveChanged = changedUris;
-		}
-
-		if (compilationUnit == null) {
-			compilationUnit = new GroovyLSCompilationUnit(config, null, classLoader);
-			// we don't care about changed URIs if there's no compilation unit yet
+		boolean hadCompilationUnit = compilationUnit != null;
+		Set<URI> effectiveChanged = mergeChangedUris(fileContentsTracker.getChangedURIs(), additionalInvalidations);
+		syncCompilationUnitWithChanges(effectiveChanged);
+		if (!hadCompilationUnit) {
 			effectiveChanged = null;
-		} else {
-			compilationUnit.setClassLoader(classLoader);
-			final Set<URI> urisToRemove = effectiveChanged;
-			List<SourceUnit> sourcesToRemove = new ArrayList<>();
-			compilationUnit.iterator().forEachRemaining(sourceUnit -> {
-				URI uri = sourceUnit.getSource().getURI();
-				if (urisToRemove.contains(uri)) {
-					sourcesToRemove.add(sourceUnit);
-				}
-			});
-			// if an URI has changed, we remove it from the compilation unit so
-			// that a new version can be built from the updated source file
-			compilationUnit.removeSources(sourcesToRemove);
 		}
 
 		if (workspaceRoot != null) {
 			addDirectoryToCompilationUnit(workspaceRoot, compilationUnit, fileContentsTracker, effectiveChanged);
 		} else {
-			final Set<URI> urisToAdd = effectiveChanged;
-			fileContentsTracker.getOpenURIs().forEach(uri -> {
-				// if we're only tracking changes, skip all files that haven't
-				// actually changed
-				if (urisToAdd != null && !urisToAdd.contains(uri)) {
-					return;
-				}
-				String contents = fileContentsTracker.getContents(uri);
-				addOpenFileToCompilationUnit(uri, contents, compilationUnit);
-			});
+			addOpenFilesToCompilationUnit(fileContentsTracker, effectiveChanged, compilationUnit);
 		}
 
 		// Add synthetic Groovy stubs for Java source files that haven't been
 		// compiled yet. This is done fresh on every create() call — scanning
 		// the disk each time — so stubs always reflect the current state of
 		// Java source files, even if they were just moved/renamed.
-		addJavaSourceStubs(workspaceRoot, compilationUnit);
+		if (javaStubGenerator != null) {
+			javaStubGenerator.addJavaSourceStubs(workspaceRoot, compilationUnit, resolvedClasspathCache);
+		}
 
 		return compilationUnit;
+	}
+
+	private Set<URI> mergeChangedUris(Set<URI> changedUris, Set<URI> additionalInvalidations) {
+		if (additionalInvalidations == null || additionalInvalidations.isEmpty()) {
+			return changedUris;
+		}
+		Set<URI> effectiveChanged = new HashSet<>(changedUris);
+		effectiveChanged.addAll(additionalInvalidations);
+		return effectiveChanged;
+	}
+
+	private void syncCompilationUnitWithChanges(Set<URI> effectiveChanged) {
+		if (compilationUnit == null) {
+			compilationUnit = new GroovyLSCompilationUnit(config, null, classLoader);
+			return;
+		}
+		compilationUnit.setClassLoader(classLoader);
+		List<SourceUnit> sourcesToRemove = new ArrayList<>();
+		compilationUnit.iterator().forEachRemaining(sourceUnit -> {
+			URI uri = sourceUnit.getSource().getURI();
+			if (effectiveChanged.contains(uri)) {
+				sourcesToRemove.add(sourceUnit);
+			}
+		});
+		compilationUnit.removeSources(sourcesToRemove);
+	}
+
+	private void addOpenFilesToCompilationUnit(FileContentsTracker fileContentsTracker,
+			Set<URI> urisToAdd,
+			GroovyLSCompilationUnit targetCompilationUnit) {
+		fileContentsTracker.getOpenURIs().forEach(uri -> {
+			if (urisToAdd != null && !urisToAdd.contains(uri)) {
+				return;
+			}
+			String contents = fileContentsTracker.getContents(uri);
+			addOpenFileToCompilationUnit(uri, contents, targetCompilationUnit);
+		});
 	}
 
 	@Override
@@ -375,36 +377,44 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 		GroovyLSCompilationUnit incrementalUnit = new GroovyLSCompilationUnit(config, null, classLoader);
 
 		for (URI uri : filesToInclude) {
-			if (fileContentsTracker.isOpen(uri)) {
-				String contents = fileContentsTracker.getContents(uri);
-				if (contents != null) {
-					addOpenFileToCompilationUnit(uri, contents, incrementalUnit);
-				}
-			} else {
-				try {
-					Path filePath = Paths.get(uri);
-					if (Files.isRegularFile(filePath)) {
-						incrementalUnit.addSource(filePath.toFile());
-					}
-				} catch (Exception ignored) {
-					// Non-file URI (e.g. jar:/, jrt:/) cannot be added as a local source file.
-				}
-			}
+			addSourceToIncrementalUnit(uri, fileContentsTracker, incrementalUnit);
 		}
 
 		// Add Java source stubs to the incremental unit as well, so that
 		// Java class imports resolve even in single-file compilation.
-		addJavaSourceStubs(workspaceRoot, incrementalUnit);
+		if (javaStubGenerator != null) {
+			javaStubGenerator.addJavaSourceStubs(workspaceRoot, incrementalUnit, resolvedClasspathCache);
+		}
 
 		return incrementalUnit;
 	}
 
+	private void addSourceToIncrementalUnit(URI uri,
+			FileContentsTracker fileContentsTracker,
+			GroovyLSCompilationUnit unit) {
+		if (fileContentsTracker.isOpen(uri)) {
+			String contents = fileContentsTracker.getContents(uri);
+			if (contents != null) {
+				addOpenFileToCompilationUnit(uri, contents, unit);
+			}
+		} else {
+			try {
+				Path filePath = Paths.get(uri);
+				if (Files.isRegularFile(filePath)) {
+					unit.addSource(filePath.toFile());
+				}
+			} catch (Exception ignored) {
+				// Non-file URI (e.g. jar:/, jrt:/) cannot be added as a local source file.
+			}
+		}
+	}
+
 	protected CompilerConfiguration getConfiguration() {
-		CompilerConfiguration config = new CompilerConfiguration();
+		CompilerConfiguration compilerConfiguration = new CompilerConfiguration();
 
 		Map<String, Boolean> optimizationOptions = new HashMap<>();
 		optimizationOptions.put(CompilerConfiguration.GROOVYDOC, true);
-		config.setOptimizationOptions(optimizationOptions);
+		compilerConfiguration.setOptimizationOptions(optimizationOptions);
 
 		List<String> classpathList = new ArrayList<>();
 		getClasspathList(classpathList);
@@ -414,9 +424,9 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 				logger.debug("  [SPOCK] effective classpath entry: {}", cp);
 			}
 		}
-		config.setClasspathList(classpathList);
+		compilerConfiguration.setClasspathList(classpathList);
 
-		return config;
+		return compilerConfiguration;
 	}
 
 	protected void getClasspathList(List<String> result) {
@@ -431,7 +441,17 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 			return;
 		}
 
-		// Combine main + test-only entries for full compilation classpath
+		Set<String> seen = new HashSet<>();
+		List<String> resolved = new ArrayList<>();
+		for (String entry : getCombinedClasspathEntries()) {
+			resolveClasspathEntry(entry, seen, resolved);
+		}
+
+		resolvedClasspathCache = resolved;
+		result.addAll(resolved);
+    }
+
+	private List<String> getCombinedClasspathEntries() {
 		List<String> allEntries = new ArrayList<>();
 		if (additionalClasspathList != null) {
 			allEntries.addAll(additionalClasspathList);
@@ -439,64 +459,61 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 		if (testOnlyClasspathList != null) {
 			allEntries.addAll(testOnlyClasspathList);
 		}
+		return allEntries;
+	}
 
-		Set<String> seen = new HashSet<>();
-		List<String> resolved = new ArrayList<>();
-		for (String entry : allEntries) {
-			boolean mustBeDirectory = false;
-			if (entry.endsWith("*")) {
-				entry = entry.substring(0, entry.length() - 1);
-				mustBeDirectory = true;
+	private void resolveClasspathEntry(String rawEntry, Set<String> seen, List<String> resolved) {
+		String entry = rawEntry;
+		boolean mustBeDirectory = false;
+		if (entry.endsWith("*")) {
+			entry = entry.substring(0, entry.length() - 1);
+			mustBeDirectory = true;
+		}
+
+		File file = new File(entry);
+		if (!file.exists()) {
+			return;
+		}
+
+		String canonicalPath = toCanonicalPath(file);
+		if (file.isDirectory()) {
+			addUniquePath(canonicalPath, seen, resolved);
+			if (mustBeDirectory) {
+				addDirectoryJars(file, seen, resolved);
 			}
+			return;
+		}
 
-            File file = new File(entry);
-            if (!file.exists()) {
-                continue;
-            }
+		if (!mustBeDirectory && file.isFile() && file.getName().endsWith(".jar")) {
+			addUniquePath(canonicalPath, seen, resolved);
+		}
+	}
 
-            // Use canonical path for dedup to handle Windows drive-letter
-            // casing differences (C:\ vs c:\)
-            String canonicalPath;
-            try {
-                canonicalPath = file.getCanonicalPath();
-            } catch (IOException e) {
-                canonicalPath = file.getPath();
-            }
+	private void addDirectoryJars(File directory, Set<String> seen, List<String> resolved) {
+		File[] children = directory.listFiles();
+		if (children == null) {
+			return;
+		}
+		for (File child : children) {
+			if (child.isFile() && child.getName().endsWith(".jar")) {
+				addUniquePath(toCanonicalPath(child), seen, resolved);
+			}
+		}
+	}
 
-            if (file.isDirectory()) {
-                // Always add directories (important for build/classes output)
-                if (seen.add(canonicalPath)) {
-                    resolved.add(canonicalPath);
-                }
+	private void addUniquePath(String path, Set<String> seen, List<String> resolved) {
+		if (seen.add(path)) {
+			resolved.add(path);
+		}
+	}
 
-                // And if user used '*', include jars inside
-                if (mustBeDirectory) {
-                    File[] children = file.listFiles();
-                    if (children != null) {
-                        for (File child : children) {
-                            if (child.isFile() && child.getName().endsWith(".jar")) {
-                                String childCanonical;
-                                try {
-                                    childCanonical = child.getCanonicalPath();
-                                } catch (IOException e) {
-                                    childCanonical = child.getPath();
-                                }
-                                if (seen.add(childCanonical)) {
-                                    resolved.add(childCanonical);
-                                }
-                            }
-                        }
-                    }
-                }
-            } else if (!mustBeDirectory && file.isFile() && file.getName().endsWith(".jar")
-                    && seen.add(canonicalPath)) {
-                resolved.add(canonicalPath);
-            }
-        }
-
-		resolvedClasspathCache = resolved;
-		result.addAll(resolved);
-    }
+	private String toCanonicalPath(File file) {
+		try {
+			return file.getCanonicalPath();
+		} catch (IOException e) {
+			return file.getPath();
+		}
+	}
 
 	/**
 	 * Populate the file cache by walking the directory tree once, filtering by
@@ -524,31 +541,9 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 				Files.walkFileTree(normalizedRoot, new SimpleFileVisitor<Path>() {
 					@Override
 					public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
-						// Never prune the root itself
-						if (dir.equals(normalizedRoot)) {
-							return FileVisitResult.CONTINUE;
-						}
-						String dirName = dir.getFileName().toString();
-						// Skip excluded directory names (build output, etc.)
-						if (EXCLUDED_DIR_NAMES.contains(dirName)) {
-							return FileVisitResult.SKIP_SUBTREE;
-						}
-						// Skip hidden directories
-						if (dirName.startsWith(".")) {
-							return FileVisitResult.SKIP_SUBTREE;
-						}
-						// Skip explicitly excluded sub-project roots
-						if (isInsideExcludedSubRoot(dir)) {
-							logger.debug("  Skipping subtree (subproject root): {}", dir);
-							return FileVisitResult.SKIP_SUBTREE;
-						}
-						// Skip directories that look like separate projects
-						// (have their own build file + JVM source dirs)
-						if (isSeparateProject(dir)) {
-							logger.debug("  Skipping subtree (separate project): {}", dir);
-							return FileVisitResult.SKIP_SUBTREE;
-						}
-						return FileVisitResult.CONTINUE;
+						return shouldSkipDirectory(dir, normalizedRoot)
+								? FileVisitResult.SKIP_SUBTREE
+								: FileVisitResult.CONTINUE;
 					}
 
 					@Override
@@ -575,6 +570,25 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 		return cachedGroovyFiles;
 	}
 
+	private boolean shouldSkipDirectory(Path dir, Path normalizedRoot) {
+		if (dir.equals(normalizedRoot)) {
+			return false;
+		}
+		String dirName = dir.getFileName().toString();
+		if (EXCLUDED_DIR_NAMES.contains(dirName) || dirName.startsWith(".")) {
+			return true;
+		}
+		if (isInsideExcludedSubRoot(dir)) {
+			logger.debug("  Skipping subtree (subproject root): {}", dir);
+			return true;
+		}
+		if (isSeparateProject(dir)) {
+			logger.debug("  Skipping subtree (separate project): {}", dir);
+			return true;
+		}
+		return false;
+	}
+
 	protected void addDirectoryToCompilationUnit(Path dirPath, GroovyLSCompilationUnit compilationUnit,
 			FileContentsTracker fileContentsTracker, Set<URI> changedUris) {
 		Set<Path> groovyFiles = getOrBuildFileCache(dirPath);
@@ -582,85 +596,100 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 		// Collect open file packages to prioritize related files when the
 		// project exceeds MAX_FULL_COMPILATION_FILES
 		boolean needsLimiting = groovyFiles.size() > MAX_FULL_COMPILATION_FILES;
-		Set<String> openPackageDirs = new HashSet<>();
-		if (needsLimiting) {
-			logger.warn("Project {} has {} .groovy files (limit {}). "
-					+ "Prioritizing open file packages to reduce memory usage.",
-					dirPath, groovyFiles.size(), MAX_FULL_COMPILATION_FILES);
-			fileContentsTracker.getOpenURIs().forEach(uri -> {
-				try {
-					if (uri == null || uri.getScheme() == null || !"file".equalsIgnoreCase(uri.getScheme())) {
-						return;
-					}
-					Path openPath = Paths.get(uri);
-					if (openPath.getParent() != null) {
-						openPackageDirs.add(openPath.getParent().normalize().toString());
-					}
-				} catch (Exception ignored) {}
-			});
-		}
+		Set<String> openPackageDirs = collectOpenPackageDirs(fileContentsTracker, needsLimiting, dirPath,
+				groovyFiles.size());
 
+		int addedCount = addPrioritizedSources(groovyFiles, fileContentsTracker, changedUris,
+				needsLimiting, openPackageDirs, compilationUnit);
+
+		addRemainingSources(groovyFiles, fileContentsTracker, changedUris,
+				needsLimiting, openPackageDirs, compilationUnit, addedCount);
+
+		Path normalizedDir = dirPath.normalize();
+		addOpenSourcesInDirectory(dirPath, normalizedDir, compilationUnit, fileContentsTracker, changedUris);
+	}
+
+	private Set<String> collectOpenPackageDirs(FileContentsTracker fileContentsTracker, boolean needsLimiting,
+			Path dirPath, int groovyFileCount) {
+		Set<String> openPackageDirs = new HashSet<>();
+		if (!needsLimiting) {
+			return openPackageDirs;
+		}
+		logger.warn("Project {} has {} .groovy files (limit {}). Prioritizing open file packages to reduce memory usage.",
+				dirPath, groovyFileCount, MAX_FULL_COMPILATION_FILES);
+		fileContentsTracker.getOpenURIs().forEach(uri -> {
+			Path openPath = toFilePath(uri);
+			if (openPath != null && openPath.getParent() != null) {
+				openPackageDirs.add(openPath.getParent().normalize().toString());
+			}
+		});
+		return openPackageDirs;
+	}
+
+	private int addPrioritizedSources(Set<Path> groovyFiles, FileContentsTracker fileContentsTracker,
+			Set<URI> changedUris, boolean needsLimiting, Set<String> openPackageDirs,
+			GroovyLSCompilationUnit compilationUnit) {
+		if (!needsLimiting) {
+			return 0;
+		}
 		int addedCount = 0;
-		// First pass: add files from open-file packages (prioritized)
-		if (needsLimiting) {
-			for (Path filePath : groovyFiles) {
-				URI fileURI = filePath.toUri();
-				if (!fileContentsTracker.isOpen(fileURI)) {
-					String parentDir = filePath.getParent() != null
-							? filePath.getParent().normalize().toString() : "";
-					if (openPackageDirs.contains(parentDir)) {
-						File file = filePath.toFile();
-						if (file.isFile()) {
-							if (changedUris == null || changedUris.contains(fileURI)) {
-								compilationUnit.addSource(file);
-								addedCount++;
-							}
-						}
-					}
-				}
+		for (Path filePath : groovyFiles) {
+			URI fileURI = filePath.toUri();
+			String parentDir = filePath.getParent() != null ? filePath.getParent().normalize().toString() : "";
+			if (!fileContentsTracker.isOpen(fileURI)
+					&& openPackageDirs.contains(parentDir)
+					&& (changedUris == null || changedUris.contains(fileURI))
+					&& addRegularFileSource(filePath, compilationUnit)) {
+				addedCount++;
 			}
 		}
+		return addedCount;
+	}
 
-		// Second pass: add remaining files up to the limit
+	private int addRemainingSources(Set<Path> groovyFiles, FileContentsTracker fileContentsTracker,
+			Set<URI> changedUris, boolean needsLimiting, Set<String> openPackageDirs,
+			GroovyLSCompilationUnit compilationUnit, int alreadyAddedCount) {
+		int addedCount = 0;
 		for (Path filePath : groovyFiles) {
-			if (needsLimiting && addedCount >= MAX_FULL_COMPILATION_FILES) {
-				logger.warn("Reached file limit of {} for project {}. "
-						+ "{} files excluded from compilation.",
-						MAX_FULL_COMPILATION_FILES, dirPath,
-						groovyFiles.size() - addedCount);
+			if (needsLimiting && alreadyAddedCount + addedCount >= MAX_FULL_COMPILATION_FILES) {
+				logger.warn("Reached file limit of {}. {} files excluded from compilation.",
+						MAX_FULL_COMPILATION_FILES, groovyFiles.size() - (alreadyAddedCount + addedCount));
 				break;
 			}
-			URI fileURI = filePath.toUri();
-			if (!fileContentsTracker.isOpen(fileURI)) {
-				// Skip files already added in the priority pass
-				if (needsLimiting && !openPackageDirs.isEmpty()) {
-					String parentDir = filePath.getParent() != null
-							? filePath.getParent().normalize().toString() : "";
-					if (openPackageDirs.contains(parentDir)) {
-						continue; // already added in first pass
-					}
-				}
-				File file = filePath.toFile();
-				if (file.isFile()) {
-					if (changedUris == null || changedUris.contains(fileURI)) {
-						compilationUnit.addSource(file);
-						addedCount++;
-					}
-				}
+			if (shouldAddInRemainingPass(filePath, fileContentsTracker, changedUris, needsLimiting, openPackageDirs)
+					&& addRegularFileSource(filePath, compilationUnit)) {
+				addedCount++;
 			}
 		}
-		Path normalizedDir = dirPath.normalize();
+		return addedCount;
+	}
+
+	private boolean shouldAddInRemainingPass(Path filePath, FileContentsTracker fileContentsTracker,
+			Set<URI> changedUris, boolean needsLimiting, Set<String> openPackageDirs) {
+		URI fileURI = filePath.toUri();
+		if (fileContentsTracker.isOpen(fileURI)) {
+			return false;
+		}
+		String parentDir = filePath.getParent() != null ? filePath.getParent().normalize().toString() : "";
+		boolean alreadyAddedInPriorityPass = needsLimiting && !openPackageDirs.isEmpty() && openPackageDirs.contains(parentDir);
+		return !alreadyAddedInPriorityPass && (changedUris == null || changedUris.contains(fileURI));
+	}
+
+	private boolean addRegularFileSource(Path filePath, GroovyLSCompilationUnit compilationUnit) {
+		File file = filePath.toFile();
+		if (!file.isFile()) {
+			return false;
+		}
+		compilationUnit.addSource(file);
+		return true;
+	}
+
+	private void addOpenSourcesInDirectory(Path dirPath, Path normalizedDir,
+			GroovyLSCompilationUnit compilationUnit, FileContentsTracker fileContentsTracker,
+			Set<URI> changedUris) {
 		fileContentsTracker.getOpenURIs().forEach(uri -> {
-			if (uri == null || uri.getScheme() == null || !"file".equalsIgnoreCase(uri.getScheme())) {
-				return;
-			}
-			Path openPath;
-			try {
-				openPath = Paths.get(uri);
-			} catch (Exception ignored) {
-				return;
-			}
-			if (!openPath.normalize().startsWith(normalizedDir)) {
+			Path openPath = toFilePath(uri);
+			if (openPath == null || !openPath.normalize().startsWith(normalizedDir)) {
 				return;
 			}
 			if (isInsideExcludedDirectory(openPath, dirPath)) {
@@ -678,9 +707,19 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 			if (changedUris != null && !changedUris.contains(uri)) {
 				return;
 			}
-			String contents = fileContentsTracker.getContents(uri);
-			addOpenFileToCompilationUnit(uri, contents, compilationUnit);
+			addOpenFileToCompilationUnit(uri, fileContentsTracker.getContents(uri), compilationUnit);
 		});
+	}
+
+	private Path toFilePath(URI uri) {
+		try {
+			if (uri == null || uri.getScheme() == null || !"file".equalsIgnoreCase(uri.getScheme())) {
+				return null;
+			}
+			return Paths.get(uri);
+		} catch (Exception ignored) {
+			return null;
+		}
 	}
 
 	/**
@@ -768,264 +807,5 @@ public class CompilationUnitFactory implements ICompilationUnitFactory {
 				compilationUnit.getConfiguration(), compilationUnit.getClassLoader(),
 				compilationUnit.getErrorCollector());
 		compilationUnit.addSource(sourceUnit);
-	}
-
-	// ---- Java source stub generation ----
-
-	/**
-	 * Adds synthetic Groovy source stubs for Java source files whose compiled
-	 * {@code .class} files are not yet on the classpath. This allows Groovy
-	 * imports to resolve immediately, without waiting for Gradle/Maven to
-	 * compile the Java sources.
-	 *
-	 * <p>The stubs are <b>rebuilt from disk on every call</b>: previous stubs
-	 * are removed from the compilation unit and fresh ones are added based on
-	 * the current state of the Java source directories. This eliminates stale
-	 * state problems that arise with classloader-based stub approaches
-	 * (where {@code defineClass()} is permanent in the JVM and cannot handle
-	 * move/rename scenarios).</p>
-	 *
-	 * <p>Each stub is a minimal Groovy source like
-	 * {@code package com.example; class Frame {}} &mdash; just enough for the
-	 * Groovy compiler to recognise the class name during
-	 * {@code Phases.CANONICALIZATION}.</p>
-	 */
-	private void addJavaSourceStubs(Path workspaceRoot, GroovyLSCompilationUnit compilationUnit) {
-		Path effectiveRoot = projectRoot != null ? projectRoot : workspaceRoot;
-		if (effectiveRoot == null) {
-			return;
-		}
-
-		// 1. Remove any existing Java stubs from a previous create() call.
-		//    Source-based ClassNodes from the new stubs take precedence over
-		//    any stale classes in the GroovyClassLoader's internal cache during
-		//    Groovy compilation, so explicit cache clearing is not needed.
-		List<SourceUnit> stubsToRemove = new ArrayList<>();
-		compilationUnit.iterator().forEachRemaining(su -> {
-			if (su.getName() != null && su.getName().startsWith(JAVA_STUB_NAME_PREFIX)) {
-				stubsToRemove.add(su);
-			}
-		});
-		if (!stubsToRemove.isEmpty()) {
-			compilationUnit.removeSources(stubsToRemove);
-		}
-		logger.trace("javaStubTrace projectRoot={} removedPreviousStubs={}", effectiveRoot, stubsToRemove.size());
-
-		// 2. Scan Java source directories for .java files
-		Map<String, Path> javaIndex = scanJavaSources(effectiveRoot);
-		if (javaIndex.isEmpty()) {
-			logger.trace("javaStubTrace projectRoot={} javaSourceCount=0", effectiveRoot);
-			return;
-		}
-		logger.trace("javaStubTrace projectRoot={} javaSourceCount={}", effectiveRoot, javaIndex.size());
-		if (logger.isDebugEnabled()) {
-			List<String> discovered = new ArrayList<>();
-			for (String fqcn : javaIndex.keySet()) {
-				discovered.add(fqcn);
-			}
-			Collections.sort(discovered);
-			int limit = Math.min(discovered.size(), 12);
-			List<String> sample = discovered.subList(0, limit);
-			logger.debug("javaStubSummary projectRoot={} javaSourceCount={} sample={}",
-					effectiveRoot, discovered.size(), sample);
-		}
-
-		// 3. Add stubs for classes not already on the classpath
-		int added = 0;
-		for (Map.Entry<String, Path> entry : javaIndex.entrySet()) {
-			String fqcn = entry.getKey();
-			Path javaSourcePath = entry.getValue();
-
-			// Skip if the class is already resolvable from the classpath
-			// (e.g. the .class file exists in build/classes/)
-			File classFileOnClasspath = findClassFileOnClasspath(fqcn);
-			if (classFileOnClasspath != null) {
-				logger.trace("javaStubTrace skip fqcn={} source={} reason=classOnClasspath classFile={}",
-						fqcn, javaSourcePath, classFileOnClasspath);
-				continue;
-			}
-
-			// Build a minimal synthetic Groovy source
-			String pkg = "";
-			String simpleName = fqcn;
-			int lastDot = fqcn.lastIndexOf('.');
-			if (lastDot >= 0) {
-				pkg = fqcn.substring(0, lastDot);
-				simpleName = fqcn.substring(lastDot + 1);
-			}
-			StringBuilder source = new StringBuilder();
-			if (!pkg.isEmpty()) {
-				source.append("package ").append(pkg).append("\n");
-			}
-			source.append("class ").append(simpleName).append(" {}\n");
-
-			// Use the REAL .java file URI so that "Go to Definition" on
-			// imports resolved through this stub navigates to the actual
-			// Java source file (not a synthetic URI).
-			URI stubUri = javaSourcePath.toUri();
-			SourceUnit su = new SourceUnit(
-					JAVA_STUB_NAME_PREFIX + fqcn,
-					new StringReaderSourceWithURI(source.toString(), stubUri,
-							compilationUnit.getConfiguration()),
-					compilationUnit.getConfiguration(),
-					compilationUnit.getClassLoader(),
-					compilationUnit.getErrorCollector());
-			compilationUnit.addSource(su);
-			logger.trace("javaStubTrace add fqcn={} source={} stubUri={}", fqcn, javaSourcePath, stubUri);
-			added++;
-		}
-
-		if (added > 0) {
-			logger.debug("Added {} Java source stub(s) to compilation unit", added);
-		}
-	}
-
-	private File findClassFileOnClasspath(String fqcn) {
-		List<String> entries = resolvedClasspathCache;
-		if (entries == null || entries.isEmpty()) {
-			logger.debug("javaStubTrace classpathCheck fqcn={} entries=0", fqcn);
-			return null;
-		}
-		String classFileRelative = fqcn.replace('.', File.separatorChar) + ".class";
-		for (String entry : entries) {
-			File entryFile = new File(entry);
-			if (entryFile.isDirectory()) {
-				File classFile = new File(entryFile, classFileRelative);
-				if (classFile.isFile()) {
-					return classFile;
-				}
-			}
-			// JAR entries are skipped — project Java sources won't be in JARs.
-			// Third-party JARs may contain classes with the same FQCN but
-			// that's extremely rare for project-level classes like Frame.
-		}
-		return null;
-	}
-
-	/**
-	 * Scans standard Java source directories ({@code src/main/java},
-	 * {@code src/test/java}) under the given project root and returns a
-	 * mapping from fully-qualified class name to source file path.
-	 */
-	private Map<String, Path> scanJavaSources(Path root) {
-		Map<String, Path> index = new HashMap<>();
-		for (String[] pattern : JAVA_SOURCE_DIR_PATTERNS) {
-			Path sourceDir = root;
-			for (String segment : pattern) {
-				sourceDir = sourceDir.resolve(segment);
-			}
-			if (!Files.isDirectory(sourceDir)) {
-				continue;
-			}
-			final Path finalSourceDir = sourceDir;
-			try {
-				Files.walkFileTree(sourceDir, new SimpleFileVisitor<Path>() {
-					@Override
-					public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
-						if (file.getFileName().toString().endsWith(".java")) {
-							Path relative = finalSourceDir.relativize(file);
-							String pathFqcn = javaPathToFqcn(relative);
-							String declaredFqcn = javaFileToDeclaredFqcn(file);
-							if (pathFqcn != null && declaredFqcn != null && !pathFqcn.equals(declaredFqcn)) {
-								logger.info(
-										"javaStubPathPackageMismatch file={} pathFqcn={} declaredFqcn={}",
-										file, pathFqcn, declaredFqcn);
-								putJavaIndexEntry(index, pathFqcn, file);
-								putJavaIndexEntry(index, declaredFqcn, file);
-								logger.info("javaStubTransitionAliases file={} aliases=[{}, {}]",
-										file, pathFqcn, declaredFqcn);
-							} else {
-								String fqcn = declaredFqcn != null ? declaredFqcn : pathFqcn;
-								putJavaIndexEntry(index, fqcn, file);
-							}
-						}
-						return FileVisitResult.CONTINUE;
-					}
-
-					@Override
-					public FileVisitResult visitFileFailed(Path file, IOException exc) {
-						return FileVisitResult.CONTINUE;
-					}
-				});
-			} catch (IOException e) {
-				logger.debug("Could not scan Java source dir {}: {}", sourceDir, e.getMessage());
-			}
-		}
-		return index;
-	}
-
-	private void putJavaIndexEntry(Map<String, Path> index, String fqcn, Path file) {
-		if (fqcn == null || fqcn.isEmpty()) {
-			return;
-		}
-		Path previous = index.put(fqcn, file);
-		if (previous != null && !previous.equals(file)) {
-			logger.warn("javaStubDuplicateFqcn fqcn={} first={} second={}", fqcn, previous, file);
-		}
-	}
-
-	private String javaFileToDeclaredFqcn(Path javaFile) {
-		String fileName = javaFile.getFileName().toString();
-		if (!fileName.endsWith(".java")) {
-			return null;
-		}
-		String simpleName = fileName.substring(0, fileName.length() - ".java".length());
-		String pkg = extractJavaPackage(javaFile);
-		if (pkg == null || pkg.isEmpty()) {
-			return simpleName;
-		}
-		return pkg + "." + simpleName;
-	}
-
-	private String extractJavaPackage(Path javaFile) {
-		try {
-			for (String line : Files.readAllLines(javaFile)) {
-				String trimmed = line.trim();
-				if (trimmed.isEmpty() || trimmed.startsWith("//") || trimmed.startsWith("/*")
-						|| trimmed.startsWith("*")) {
-					continue;
-				}
-				if (trimmed.startsWith("package ")) {
-					String tail = trimmed.substring("package ".length()).trim();
-					if (tail.endsWith(";")) {
-						tail = tail.substring(0, tail.length() - 1).trim();
-					}
-					return tail;
-				}
-				// Once we hit a non-comment, non-package top-level line,
-				// there is no package declaration.
-				break;
-			}
-		} catch (IOException e) {
-			logger.debug("Could not read Java source file for package extraction {}: {}",
-					javaFile, e.getMessage());
-		}
-		return "";
-	}
-
-	/**
-	 * Converts a path relative to a Java source root to a fully-qualified
-	 * class name. E.g. {@code com/example/Frame.java} &rarr;
-	 * {@code com.example.Frame}.
-	 */
-	private static String javaPathToFqcn(Path relativePath) {
-		StringBuilder sb = new StringBuilder();
-		for (int i = 0; i < relativePath.getNameCount(); i++) {
-			String segment = relativePath.getName(i).toString();
-			if (i == relativePath.getNameCount() - 1) {
-				if (!segment.endsWith(".java")) {
-					return null;
-				}
-				segment = segment.substring(0, segment.length() - ".java".length());
-			}
-			if (segment.isEmpty()) {
-				return null;
-			}
-			if (sb.length() > 0) {
-				sb.append('.');
-			}
-			sb.append(segment);
-		}
-		return sb.toString();
 	}
 }

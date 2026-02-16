@@ -23,6 +23,7 @@ package com.tomaszrup.groovyls.providers;
 import java.net.URI;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 
@@ -47,64 +48,60 @@ public class WorkspaceSymbolProvider {
 		this.ast = ast;
 	}
 
-	public CompletableFuture<List<? extends WorkspaceSymbol>> provideWorkspaceSymbols(String query) {
+	public CompletableFuture<List<WorkspaceSymbol>> provideWorkspaceSymbols(String query) {
 		if (ast == null) {
 			// this shouldn't happen, but let's avoid an exception if something
 			// goes terribly wrong.
 			return CompletableFuture.completedFuture(Collections.emptyList());
 		}
-		String lowerCaseQuery = query.toLowerCase();
+		String lowerCaseQuery = query == null ? "" : query.toLowerCase();
 		List<ASTNode> nodes = ast.getNodes();
-		List<WorkspaceSymbol> symbols = nodes.stream().filter(node -> {
-			String name = null;
-			if (node instanceof ClassNode) {
-				ClassNode classNode = (ClassNode) node;
-				name = classNode.getName();
-			} else if (node instanceof MethodNode) {
-				MethodNode methodNode = (MethodNode) node;
-				name = methodNode.getName();
-			} else if (node instanceof FieldNode) {
-				FieldNode fieldNode = (FieldNode) node;
-				name = fieldNode.getName();
-			} else if (node instanceof PropertyNode) {
-				PropertyNode propNode = (PropertyNode) node;
-				name = propNode.getName();
-			}
-			if (name == null) {
-				return false;
-			}
-			return name.toLowerCase().contains(lowerCaseQuery);
-		}).map(node -> {
-			URI uri = ast.getURI(node);
-			if (uri == null) {
-				return null;
-			}
-			Location location = GroovyLanguageServerUtils.astNodeToLocation(node, uri);
-			if (location == null) {
-				return null;
-			}
-			SymbolKind kind = GroovyLanguageServerUtils.astNodeToSymbolKind(node);
-			if (node instanceof ClassNode) {
-				ClassNode classNode = (ClassNode) node;
-				return new WorkspaceSymbol(classNode.getName(), kind, Either.forLeft(location), null);
-			}
-			ClassNode classNode = (ClassNode) GroovyASTUtils.getEnclosingNodeOfType(node, ClassNode.class, ast);
-			String containerName = classNode != null ? classNode.getName() : null;
-			if (node instanceof MethodNode) {
-				MethodNode methodNode = (MethodNode) node;
-				return new WorkspaceSymbol(methodNode.getName(), kind, Either.forLeft(location), containerName);
-			}
-			if (node instanceof PropertyNode) {
-				PropertyNode propNode = (PropertyNode) node;
-				return new WorkspaceSymbol(propNode.getName(), kind, Either.forLeft(location), containerName);
-			}
-			if (node instanceof FieldNode) {
-				FieldNode fieldNode = (FieldNode) node;
-				return new WorkspaceSymbol(fieldNode.getName(), kind, Either.forLeft(location), containerName);
-			}
-			// this should never happen
-			return null;
-		}).filter(symbolInformation -> symbolInformation != null).collect(Collectors.toList());
+		List<WorkspaceSymbol> symbols = nodes.stream()
+				.filter(node -> {
+					String name = getNodeName(node);
+					return name != null && name.toLowerCase().contains(lowerCaseQuery);
+				})
+				.map(this::toWorkspaceSymbol)
+				.filter(Objects::nonNull)
+				.collect(Collectors.toList());
 		return CompletableFuture.completedFuture(symbols);
+	}
+
+	private String getNodeName(ASTNode node) {
+		if (node instanceof ClassNode) {
+			return ((ClassNode) node).getName();
+		}
+		if (node instanceof MethodNode) {
+			return ((MethodNode) node).getName();
+		}
+		if (node instanceof FieldNode) {
+			return ((FieldNode) node).getName();
+		}
+		if (node instanceof PropertyNode) {
+			return ((PropertyNode) node).getName();
+		}
+		return null;
+	}
+
+	private WorkspaceSymbol toWorkspaceSymbol(ASTNode node) {
+		URI uri = ast.getURI(node);
+		if (uri == null) {
+			return null;
+		}
+		Location location = GroovyLanguageServerUtils.astNodeToLocation(node, uri);
+		if (location == null) {
+			return null;
+		}
+		SymbolKind kind = GroovyLanguageServerUtils.astNodeToSymbolKind(node);
+		String name = getNodeName(node);
+		if (name == null) {
+			return null;
+		}
+		if (node instanceof ClassNode) {
+			return new WorkspaceSymbol(name, kind, Either.forLeft(location), null);
+		}
+		ClassNode classNode = (ClassNode) GroovyASTUtils.getEnclosingNodeOfType(node, ClassNode.class, ast);
+		String containerName = classNode != null ? classNode.getName() : null;
+		return new WorkspaceSymbol(name, kind, Either.forLeft(location), containerName);
 	}
 }

@@ -46,7 +46,6 @@ import org.codehaus.groovy.ast.expr.PropertyExpression;
 import org.codehaus.groovy.ast.expr.VariableExpression;
 import org.codehaus.groovy.ast.stmt.BlockStatement;
 import org.codehaus.groovy.ast.stmt.Statement;
-import org.eclipse.lsp4j.CompletionContext;
 import org.eclipse.lsp4j.CompletionItem;
 import org.eclipse.lsp4j.CompletionItemKind;
 import org.eclipse.lsp4j.CompletionItemLabelDetails;
@@ -105,7 +104,7 @@ public class CompletionProvider {
 	}
 
 	public CompletableFuture<Either<List<CompletionItem>, CompletionList>> provideCompletion(
-			TextDocumentIdentifier textDocument, Position position, CompletionContext context) {
+			TextDocumentIdentifier textDocument, Position position) {
 		if (ast == null) {
 			// this shouldn't happen, but let's avoid an exception if something
 			// goes terribly wrong.
@@ -184,23 +183,18 @@ public class CompletionProvider {
 
 		String enclosingPackageName = enclosingModule != null ? enclosingModule.getPackageName() : null;
 		List<String> importNames = enclosingModule != null ? enclosingModule.getImports().stream()
-				.map(otherImportNode -> otherImportNode.getClassName()).collect(Collectors.toList())
+				.map(ImportNode::getClassName).collect(Collectors.toList())
 				: Collections.emptyList();
 
 		List<CompletionItem> localClassItems = ast.getClassNodes().stream().filter(classNode -> {
 			String packageName = classNode.getPackageName();
-			if (packageName == null || packageName.length() == 0 || packageName.equals(enclosingPackageName)) {
+			if (!isImportablePackage(packageName, enclosingPackageName)) {
 				return false;
 			}
 			String className = classNode.getName();
 			String classNameWithoutPackage = classNode.getNameWithoutPackage();
-			if (!className.startsWith(importText) && !classNameWithoutPackage.startsWith(importText)) {
-				return false;
-			}
-			if (importNames.contains(className)) {
-				return false;
-			}
-			return true;
+			boolean nameMatches = matchesImportPrefix(importText, className, classNameWithoutPackage);
+			return nameMatches && !importNames.contains(className);
 		}).map(classNode -> {
 			CompletionItem item = new CompletionItem();
 			item.setLabel(classNode.getName());
@@ -220,12 +214,8 @@ public class CompletionProvider {
 		List<ClasspathSymbolIndex.Symbol> classes = getFilteredClasses();
 		Set<String> packages = classpathSymbolIndex.getPackageNames();
 
-		List<CompletionItem> packageItems = packages.stream().filter(packageName -> {
-			if (packageName.startsWith(importText)) {
-				return true;
-			}
-			return false;
-		}).map(packageName -> {
+		List<CompletionItem> packageItems = packages.stream().filter(packageName -> packageName.startsWith(importText))
+				.map(packageName -> {
 			CompletionItem item = new CompletionItem();
 			item.setLabel(packageName);
 			item.setTextEdit(Either.forLeft(new TextEdit(importRange, packageName)));
@@ -236,18 +226,13 @@ public class CompletionProvider {
 
 		List<CompletionItem> classItems = classes.stream().filter(classSymbol -> {
 			String packageName = classSymbol.getPackageName();
-			if (packageName == null || packageName.length() == 0 || packageName.equals(enclosingPackageName)) {
+			if (!isImportablePackage(packageName, enclosingPackageName)) {
 				return false;
 			}
 			String className = classSymbol.getName();
 			String classNameWithoutPackage = classSymbol.getSimpleName();
-			if (!className.startsWith(importText) && !classNameWithoutPackage.startsWith(importText)) {
-				return false;
-			}
-			if (importNames.contains(className)) {
-				return false;
-			}
-			return true;
+			boolean nameMatches = matchesImportPrefix(importText, className, classNameWithoutPackage);
+			return nameMatches && !importNames.contains(className);
 		}).map(classSymbol -> {
 			CompletionItem item = new CompletionItem();
 			item.setLabel(classSymbol.getName());
@@ -261,6 +246,14 @@ public class CompletionProvider {
 		items.addAll(classItems);
 	}
 
+	private boolean isImportablePackage(String packageName, String enclosingPackageName) {
+		return packageName != null && !packageName.isEmpty() && !packageName.equals(enclosingPackageName);
+	}
+
+	private boolean matchesImportPrefix(String importText, String className, String classNameWithoutPackage) {
+		return className.startsWith(importText) || classNameWithoutPackage.startsWith(importText);
+	}
+
 	private void populateItemsFromClassNode(ClassNode classNode, Position position, List<CompletionItem> items) {
 		ASTNode parentNode = ast.getParent(classNode);
 		if (!(parentNode instanceof ClassNode)) {
@@ -272,10 +265,9 @@ public class CompletionProvider {
 			return;
 		}
 		String className = getMemberName(classNode.getUnresolvedName(), classRange, position);
-		if (classNode.equals(parentClassNode.getUnresolvedSuperClass())) {
-			populateTypes(classNode, className, new HashSet<>(), true, false, false, items);
-		} else if (Arrays.asList(parentClassNode.getUnresolvedInterfaces()).contains(classNode)) {
-			populateTypes(classNode, className, new HashSet<>(), false, true, false, items);
+		if (classNode.equals(parentClassNode.getUnresolvedSuperClass())
+				|| Arrays.asList(parentClassNode.getUnresolvedInterfaces()).contains(classNode)) {
+			populateTypes(classNode, className, new HashSet<>(), items);
 		}
 	}
 
@@ -286,7 +278,7 @@ public class CompletionProvider {
 			return;
 		}
 		String typeName = getMemberName(constructorCallExpr.getType().getNameWithoutPackage(), typeRange, position);
-		populateTypes(constructorCallExpr, typeName, new HashSet<>(), true, false, false, items);
+		populateTypes(constructorCallExpr, typeName, new HashSet<>(), items);
 	}
 
 	private void populateItemsFromVariableExpression(VariableExpression varExpr, Position position,
@@ -440,37 +432,20 @@ public class CompletionProvider {
 
 	private void populateTypes(ASTNode offsetNode, String namePrefix, Set<String> existingNames,
 			List<CompletionItem> items) {
-		populateTypes(offsetNode, namePrefix, existingNames, true, true, true, items);
-	}
-
-	private void populateTypes(ASTNode offsetNode, String namePrefix, Set<String> existingNames, boolean includeClasses,
-			boolean includeInterfaces, boolean includeEnums, List<CompletionItem> items) {
 		Range addImportRange = GroovyASTUtils.findAddImportRange(offsetNode, ast);
 
 		ModuleNode enclosingModule = (ModuleNode) GroovyASTUtils.getEnclosingNodeOfType(offsetNode, ModuleNode.class,
 				ast);
 		String enclosingPackageName = enclosingModule != null ? enclosingModule.getPackageName() : null;
 		List<String> importNames = enclosingModule != null
-				? enclosingModule.getImports().stream().map(importNode -> importNode.getClassName())
+				? enclosingModule.getImports().stream().map(ImportNode::getClassName)
 						.collect(Collectors.toList())
 				: Collections.emptyList();
 
-		List<CompletionItem> localClassItems = ast.getClassNodes().stream().filter(classNode -> {
-			if (isIncomplete) {
-				return false;
-			}
-			if (existingNames.size() >= maxItemCount) {
-				isIncomplete = true;
-				return false;
-			}
-			String classNameWithoutPackage = classNode.getNameWithoutPackage();
-			String className = classNode.getName();
-			if (classNameWithoutPackage.startsWith(namePrefix) && !existingNames.contains(className)) {
-				existingNames.add(className);
-				return true;
-			}
-			return false;
-		}).map(classNode -> {
+		List<CompletionItem> localClassItems = ast.getClassNodes().stream().filter(classNode ->
+				shouldIncludeTypeByName(classNode.getNameWithoutPackage(), classNode.getName(), namePrefix,
+						existingNames))
+				.map(classNode -> {
 			String className = classNode.getName();
 			String packageName = classNode.getPackageName();
 			CompletionItem item = new CompletionItem();
@@ -493,22 +468,9 @@ public class CompletionProvider {
 		}
 		List<ClasspathSymbolIndex.Symbol> classes = getFilteredClasses();
 
-		List<CompletionItem> classItems = classes.stream().filter(classSymbol -> {
-			if (isIncomplete) {
-				return false;
-			}
-			if (existingNames.size() >= maxItemCount) {
-				isIncomplete = true;
-				return false;
-			}
-			String className = classSymbol.getName();
-			String classNameWithoutPackage = classSymbol.getSimpleName();
-			if (classNameWithoutPackage.startsWith(namePrefix) && !existingNames.contains(className)) {
-				existingNames.add(className);
-				return true;
-			}
-			return false;
-		}).map(classSymbol -> {
+		List<CompletionItem> classItems = classes.stream().filter(classSymbol ->
+				shouldIncludeTypeByName(classSymbol.getSimpleName(), classSymbol.getName(), namePrefix, existingNames))
+				.map(classSymbol -> {
 			String className = classSymbol.getName();
 			String packageName = classSymbol.getPackageName();
 			CompletionItem item = new CompletionItem();
@@ -524,6 +486,22 @@ public class CompletionProvider {
 			return item;
 		}).collect(Collectors.toList());
 		items.addAll(classItems);
+	}
+
+	private boolean shouldIncludeTypeByName(String simpleName, String fullName, String namePrefix,
+			Set<String> existingNames) {
+		if (isIncomplete) {
+			return false;
+		}
+		if (existingNames.size() >= maxItemCount) {
+			isIncomplete = true;
+			return false;
+		}
+		if (!simpleName.startsWith(namePrefix) || existingNames.contains(fullName)) {
+			return false;
+		}
+		existingNames.add(fullName);
+		return true;
 	}
 
 	private String getMemberName(String memberName, Range range, Position position) {

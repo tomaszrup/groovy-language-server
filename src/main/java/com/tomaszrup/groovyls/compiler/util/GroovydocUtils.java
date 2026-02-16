@@ -26,179 +26,225 @@ import java.util.List;
 import groovy.lang.groovydoc.Groovydoc;
 
 public class GroovydocUtils {
+	private static final String MARKDOWN_LINE_BREAK = "  \n";
+	private static final int MAX_REGEX_LINE_CHARS = 20_000;
+
+	private GroovydocUtils() {
+	}
+
 	public static String groovydocToMarkdownDescription(Groovydoc groovydoc) {
 		if (groovydoc == null || !groovydoc.isPresent()) {
 			return null;
 		}
-		String content = groovydoc.getContent();
+		GroovydocParseState state = new GroovydocParseState();
+		parseGroovydocLines(groovydoc.getContent(), state);
+		String result = buildMarkdown(state).toString().trim();
+		return result.isEmpty() ? null : result;
+	}
+
+	private static void parseGroovydocLines(String content, GroovydocParseState state) {
 		String[] lines = content.split("\n");
-		StringBuilder descriptionBuilder = new StringBuilder();
-		List<String> paramDocs = new ArrayList<>();
-		List<String> throwsDocs = new ArrayList<>();
-		List<String> seeDocs = new ArrayList<>();
-		List<String> returnDocs = new ArrayList<>();
-		String sinceDoc = null;
-		String deprecatedDoc = null;
-		StringBuilder currentTagContent = null;
-		String currentTagType = null;
-
-		int n = lines.length;
-
-		for (int i = 0; i < n; i++) {
-			String line = lines[i];
-
-			if (i == 0) {
-				// Strip start of groovydoc comment (/**)
-				int startLen = Math.min(line.length(), 3);
-				line = line.substring(startLen);
-			}
-			if (i == n - 1) {
-				// Strip end of groovydoc comment (*/)
-				int endIndex = line.indexOf("*/");
-				if (endIndex != -1) {
-					line = line.substring(0, endIndex);
-				}
-			}
-
-			// Strip leading * character from continuation lines
-			if (i > 0) {
-				int star = line.indexOf("*");
-				if (star > -1) {
-					line = line.substring(star + 1);
-				}
-			}
-
-			line = line.trim();
-
-			// Check for tag lines
-			if (line.startsWith("@param ")) {
-				flushTag(currentTagType, currentTagContent, paramDocs, throwsDocs, seeDocs, returnDocs);
-				currentTagType = "param";
-				currentTagContent = new StringBuilder(line.substring(7).trim());
-			} else if (line.startsWith("@return ") || line.equals("@return")) {
-				flushTag(currentTagType, currentTagContent, paramDocs, throwsDocs, seeDocs, returnDocs);
-				currentTagType = "return";
-				currentTagContent = new StringBuilder(line.length() > 8 ? line.substring(8).trim() : "");
-			} else if (line.startsWith("@throws ") || line.startsWith("@exception ")) {
-				flushTag(currentTagType, currentTagContent, paramDocs, throwsDocs, seeDocs, returnDocs);
-				currentTagType = "throws";
-				String tagContent = line.startsWith("@throws ") ? line.substring(8) : line.substring(11);
-				currentTagContent = new StringBuilder(tagContent.trim());
-			} else if (line.startsWith("@see ")) {
-				flushTag(currentTagType, currentTagContent, paramDocs, throwsDocs, seeDocs, returnDocs);
-				currentTagType = "see";
-				currentTagContent = new StringBuilder(line.substring(5).trim());
-			} else if (line.startsWith("@since ")) {
-				flushTag(currentTagType, currentTagContent, paramDocs, throwsDocs, seeDocs, returnDocs);
-				sinceDoc = line.substring(7).trim();
-				currentTagType = null;
-				currentTagContent = null;
-			} else if (line.startsWith("@deprecated")) {
-				flushTag(currentTagType, currentTagContent, paramDocs, throwsDocs, seeDocs, returnDocs);
-				deprecatedDoc = line.length() > 12 ? line.substring(12).trim() : "";
-				currentTagType = null;
-				currentTagContent = null;
-			} else if (line.startsWith("@")) {
-				// Other tag — flush current and ignore
-				flushTag(currentTagType, currentTagContent, paramDocs, throwsDocs, seeDocs, returnDocs);
-				currentTagType = null;
-				currentTagContent = null;
-			} else {
-				// Continuation or description line
-				if (currentTagType != null && currentTagContent != null) {
-					if (!line.isEmpty()) {
-						currentTagContent.append(" ").append(line);
-					}
-				} else {
-					String reformatted = reformatLine(line);
-					if (!reformatted.isEmpty()) {
-						if (descriptionBuilder.length() > 0) {
-							descriptionBuilder.append("\n");
-						}
-						descriptionBuilder.append(reformatted);
-					}
-				}
+		for (int i = 0; i < lines.length; i++) {
+			String line = normalizeGroovydocLine(lines[i], i, lines.length);
+			if (!handleTagLine(line, state)) {
+				handleDescriptionOrContinuation(line, state);
 			}
 		}
+		flushCurrentTag(state);
+	}
 
-		// Flush any remaining tag
-		flushTag(currentTagType, currentTagContent, paramDocs, throwsDocs, seeDocs, returnDocs);
-		String returnDoc = returnDocs.isEmpty() ? null : returnDocs.get(0);
-
-		// Build the final Markdown output
-		StringBuilder markdown = new StringBuilder();
-
-		if (deprecatedDoc != null) {
-			markdown.append("**@deprecated**");
-			if (!deprecatedDoc.isEmpty()) {
-				markdown.append(" ").append(deprecatedDoc);
+	private static String normalizeGroovydocLine(String line, int index, int totalLines) {
+		if (index == 0) {
+			int startLen = Math.min(line.length(), 3);
+			line = line.substring(startLen);
+		}
+		if (index == totalLines - 1) {
+			int endIndex = line.indexOf("*/");
+			if (endIndex != -1) {
+				line = line.substring(0, endIndex);
 			}
+		}
+		if (index > 0) {
+			int star = line.indexOf("*");
+			if (star > -1) {
+				line = line.substring(star + 1);
+			}
+		}
+		return line.trim();
+	}
+
+	private static boolean handleTagLine(String line, GroovydocParseState state) {
+		if (line.startsWith("@param ")) {
+			startTag(state, "param", line.substring(7).trim());
+			return true;
+		}
+		if (line.startsWith("@return ") || line.equals("@return")) {
+			startTag(state, "return", line.length() > 8 ? line.substring(8).trim() : "");
+			return true;
+		}
+		if (line.startsWith("@throws ") || line.startsWith("@exception ")) {
+			String tagContent = line.startsWith("@throws ") ? line.substring(8) : line.substring(11);
+			startTag(state, "throws", tagContent.trim());
+			return true;
+		}
+		if (line.startsWith("@see ")) {
+			startTag(state, "see", line.substring(5).trim());
+			return true;
+		}
+		if (line.startsWith("@since ")) {
+			flushCurrentTag(state);
+			state.sinceDoc = line.substring(7).trim();
+			return true;
+		}
+		if (line.startsWith("@deprecated")) {
+			flushCurrentTag(state);
+			state.deprecatedDoc = line.length() > 12 ? line.substring(12).trim() : "";
+			return true;
+		}
+		if (line.startsWith("@")) {
+			flushCurrentTag(state);
+			return true;
+		}
+		return false;
+	}
+
+	private static void startTag(GroovydocParseState state, String tagType, String content) {
+		flushCurrentTag(state);
+		state.currentTagType = tagType;
+		state.currentTagContent = new StringBuilder(content);
+	}
+
+	private static void flushCurrentTag(GroovydocParseState state) {
+		flushTag(state.currentTagType, state.currentTagContent,
+				state.paramDocs, state.throwsDocs, state.seeDocs, state.returnDocs);
+		state.currentTagType = null;
+		state.currentTagContent = null;
+	}
+
+	private static void handleDescriptionOrContinuation(String line, GroovydocParseState state) {
+		if (state.currentTagType != null && state.currentTagContent != null) {
+			if (!line.isEmpty()) {
+				state.currentTagContent.append(" ").append(line);
+			}
+			return;
+		}
+		String reformatted = reformatLine(line);
+		if (!reformatted.isEmpty()) {
+			if (state.descriptionBuilder.length() > 0) {
+				state.descriptionBuilder.append("\n");
+			}
+			state.descriptionBuilder.append(reformatted);
+		}
+	}
+
+	private static StringBuilder buildMarkdown(GroovydocParseState state) {
+		StringBuilder markdown = new StringBuilder();
+		appendDeprecated(markdown, state.deprecatedDoc);
+		appendDescription(markdown, state.descriptionBuilder.toString().trim());
+		appendParamDocs(markdown, state.paramDocs);
+		appendReturnDoc(markdown, state.returnDocs.isEmpty() ? null : state.returnDocs.get(0));
+		appendThrowsDocs(markdown, state.throwsDocs);
+		appendSinceDoc(markdown, state.sinceDoc);
+		appendSeeDocs(markdown, state.seeDocs);
+		return markdown;
+	}
+
+	private static void appendDeprecated(StringBuilder markdown, String deprecatedDoc) {
+		if (deprecatedDoc == null) {
+			return;
+		}
+		markdown.append("**@deprecated**");
+		if (!deprecatedDoc.isEmpty()) {
+			markdown.append(" ").append(deprecatedDoc);
+		}
+		markdown.append("\n\n");
+	}
+
+	private static void appendDescription(StringBuilder markdown, String description) {
+		if (!description.isEmpty()) {
+			markdown.append(description);
+		}
+	}
+
+	private static void appendParamDocs(StringBuilder markdown, List<String> paramDocs) {
+		if (paramDocs.isEmpty()) {
+			return;
+		}
+		if (markdown.length() > 0) {
 			markdown.append("\n\n");
 		}
-
-		String desc = descriptionBuilder.toString().trim();
-		if (!desc.isEmpty()) {
-			markdown.append(desc);
+		for (String param : paramDocs) {
+			appendNamedTag(markdown, "@param", param);
 		}
+	}
 
-		if (!paramDocs.isEmpty()) {
-			if (markdown.length() > 0) {
-				markdown.append("\n\n");
-			}
-			for (String param : paramDocs) {
-				// param format: "name description"
-				int space = param.indexOf(' ');
-				if (space > 0) {
-					String pName = param.substring(0, space);
-					String pDesc = param.substring(space + 1).trim();
-					markdown.append("**@param** `").append(pName).append("` — ").append(pDesc).append("  \n");
-				} else {
-					markdown.append("**@param** `").append(param.trim()).append("`  \n");
-				}
-			}
+	private static void appendReturnDoc(StringBuilder markdown, String returnDoc) {
+		if (returnDoc == null || returnDoc.isEmpty()) {
+			return;
 		}
-
-		if (returnDoc != null && !returnDoc.isEmpty()) {
-			if (markdown.length() > 0) {
-				markdown.append("\n");
-			}
-			markdown.append("**@return** ").append(returnDoc).append("\n");
+		if (markdown.length() > 0) {
+			markdown.append("\n");
 		}
+		markdown.append("**@return** ").append(returnDoc).append("\n");
+	}
 
-		if (!throwsDocs.isEmpty()) {
-			if (markdown.length() > 0) {
-				markdown.append("\n");
-			}
-			for (String t : throwsDocs) {
-				int space = t.indexOf(' ');
-				if (space > 0) {
-					String tName = t.substring(0, space);
-					String tDesc = t.substring(space + 1).trim();
-					markdown.append("**@throws** `").append(tName).append("` — ").append(tDesc).append("  \n");
-				} else {
-					markdown.append("**@throws** `").append(t.trim()).append("`  \n");
-				}
-			}
+	private static void appendThrowsDocs(StringBuilder markdown, List<String> throwsDocs) {
+		if (throwsDocs.isEmpty()) {
+			return;
 		}
-
-		if (sinceDoc != null) {
-			if (markdown.length() > 0) {
-				markdown.append("\n");
-			}
-			markdown.append("**@since** ").append(sinceDoc).append("\n");
+		if (markdown.length() > 0) {
+			markdown.append("\n");
 		}
-
-		if (!seeDocs.isEmpty()) {
-			if (markdown.length() > 0) {
-				markdown.append("\n");
-			}
-			for (String see : seeDocs) {
-				markdown.append("**@see** `").append(see).append("`  \n");
-			}
+		for (String value : throwsDocs) {
+			appendNamedTag(markdown, "@throws", value);
 		}
+	}
 
-		String result = markdown.toString().trim();
-		return result.isEmpty() ? null : result;
+	private static void appendSinceDoc(StringBuilder markdown, String sinceDoc) {
+		if (sinceDoc == null) {
+			return;
+		}
+		if (markdown.length() > 0) {
+			markdown.append("\n");
+		}
+		markdown.append("**@since** ").append(sinceDoc).append("\n");
+	}
+
+	private static void appendSeeDocs(StringBuilder markdown, List<String> seeDocs) {
+		if (seeDocs.isEmpty()) {
+			return;
+		}
+		if (markdown.length() > 0) {
+			markdown.append("\n");
+		}
+		for (String see : seeDocs) {
+			markdown.append("**@see** `").append(see).append("`").append(MARKDOWN_LINE_BREAK);
+		}
+	}
+
+	private static void appendNamedTag(StringBuilder markdown, String tag, String value) {
+		int space = value.indexOf(' ');
+		if (space > 0) {
+			String name = value.substring(0, space);
+			String desc = value.substring(space + 1).trim();
+			markdown.append("**").append(tag).append("** `").append(name).append("` — ")
+					.append(desc).append(MARKDOWN_LINE_BREAK);
+		} else {
+			markdown.append("**").append(tag).append("** `").append(value.trim()).append("`")
+					.append(MARKDOWN_LINE_BREAK);
+		}
+	}
+
+	private static final class GroovydocParseState {
+		private final StringBuilder descriptionBuilder = new StringBuilder();
+		private final List<String> paramDocs = new ArrayList<>();
+		private final List<String> throwsDocs = new ArrayList<>();
+		private final List<String> seeDocs = new ArrayList<>();
+		private final List<String> returnDocs = new ArrayList<>();
+		private String sinceDoc;
+		private String deprecatedDoc;
+		private StringBuilder currentTagContent;
+		private String currentTagType;
 	}
 
 	/**
@@ -233,24 +279,132 @@ public class GroovydocUtils {
 	}
 
 	private static String reformatLine(String line) {
-		// remove all attributes (including namespaced)
-		line = line.replaceAll("<(\\w+)(?:\\s+\\w+(?::\\w+)?=(\"|\')[^\"\']*\\2)*\\s*(\\/{0,1})>", "<$1$3>");
-		line = line.replaceAll("<pre>", "\n\n```\n");
-		line = line.replaceAll("</pre>", "\n```\n");
-		line = line.replaceAll("</?(em|i)>", "_");
-		line = line.replaceAll("</?(strong|b)>", "**");
-		line = line.replaceAll("</?code>", "`");
-		line = line.replaceAll("<hr ?\\/>", "\n\n---\n\n");
-		line = line.replaceAll("<(p|ul|ol|dl|li|dt|table|tr|div|blockquote)>", "\n\n");
+		if (line.length() > MAX_REGEX_LINE_CHARS) {
+			line = line.substring(0, MAX_REGEX_LINE_CHARS);
+		}
+		line = stripHtmlTagAttributes(line);
+		line = line.replace("<pre>", "\n\n```\n");
+		line = line.replace("</pre>", "\n```\n");
+		line = replaceSimpleTag(line, "em", "_");
+		line = replaceSimpleTag(line, "i", "_");
+		line = replaceSimpleTag(line, "strong", "**");
+		line = replaceSimpleTag(line, "b", "**");
+		line = replaceSimpleTag(line, "code", "`");
+		line = line.replace("<hr/>", "\n\n---\n\n").replace("<hr />", "\n\n---\n\n");
+		line = replaceBlockOpenTagsWithBlankLine(line);
 
 		// to add a line break to markdown, there needs to be at least two
 		// spaces at the end of the line
-		line = line.replaceAll("<br\\s*/?>\\s*", "  \n");
-		line = line.replaceAll("<\\/{0,1}\\w+\\/{0,1}>", "");
-		// Handle {@code ...} inline tags
-		line = line.replaceAll("\\{@code\\s+([^}]*)\\}", "`$1`");
-		// Handle {@link ...} inline tags
-		line = line.replaceAll("\\{@link(?:plain)?\\s+([^}]*)\\}", "`$1`");
+		line = replaceBrTags(line, "  \n");
+		line = stripHtmlTags(line);
+		line = replaceInlineTag(line, "@code");
+		line = replaceInlineTag(line, "@link");
+		line = replaceInlineTag(line, "@linkplain");
 		return line;
+	}
+
+	private static String replaceSimpleTag(String text, String tag, String replacement) {
+		return text.replace("<" + tag + ">", replacement)
+				.replace("</" + tag + ">", replacement);
+	}
+
+	private static String replaceBrTags(String text, String replacement) {
+		return text.replace("<br>", replacement)
+				.replace("<br/>", replacement)
+				.replace("<br />", replacement);
+	}
+
+	private static String replaceBlockOpenTagsWithBlankLine(String text) {
+		String[] tags = { "p", "ul", "ol", "dl", "li", "dt", "table", "tr", "div", "blockquote" };
+		String out = text;
+		for (String tag : tags) {
+			out = out.replace("<" + tag + ">", "\n\n");
+		}
+		return out;
+	}
+
+	private static String stripHtmlTagAttributes(String text) {
+		StringBuilder sb = new StringBuilder(text.length());
+		int cursor = 0;
+		while (cursor < text.length()) {
+			int open = text.indexOf('<', cursor);
+			if (open < 0) {
+				sb.append(text.substring(cursor));
+				cursor = text.length();
+			} else {
+				sb.append(text, cursor, open);
+				int close = text.indexOf('>', open + 1);
+				if (close < 0) {
+					sb.append(text.substring(open));
+					cursor = text.length();
+				} else {
+					appendNormalizedTag(sb, text, open, close);
+					cursor = close + 1;
+				}
+			}
+		}
+		return sb.toString();
+	}
+
+	private static void appendNormalizedTag(StringBuilder sb, String text, int open, int close) {
+		String body = text.substring(open + 1, close).trim();
+		boolean closing = body.startsWith("/");
+		if (closing) {
+			body = body.substring(1).trim();
+		}
+		int p = 0;
+		while (p < body.length() && Character.isLetterOrDigit(body.charAt(p))) {
+			p++;
+		}
+		if (p == 0) {
+			sb.append(text, open, close + 1);
+			return;
+		}
+		sb.append('<');
+		if (closing) {
+			sb.append('/');
+		}
+		sb.append(body, 0, p).append('>');
+	}
+
+	private static String stripHtmlTags(String text) {
+		StringBuilder sb = new StringBuilder(text.length());
+		boolean inTag = false;
+		for (int i = 0; i < text.length(); i++) {
+			char ch = text.charAt(i);
+			if (ch == '<') {
+				inTag = true;
+			} else if (inTag && ch == '>') {
+				inTag = false;
+			} else if (!inTag) {
+				sb.append(ch);
+			}
+		}
+		return sb.toString();
+	}
+
+	private static String replaceInlineTag(String text, String tagName) {
+		String marker = "{" + tagName;
+		StringBuilder sb = new StringBuilder(text.length());
+		int from = 0;
+		while (from < text.length()) {
+			int open = text.indexOf(marker, from);
+			if (open < 0) {
+				sb.append(text.substring(from));
+				from = text.length();
+			} else {
+				int close = text.indexOf('}', open + marker.length());
+				if (close < 0) {
+					sb.append(text.substring(from));
+					from = text.length();
+				} else {
+					sb.append(text, from, open);
+					String inner = text.substring(open + marker.length(), close).trim();
+					sb.append('`').append(inner).append('`');
+					from = close + 1;
+				}
+			}
+		}
+		return sb.toString();
 	}
 }

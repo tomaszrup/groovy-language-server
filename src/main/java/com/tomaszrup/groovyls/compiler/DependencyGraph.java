@@ -235,29 +235,41 @@ public class DependencyGraph {
 	public synchronized void removeFile(URI file) {
 		// Remove forward edges (file → its dependencies)
 		Set<URI> oldDeps = dependsOn.remove(file);
-		if (oldDeps != null) {
-			for (URI dep : oldDeps) {
-				Set<URI> reverse = dependedOnBy.get(dep);
-				if (reverse != null) {
-					reverse.remove(file);
-					if (reverse.isEmpty()) {
-						dependedOnBy.remove(dep);
-					}
-				}
-			}
-		}
+		removeReverseReferences(file, oldDeps);
 
 		// Remove reverse entries (other files → this file)
 		Set<URI> oldDependents = dependedOnBy.remove(file);
-		if (oldDependents != null) {
-			for (URI dependent : oldDependents) {
-				Set<URI> forwardDeps = dependsOn.get(dependent);
-				if (forwardDeps != null) {
-					forwardDeps.remove(file);
-					if (forwardDeps.isEmpty()) {
-						dependsOn.remove(dependent);
-					}
-				}
+		removeForwardReferences(file, oldDependents);
+	}
+
+	private void removeReverseReferences(URI file, Set<URI> dependencies) {
+		if (dependencies == null) {
+			return;
+		}
+		for (URI dependency : dependencies) {
+			Set<URI> reverse = dependedOnBy.get(dependency);
+			if (reverse == null) {
+				continue;
+			}
+			reverse.remove(file);
+			if (reverse.isEmpty()) {
+				dependedOnBy.remove(dependency);
+			}
+		}
+	}
+
+	private void removeForwardReferences(URI file, Set<URI> dependents) {
+		if (dependents == null) {
+			return;
+		}
+		for (URI dependent : dependents) {
+			Set<URI> forwardDeps = dependsOn.get(dependent);
+			if (forwardDeps == null) {
+				continue;
+			}
+			forwardDeps.remove(file);
+			if (forwardDeps.isEmpty()) {
+				dependsOn.remove(dependent);
 			}
 		}
 	}

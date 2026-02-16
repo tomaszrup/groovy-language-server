@@ -41,6 +41,9 @@ import org.eclipse.lsp4j.SymbolInformation;
 import org.eclipse.lsp4j.SymbolKind;
 
 public class GroovyLanguageServerUtils {
+	private GroovyLanguageServerUtils() {
+	}
+
 	/**
 	 * Convert a Groovy source locator to a canonical URI.
 	 *

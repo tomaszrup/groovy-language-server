@@ -56,7 +56,7 @@ import org.slf4j.LoggerFactory;
 public class DiagnosticHandler {
 	private static final Logger logger = LoggerFactory.getLogger(DiagnosticHandler.class);
 	private static final Pattern UNRESOLVED_CLASS_PATTERN =
-			Pattern.compile("unable to resolve class\\s+([^\\s\\r\\n]+)", Pattern.CASE_INSENSITIVE);
+			Pattern.compile("unable to resolve class\\s+([^\\s]+)", Pattern.CASE_INSENSITIVE);
 
 	/**
 	 * Processes the error collector from a compilation and produces LSP
@@ -77,11 +77,19 @@ public class DiagnosticHandler {
 
 		Map<URI, List<Diagnostic>> diagnosticsByFile = new HashMap<>();
 
-		// Find unused imports and add them as diagnostics with the Unnecessary tag.
-		// Wrapped in try/catch because incompletely-compiled ASTs (e.g. projects
-		// that have never been built) can contain null arrays in MethodNode,
-		// and we don't want unused-import analysis failures to prevent real
-		// diagnostics from being published.
+		addUnusedImportDiagnostics(compilationUnit, projectRoot, diagnosticsByFile);
+		addCompilationErrorDiagnostics(collector, projectRoot, diagnosticsByFile);
+		deduplicateDiagnosticsByFile(diagnosticsByFile);
+
+		Set<PublishDiagnosticsParams> result = toPublishParams(diagnosticsByFile);
+		addClearedDiagnostics(prevDiagnosticsByFile, diagnosticsByFile, result);
+
+		return new DiagnosticResult(result, diagnosticsByFile);
+	}
+
+	private void addUnusedImportDiagnostics(GroovyLSCompilationUnit compilationUnit,
+			Path projectRoot,
+			Map<URI, List<Diagnostic>> diagnosticsByFile) {
 		try {
 			UnusedImportFinder unusedImportFinder = new UnusedImportFinder();
 			Map<URI, List<org.codehaus.groovy.ast.ImportNode>> unusedImportsByFile = unusedImportFinder
@@ -90,59 +98,65 @@ public class DiagnosticHandler {
 				URI uri = entry.getKey();
 				for (org.codehaus.groovy.ast.ImportNode importNode : entry.getValue()) {
 					Range range = GroovyLanguageServerUtils.astNodeToRange(importNode);
-					if (range == null) {
-						continue;
+					if (range != null) {
+						Diagnostic diagnostic = new Diagnostic();
+						diagnostic.setRange(range);
+						diagnostic.setSeverity(DiagnosticSeverity.Hint);
+						diagnostic.setMessage("Unused import");
+						diagnostic.setTags(Collections.singletonList(DiagnosticTag.Unnecessary));
+						diagnostic.setSource("groovy");
+						diagnosticsByFile.computeIfAbsent(uri, key -> new ArrayList<>()).add(diagnostic);
 					}
-					Diagnostic diagnostic = new Diagnostic();
-					diagnostic.setRange(range);
-					diagnostic.setSeverity(DiagnosticSeverity.Hint);
-					diagnostic.setMessage("Unused import");
-					diagnostic.setTags(Collections.singletonList(DiagnosticTag.Unnecessary));
-					diagnostic.setSource("groovy");
-					diagnosticsByFile.computeIfAbsent(uri, (key) -> new ArrayList<>()).add(diagnostic);
 				}
 			}
 		} catch (Exception e) {
 			logger.warn("Unused import analysis failed for scope {}: {}", projectRoot, e.getMessage());
 		}
+	}
 
+	private void addCompilationErrorDiagnostics(ErrorCollector collector,
+			Path projectRoot,
+			Map<URI, List<Diagnostic>> diagnosticsByFile) {
 		List<? extends Message> errors = collector.getErrors();
 		if (errors != null && !errors.isEmpty()) {
 			logger.debug("Scope {} has {} compilation errors", projectRoot, errors.size());
 		}
-		if (errors != null) {
-			errors.stream().filter((Object message) -> message instanceof SyntaxErrorMessage)
-					.forEach((Object message) -> {
-						SyntaxErrorMessage syntaxErrorMessage = (SyntaxErrorMessage) message;
-						SyntaxException cause = syntaxErrorMessage.getCause();
-						Range range = GroovyLanguageServerUtils.syntaxExceptionToRange(cause);
-						if (range == null) {
-							range = new Range(new Position(0, 0), new Position(0, 0));
-						}
-						Diagnostic diagnostic = new Diagnostic();
-						diagnostic.setRange(range);
-						diagnostic.setSeverity(cause.isFatal() ? DiagnosticSeverity.Error : DiagnosticSeverity.Warning);
-						diagnostic.setMessage(cause.getMessage());
-						String sourceLocator = cause.getSourceLocator();
-						if (sourceLocator == null || sourceLocator.isEmpty()) {
-							logger.debug("Skipping diagnostic with null/empty source locator: {}", cause.getMessage());
-							return;
-						}
-						URI uri;
-						uri = GroovyLanguageServerUtils.sourceLocatorToUri(sourceLocator);
-						if (uri == null) {
-							logger.debug("Skipping diagnostic with invalid source locator '{}': {}", sourceLocator, cause.getMessage());
-							return;
-						}
-						logger.debug("  Diagnostic [{}] in {}: {}", projectRoot, uri, cause.getMessage());
-						traceUnresolvedClassDiagnostic(projectRoot, cause, uri, range);
-						diagnosticsByFile.computeIfAbsent(uri, (key) -> new ArrayList<>()).add(diagnostic);
-					});
+		if (errors == null) {
+			return;
 		}
+		errors.stream().filter(SyntaxErrorMessage.class::isInstance)
+				.map(SyntaxErrorMessage.class::cast)
+				.forEach(message -> addSyntaxDiagnostic(message, projectRoot, diagnosticsByFile));
+	}
 
-		// Deduplicate diagnostics per file — the Groovy compiler can report
-		// the same error in multiple compilation phases because
-		// LanguageServerErrorCollector.failIfErrors() is a no-op.
+	private void addSyntaxDiagnostic(SyntaxErrorMessage syntaxErrorMessage,
+			Path projectRoot,
+			Map<URI, List<Diagnostic>> diagnosticsByFile) {
+		SyntaxException cause = syntaxErrorMessage.getCause();
+		Range range = GroovyLanguageServerUtils.syntaxExceptionToRange(cause);
+		if (range == null) {
+			range = new Range(new Position(0, 0), new Position(0, 0));
+		}
+		String sourceLocator = cause.getSourceLocator();
+		if (sourceLocator == null || sourceLocator.isEmpty()) {
+			logger.debug("Skipping diagnostic with null/empty source locator: {}", cause.getMessage());
+			return;
+		}
+		URI uri = GroovyLanguageServerUtils.sourceLocatorToUri(sourceLocator);
+		if (uri == null) {
+			logger.debug("Skipping diagnostic with invalid source locator '{}': {}", sourceLocator, cause.getMessage());
+			return;
+		}
+		Diagnostic diagnostic = new Diagnostic();
+		diagnostic.setRange(range);
+		diagnostic.setSeverity(cause.isFatal() ? DiagnosticSeverity.Error : DiagnosticSeverity.Warning);
+		diagnostic.setMessage(cause.getMessage());
+		logger.debug("  Diagnostic [{}] in {}: {}", projectRoot, uri, cause.getMessage());
+		traceUnresolvedClassDiagnostic(projectRoot, cause, uri, range);
+		diagnosticsByFile.computeIfAbsent(uri, key -> new ArrayList<>()).add(diagnostic);
+	}
+
+	private void deduplicateDiagnosticsByFile(Map<URI, List<Diagnostic>> diagnosticsByFile) {
 		for (Map.Entry<URI, List<Diagnostic>> entry : diagnosticsByFile.entrySet()) {
 			List<Diagnostic> unique = new ArrayList<>();
 			Set<String> seen = new HashSet<>();
@@ -154,20 +168,25 @@ public class DiagnosticHandler {
 			}
 			entry.setValue(unique);
 		}
+	}
 
-		Set<PublishDiagnosticsParams> result = diagnosticsByFile.entrySet().stream()
+	private Set<PublishDiagnosticsParams> toPublishParams(Map<URI, List<Diagnostic>> diagnosticsByFile) {
+		return diagnosticsByFile.entrySet().stream()
 				.map(entry -> new PublishDiagnosticsParams(entry.getKey().toString(), entry.getValue()))
 				.collect(Collectors.toSet());
+	}
 
-		if (prevDiagnosticsByFile != null) {
-			for (URI key : prevDiagnosticsByFile.keySet()) {
-				if (!diagnosticsByFile.containsKey(key)) {
-					result.add(new PublishDiagnosticsParams(key.toString(), new ArrayList<>()));
-				}
+	private void addClearedDiagnostics(Map<URI, List<Diagnostic>> prevDiagnosticsByFile,
+			Map<URI, List<Diagnostic>> diagnosticsByFile,
+			Set<PublishDiagnosticsParams> result) {
+		if (prevDiagnosticsByFile == null) {
+			return;
+		}
+		for (URI key : prevDiagnosticsByFile.keySet()) {
+			if (!diagnosticsByFile.containsKey(key)) {
+				result.add(new PublishDiagnosticsParams(key.toString(), new ArrayList<>()));
 			}
 		}
-
-		return new DiagnosticResult(result, diagnosticsByFile);
 	}
 
 	private void traceUnresolvedClassDiagnostic(Path projectRoot, SyntaxException cause, URI uri, Range range) {
