@@ -122,6 +122,20 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             logger.error("Language server listener terminated with error: {}",
                     e.getCause() != null ? e.getCause().getMessage() : e.getMessage(), e);
         }
+
+        // The LSP connection has ended — either from a clean shutdown/exit
+        // sequence or because the client (VS Code) closed the stdin pipe
+        // (e.g. the editor was closed).  In the latter case, shutdown() and
+        // exit() were never called, so non-daemon threads created by the
+        // Gradle Tooling API or other libraries may still be running and
+        // would keep the JVM alive indefinitely.  Clean up and force-exit.
+        logger.info("LSP connection ended — shutting down server process");
+        try {
+            server.shutdown();
+        } catch (Exception e) {
+            logger.debug("Error during post-disconnect shutdown: {}", e.getMessage());
+        }
+        System.exit(0);
     }
 
     private final GroovyServices groovyServices;

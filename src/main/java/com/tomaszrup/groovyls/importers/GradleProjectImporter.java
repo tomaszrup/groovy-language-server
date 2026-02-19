@@ -62,6 +62,15 @@ public class GradleProjectImporter implements ProjectImporter {
     private static final String BUILD_GRADLE = "build.gradle";
     private static final String BUILD_GRADLE_KTS = "build.gradle.kts";
 
+    /**
+     * Default arguments appended to every Gradle Tooling API invocation.
+     * Sets a short daemon idle timeout so the Gradle Daemon exits shortly
+     * after our builds finish, instead of lingering for 3 hours (the default).
+     */
+    private static final List<String> DAEMON_ARGS = List.of(
+            "-Dorg.gradle.daemon.idletimeout=10000"
+    );
+
     private static final class GradleImportException extends RuntimeException {
         GradleImportException(String message, Throwable cause) {
             super(message, cause);
@@ -397,6 +406,7 @@ public class GradleProjectImporter implements ProjectImporter {
         try {
             connection.newBuild()
                     .forTasks(tasks)
+                    .withArguments(DAEMON_ARGS)
                     .setStandardOutput(parser.newLogOutputStream())
                     .setStandardError(parser.newLogOutputStream())
                     .run();
@@ -519,6 +529,7 @@ public class GradleProjectImporter implements ProjectImporter {
         try {
             connection.newBuild()
                     .forTasks(TASK_CLASSES, TASK_TEST_CLASSES)
+                    .withArguments(DAEMON_ARGS)
                     .setStandardOutput(parser.newLogOutputStream())
                     .setStandardError(parser.newLogOutputStream())
                     .run();
@@ -527,6 +538,7 @@ public class GradleProjectImporter implements ProjectImporter {
             try {
                 connection.newBuild()
                         .forTasks(TASK_CLASSES)
+                        .withArguments(DAEMON_ARGS)
                         .setStandardOutput(parser.newLogOutputStream())
                         .setStandardError(parser.newLogOutputStream())
                         .run();
@@ -672,9 +684,12 @@ public class GradleProjectImporter implements ProjectImporter {
                 "}\n";
             Files.write(initScript, initScriptContent.getBytes(StandardCharsets.UTF_8));
 
+            List<String> args = new ArrayList<>(DAEMON_ARGS);
+            args.add(INIT_SCRIPT_ARGUMENT);
+            args.add(initScript.toString());
             connection.newBuild()
                     .forTasks("_groovyLSDownloadSources")
-                    .withArguments(INIT_SCRIPT_ARGUMENT, initScript.toString())
+                    .withArguments(args)
                     .setStandardOutput(parser.newLogOutputStream())
                     .setStandardError(parser.newLogOutputStream())
                     .run();
@@ -779,10 +794,13 @@ public class GradleProjectImporter implements ProjectImporter {
                 "}\n";
             Files.write(initScript, initScriptContent.getBytes(StandardCharsets.UTF_8));
 
+            List<String> args = new ArrayList<>(DAEMON_ARGS);
+            args.add(INIT_SCRIPT_ARGUMENT);
+            args.add(initScript.toString());
             try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
                 connection.newBuild()
                         .forTasks("_groovyLSResolveClasspath")
-                        .withArguments(INIT_SCRIPT_ARGUMENT, initScript.toString())
+                        .withArguments(args)
                         .setStandardOutput(baos)
                         .setStandardError(parser.newLogOutputStream())
                         .run();
@@ -917,10 +935,13 @@ public class GradleProjectImporter implements ProjectImporter {
                 "}\n";
             Files.write(initScript, initScriptContent.getBytes(StandardCharsets.UTF_8));
 
+            List<String> args = new ArrayList<>(DAEMON_ARGS);
+            args.add(INIT_SCRIPT_ARGUMENT);
+            args.add(initScript.toString());
             try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
                 connection.newBuild()
                         .forTasks("_groovyLSResolveSingleClasspath")
-                        .withArguments(INIT_SCRIPT_ARGUMENT, initScript.toString())
+                        .withArguments(args)
                         .setStandardOutput(baos)
                         .setStandardError(parser.newLogOutputStream())
                         .run();
