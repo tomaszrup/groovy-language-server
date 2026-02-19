@@ -458,14 +458,10 @@ export function buildInitializationOptions(): Record<string, unknown> {
 
 function startLanguageServer() {
   vscode.window.withProgress(
-    { location: vscode.ProgressLocation.Notification, title: INITIALIZING_MESSAGE, cancellable: true },
-    (progress, token) => {
+    { location: vscode.ProgressLocation.Window, title: INITIALIZING_MESSAGE },
+    (progress) => {
       return new Promise<void>(async (resolve) => {
-        // Allow the user to dismiss the progress notification without
-        // stopping the language server.
-        token.onCancellationRequested(() => {
-          resolve();
-        });
+        // Progress is shown in the status bar (non-intrusive).
 
         if (!extensionContext) {
           resolve();

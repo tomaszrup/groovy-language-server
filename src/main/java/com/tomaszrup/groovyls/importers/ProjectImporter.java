@@ -270,6 +270,16 @@ public interface ProjectImporter {
     }
 
     /**
+     * Release importer-owned resources when the language server is shutting
+     * down (for example long-lived build-tool connectors or worker handles).
+     *
+     * <p>Default is a no-op.</p>
+     */
+    default void shutdown() {
+        // No-op by default
+    }
+
+    /**
      * Determines whether a resolved classpath should mark the project scope as
      * fully resolved.
      *

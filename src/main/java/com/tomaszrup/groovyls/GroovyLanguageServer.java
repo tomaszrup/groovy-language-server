@@ -884,6 +884,13 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         if (coordinator != null) {
             coordinator.shutdown();
         }
+        for (ProjectImporter importer : importers) {
+            try {
+                importer.shutdown();
+            } catch (Exception e) {
+                logger.warn("Importer shutdown failed for {}: {}", importer.getName(), e.getMessage());
+            }
+        }
         groovyServices.getScopeManager().stopEvictionScheduler();
         groovyServices.shutdown();
         executorPools.shutdownAll();

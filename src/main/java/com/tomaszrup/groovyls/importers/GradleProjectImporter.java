@@ -22,6 +22,7 @@ package com.tomaszrup.groovyls.importers;
 
 import org.gradle.tooling.GradleConnector;
 import org.gradle.tooling.ProjectConnection;
+import org.gradle.tooling.internal.consumer.DefaultGradleConnector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -32,6 +33,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 import java.util.concurrent.ConcurrentHashMap;
@@ -63,13 +65,13 @@ public class GradleProjectImporter implements ProjectImporter {
     private static final String BUILD_GRADLE_KTS = "build.gradle.kts";
 
     /**
-     * Default arguments appended to every Gradle Tooling API invocation.
-     * Sets a short daemon idle timeout so the Gradle Daemon exits shortly
-     * after our builds finish, instead of lingering for 3 hours (the default).
+     * Short idle timeout (in seconds) applied to every {@link GradleConnector}
+     * created by this importer.  After the last build finishes, the Gradle
+     * Daemon will exit after this many seconds of inactivity instead of the
+     * default 3 hours.  Kept just long enough for back-to-back Tooling API
+     * calls (e.g. resolve → recompile) to reuse the same daemon.
      */
-    private static final List<String> DAEMON_ARGS = List.of(
-            "-Dorg.gradle.daemon.idletimeout=10000"
-    );
+    private static final int DAEMON_IDLE_TIMEOUT_SECONDS = 3;
 
     private static final class GradleImportException extends RuntimeException {
         GradleImportException(String message, Throwable cause) {
@@ -91,6 +93,50 @@ public class GradleProjectImporter implements ProjectImporter {
      * integrity, to avoid re-reading properties on every connector call.
      */
     private final Set<Path> validatedRoots = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Connectors created by this importer that may hold build-tool resources.
+     * Disconnected on method completion and again on importer shutdown as a
+     * safety net.
+     */
+    private final Set<GradleConnector> activeConnectors = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Create a {@link GradleConnector} pre-configured with a short daemon
+     * idle timeout so that the Gradle Daemon shuts down shortly after the
+     * language server no longer needs it.
+     */
+    private GradleConnector createConnector(Path projectDir) {
+        GradleConnector connector = GradleConnector.newConnector()
+                .forProjectDirectory(projectDir.toFile());
+        if (connector instanceof DefaultGradleConnector) {
+            ((DefaultGradleConnector) connector)
+                    .daemonMaxIdleTime(DAEMON_IDLE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        }
+        activeConnectors.add(connector);
+        return connector;
+    }
+
+    private void disconnectConnector(GradleConnector connector) {
+        if (connector == null) {
+            return;
+        }
+        try {
+            connector.disconnect();
+        } catch (Exception e) {
+            logger.debug("Gradle connector disconnect failed: {}", e.getMessage());
+        } finally {
+            activeConnectors.remove(connector);
+        }
+    }
+
+    @Override
+    public void shutdown() {
+        List<GradleConnector> snapshot = new ArrayList<>(activeConnectors);
+        for (GradleConnector connector : snapshot) {
+            disconnectConnector(connector);
+        }
+    }
 
     /**
      * Best-effort cache of detected Groovy versions keyed by normalized project
@@ -150,8 +196,7 @@ public class GradleProjectImporter implements ProjectImporter {
     public List<String> importProject(Path projectRoot) {
         List<String> classpathList = new ArrayList<>();
         validateGradleWrapper(projectRoot);
-        GradleConnector connector = GradleConnector.newConnector()
-                .forProjectDirectory(projectRoot.toFile());
+        GradleConnector connector = createConnector(projectRoot);
 
         try (ProjectConnection connection = connector.connect()) {
             // Try to compile both main and test classes, but don't fail if tasks don't exist
@@ -166,6 +211,8 @@ public class GradleProjectImporter implements ProjectImporter {
             logger.info("Classpath for project {}: {} entries", projectRoot, classpathList.size());
         } catch (Exception e) {
             logger.error("Failed to import Gradle project {}: {}", projectRoot, e.getMessage(), e);
+        } finally {
+            disconnectConnector(connector);
         }
         return classpathList;
     }
@@ -216,8 +263,7 @@ public class GradleProjectImporter implements ProjectImporter {
         logger.info("Lazy-resolving classpath for single project {} via Gradle root {}", projectRoot, gradleRoot);
 
         validateGradleWrapper(gradleRoot);
-        GradleConnector connector = GradleConnector.newConnector()
-                .forProjectDirectory(gradleRoot.toFile());
+        GradleConnector connector = createConnector(gradleRoot);
         try (ProjectConnection connection = connector.connect()) {
             // Use the filtered init script that only resolves the requested
             // project, avoiding the cost of resolving all ~N sibling projects.
@@ -253,6 +299,8 @@ public class GradleProjectImporter implements ProjectImporter {
         } catch (Exception e) {
             logger.error("Failed to resolve classpath for {}: {}", projectRoot, e.getMessage(), e);
             return new ArrayList<>();
+        } finally {
+            disconnectConnector(connector);
         }
     }
 
@@ -332,8 +380,7 @@ public class GradleProjectImporter implements ProjectImporter {
         Map<Path, List<String>> result = new LinkedHashMap<>();
 
         validateGradleWrapper(gradleRoot);
-        GradleConnector connector = GradleConnector.newConnector()
-                .forProjectDirectory(gradleRoot.toFile());
+        GradleConnector connector = createConnector(gradleRoot);
 
         try (ProjectConnection connection = connector.connect()) {
             // 1. Compile everything at the root level (one invocation)
@@ -373,6 +420,8 @@ public class GradleProjectImporter implements ProjectImporter {
             }
         } catch (Exception e) {
             throw new GradleImportException("Batch import failed for Gradle root " + gradleRoot, e);
+        } finally {
+            disconnectConnector(connector);
         }
 
         return result;
@@ -382,8 +431,7 @@ public class GradleProjectImporter implements ProjectImporter {
     public void recompile(Path projectRoot) {
         logger.info("Recompiling Gradle project: {}", projectRoot);
         validateGradleWrapper(projectRoot);
-        GradleConnector connector = GradleConnector.newConnector()
-                .forProjectDirectory(projectRoot.toFile());
+        GradleConnector connector = createConnector(projectRoot);
 
         try (ProjectConnection connection = connector.connect()) {
             if (runRecompileBuild(connection, projectRoot)) {
@@ -391,6 +439,8 @@ public class GradleProjectImporter implements ProjectImporter {
             }
         } catch (Exception e) {
 			throw new GradleImportException("Could not recompile Gradle project " + projectRoot, e);
+        } finally {
+            disconnectConnector(connector);
         }
     }
 
@@ -406,7 +456,6 @@ public class GradleProjectImporter implements ProjectImporter {
         try {
             connection.newBuild()
                     .forTasks(tasks)
-                    .withArguments(DAEMON_ARGS)
                     .setStandardOutput(parser.newLogOutputStream())
                     .setStandardError(parser.newLogOutputStream())
                     .run();
@@ -448,13 +497,14 @@ public class GradleProjectImporter implements ProjectImporter {
             logger.info("Compiling sources for Gradle root {} ({} subproject(s))",
                     gradleRoot, subprojects.size());
             validateGradleWrapper(gradleRoot);
-            GradleConnector connector = GradleConnector.newConnector()
-                    .forProjectDirectory(gradleRoot.toFile());
+            GradleConnector connector = createConnector(gradleRoot);
             try (ProjectConnection connection = connector.connect()) {
                 runCompileTasks(connection, gradleRoot);
             } catch (Exception e) {
                 logger.warn("Failed to compile sources for Gradle root {}: {}",
                         gradleRoot, e.getMessage(), e);
+            } finally {
+                disconnectConnector(connector);
             }
         }
     }
@@ -529,7 +579,6 @@ public class GradleProjectImporter implements ProjectImporter {
         try {
             connection.newBuild()
                     .forTasks(TASK_CLASSES, TASK_TEST_CLASSES)
-                    .withArguments(DAEMON_ARGS)
                     .setStandardOutput(parser.newLogOutputStream())
                     .setStandardError(parser.newLogOutputStream())
                     .run();
@@ -538,7 +587,6 @@ public class GradleProjectImporter implements ProjectImporter {
             try {
                 connection.newBuild()
                         .forTasks(TASK_CLASSES)
-                        .withArguments(DAEMON_ARGS)
                         .setStandardOutput(parser.newLogOutputStream())
                         .setStandardError(parser.newLogOutputStream())
                         .run();
@@ -643,8 +691,7 @@ public class GradleProjectImporter implements ProjectImporter {
         logger.info("Background source JAR download for Gradle root {}", gradleRoot);
 
         validateGradleWrapper(gradleRoot);
-        GradleConnector connector = GradleConnector.newConnector()
-                .forProjectDirectory(gradleRoot.toFile());
+        GradleConnector connector = createConnector(gradleRoot);
         Path initScript = null;
         try (ProjectConnection connection = connector.connect()) {
             initScript = TempFileUtils.createSecureTempFile("groovyls-sources-init", INIT_SCRIPT_EXTENSION);
@@ -684,7 +731,7 @@ public class GradleProjectImporter implements ProjectImporter {
                 "}\n";
             Files.write(initScript, initScriptContent.getBytes(StandardCharsets.UTF_8));
 
-            List<String> args = new ArrayList<>(DAEMON_ARGS);
+            List<String> args = new ArrayList<>();
             args.add(INIT_SCRIPT_ARGUMENT);
             args.add(initScript.toString());
             connection.newBuild()
@@ -705,6 +752,7 @@ public class GradleProjectImporter implements ProjectImporter {
                     // Temporary script cleanup is best-effort.
                 }
             }
+            disconnectConnector(connector);
         }
     }
 
@@ -794,7 +842,7 @@ public class GradleProjectImporter implements ProjectImporter {
                 "}\n";
             Files.write(initScript, initScriptContent.getBytes(StandardCharsets.UTF_8));
 
-            List<String> args = new ArrayList<>(DAEMON_ARGS);
+            List<String> args = new ArrayList<>();
             args.add(INIT_SCRIPT_ARGUMENT);
             args.add(initScript.toString());
             try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
@@ -935,7 +983,7 @@ public class GradleProjectImporter implements ProjectImporter {
                 "}\n";
             Files.write(initScript, initScriptContent.getBytes(StandardCharsets.UTF_8));
 
-            List<String> args = new ArrayList<>(DAEMON_ARGS);
+            List<String> args = new ArrayList<>();
             args.add(INIT_SCRIPT_ARGUMENT);
             args.add(initScript.toString());
             try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
