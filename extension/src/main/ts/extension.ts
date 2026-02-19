@@ -676,6 +676,72 @@ function startLanguageServer() {
         try {
           await languageClient.start();
 
+          // Register notification handlers IMMEDIATELY after start() to
+          // avoid a race condition: the server begins background import
+          // during initialize() and may send the "ready" notification
+          // before we finish registering content providers below.  If the
+          // handler isn't registered yet, the notification is lost and the
+          // status bar stays stuck at "Importing projects…".
+          setStatusBar("importing");
+          progress.report({ message: "Importing projects…" });
+
+          // Handle unexpected server stops: resolve the progress
+          // notification, update the status bar, and offer a restart.
+          languageClient.onDidChangeState((event) => {
+            if (event.newState === State.Stopped) {
+              resolve();
+              if (!isIntentionalStop) {
+                setStatusBar("error");
+                if (serverCrashCount >= MAX_SERVER_RESTARTS) {
+                  vscode.window
+                    .showErrorMessage(
+                      SERVER_CRASHED_MESSAGE,
+                      LABEL_RESTART_SERVER
+                    )
+                    .then((action) => {
+                      if (action === LABEL_RESTART_SERVER) {
+                        serverCrashCount = 0;
+                        restartLanguageServer();
+                      }
+                    });
+                }
+              }
+            } else if (event.newState === State.Running) {
+              // Server (re)started successfully — reset crash counter.
+              serverCrashCount = 0;
+            }
+          });
+
+          languageClient.onNotification(NOTIFICATION_STATUS_UPDATE, (params: { state: string; message?: string }) => {
+            const state = params.state;
+            if (state === "importing") {
+              setStatusBar("importing", params.message);
+              progress.report({ message: params.message || "Importing projects…" });
+            } else if (state === "ready") {
+              setStatusBar("ready");
+              resolve();
+            } else if (state === "error") {
+              setStatusBar("error");
+              resolve();
+            }
+          });
+
+          // Listen for periodic memory usage reports from the server
+          languageClient.onNotification(NOTIFICATION_MEMORY_USAGE, (params: { usedMB: number; maxMB: number; activeScopes?: number; evictedScopes?: number; totalScopes?: number }) => {
+            lastMemoryText = `${params.usedMB}/${params.maxMB} MB`;
+            if (params.totalScopes !== undefined && params.totalScopes > 0) {
+              lastScopeCounts = {
+                active: params.activeScopes ?? 0,
+                evicted: params.evictedScopes ?? 0,
+                total: params.totalScopes,
+              };
+            }
+            // Re-render the status bar if we're in "ready" state
+            if (currentStatusState === "ready") {
+              setStatusBar("ready");
+            }
+          });
+
           let serverProtocolVersion: string | undefined;
           try {
             const response = await languageClient.sendRequest<string>(
@@ -755,70 +821,6 @@ function startLanguageServer() {
             );
             extensionContext!.subscriptions.push(provider);
           }
-
-          // The server starts a background import (Gradle/Maven) after
-          // initialization.  Listen for structured status notifications to
-          // transition the status bar and keep the progress notification
-          // visible until the server is ready.
-          setStatusBar("importing");
-          progress.report({ message: "Importing projects…" });
-
-          // Handle unexpected server stops: resolve the progress
-          // notification, update the status bar, and offer a restart.
-          languageClient.onDidChangeState((event) => {
-            if (event.newState === State.Stopped) {
-              resolve();
-              if (!isIntentionalStop) {
-                setStatusBar("error");
-                if (serverCrashCount >= MAX_SERVER_RESTARTS) {
-                  vscode.window
-                    .showErrorMessage(
-                      SERVER_CRASHED_MESSAGE,
-                      LABEL_RESTART_SERVER
-                    )
-                    .then((action) => {
-                      if (action === LABEL_RESTART_SERVER) {
-                        serverCrashCount = 0;
-                        restartLanguageServer();
-                      }
-                    });
-                }
-              }
-            } else if (event.newState === State.Running) {
-              // Server (re)started successfully — reset crash counter.
-              serverCrashCount = 0;
-            }
-          });
-
-          languageClient.onNotification(NOTIFICATION_STATUS_UPDATE, (params: { state: string; message?: string }) => {
-            const state = params.state;
-            if (state === "importing") {
-              setStatusBar("importing", params.message);
-              progress.report({ message: params.message || "Importing projects…" });
-            } else if (state === "ready") {
-              setStatusBar("ready");
-              resolve();
-            } else if (state === "error") {
-              setStatusBar("error");
-              resolve();
-            }
-          });
-
-          // Listen for periodic memory usage reports from the server
-          languageClient.onNotification(NOTIFICATION_MEMORY_USAGE, (params: { usedMB: number; maxMB: number; activeScopes?: number; evictedScopes?: number; totalScopes?: number }) => {
-            lastMemoryText = `${params.usedMB}/${params.maxMB} MB`;
-            if (params.totalScopes !== undefined && params.totalScopes > 0) {
-              lastScopeCounts = {
-                active: params.activeScopes ?? 0,
-                evicted: params.evictedScopes ?? 0,
-                total: params.totalScopes,
-              };
-            }
-            // Re-render the status bar if we're in "ready" state
-            if (currentStatusState === "ready") {
-              setStatusBar("ready");
-            }
-          });
         } catch {
           setStatusBar("error");
           vscode.window.showErrorMessage(STARTUP_ERROR);

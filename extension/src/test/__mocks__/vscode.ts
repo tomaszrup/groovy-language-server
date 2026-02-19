@@ -27,7 +27,8 @@ const window = {
   showInformationMessage: vi.fn().mockResolvedValue(undefined),
   withProgress: vi.fn().mockImplementation((_opts, task) => {
     const progress = { report: vi.fn() };
-    return task(progress, { isCancellationRequested: false });
+    const token = { isCancellationRequested: false, onCancellationRequested: vi.fn() };
+    return task(progress, token);
   }),
   createOutputChannel: vi.fn().mockReturnValue({
     appendLine: vi.fn(),
