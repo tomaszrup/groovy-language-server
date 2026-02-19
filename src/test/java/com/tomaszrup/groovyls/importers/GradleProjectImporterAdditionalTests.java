@@ -36,7 +36,7 @@ import java.util.List;
  * <ul>
  *   <li>{@code getGradleRoot()} / {@code findGradleRoot()} — Gradle root detection</li>
  *   <li>{@code resolveClasspath()} — single-project class-dir discovery</li>
- *   <li>{@code setWorkspaceBound()} — bounding root search</li>
+ *   <li>{@code setWorkspaceBound()} / {@code setWorkspaceBounds()} — bounding root search (single and multi-root)</li>
  * </ul>
  */
 class GradleProjectImporterAdditionalTests {
@@ -531,5 +531,151 @@ class GradleProjectImporterAdditionalTests {
 
         Assertions.assertDoesNotThrow(() -> importer.recompile(project));
         Assertions.assertDoesNotThrow(() -> importer.downloadSourceJarsAsync(project));
+    }
+
+    // --- setWorkspaceBounds (multi-root) ---
+
+    @Test
+    void testSetWorkspaceBoundsMultiRootEachProjectBoundedByItsFolder() throws IOException {
+        // Multi-root workspace:
+        //   folderA/                   <-- workspace folder 1
+        //     settings.gradle          <-- Gradle 7.x root
+        //     subA/
+        //       build.gradle
+        //   folderB/                   <-- workspace folder 2
+        //     settings.gradle          <-- Gradle 8.x root
+        //     subB/
+        //       build.gradle
+        Path folderA = tempDir.resolve("folderA");
+        Path folderB = tempDir.resolve("folderB");
+        Path subA = folderA.resolve("subA");
+        Path subB = folderB.resolve("subB");
+        Files.createDirectories(subA);
+        Files.createDirectories(subB);
+        Files.createFile(folderA.resolve("settings.gradle"));
+        Files.createFile(subA.resolve("build.gradle"));
+        Files.createFile(folderB.resolve("settings.gradle"));
+        Files.createFile(subB.resolve("build.gradle"));
+
+        importer.setWorkspaceBounds(List.of(folderA, folderB));
+
+        // subA's Gradle root should be folderA
+        Assertions.assertEquals(folderA, importer.getGradleRoot(subA),
+                "subA should resolve to folderA as its Gradle root");
+        // subB's Gradle root should be folderB
+        Assertions.assertEquals(folderB, importer.getGradleRoot(subB),
+                "subB should resolve to folderB as its Gradle root");
+    }
+
+    @Test
+    void testSetWorkspaceBoundsDoesNotCrossBetweenFolders() throws IOException {
+        // Ensure a settings.gradle in folderA doesn't affect folderB projects
+        //   folderA/
+        //     settings.gradle
+        //   folderB/
+        //     project/
+        //       build.gradle           <-- no settings.gradle in folderB
+        Path folderA = tempDir.resolve("folderA");
+        Path folderB = tempDir.resolve("folderB");
+        Path project = folderB.resolve("project");
+        Files.createDirectories(folderA);
+        Files.createDirectories(project);
+        Files.createFile(folderA.resolve("settings.gradle"));
+        Files.createFile(project.resolve("build.gradle"));
+
+        importer.setWorkspaceBounds(List.of(folderA, folderB));
+
+        // project is under folderB, which has no settings.gradle -> Gradle root = project itself
+        Assertions.assertEquals(project, importer.getGradleRoot(project),
+                "Should not cross into folderA to find settings.gradle");
+    }
+
+    @Test
+    void testSetWorkspaceBoundsNestedFoldersPicksDeepestBound() throws IOException {
+        // If workspace folders are nested (unusual but possible):
+        //   outer/                     <-- workspace folder 1
+        //     settings.gradle
+        //     inner/                   <-- workspace folder 2
+        //       settings.gradle
+        //       sub/
+        //         build.gradle
+        Path outer = tempDir.resolve("outer");
+        Path inner = outer.resolve("inner");
+        Path sub = inner.resolve("sub");
+        Files.createDirectories(sub);
+        Files.createFile(outer.resolve("settings.gradle"));
+        Files.createFile(inner.resolve("settings.gradle"));
+        Files.createFile(sub.resolve("build.gradle"));
+
+        importer.setWorkspaceBounds(List.of(outer, inner));
+
+        // sub is under inner, so bound should be inner (deepest ancestor bound)
+        // findGradleRoot should find inner/settings.gradle and stop, not walk to outer
+        Assertions.assertEquals(inner, importer.getGradleRoot(sub),
+                "Should use deepest (most specific) workspace bound");
+    }
+
+    @Test
+    void testSetWorkspaceBoundsProjectAtRootLevel() throws IOException {
+        // Project is directly in a workspace folder (no nesting)
+        //   folderA/
+        //     settings.gradle
+        //     build.gradle
+        Path folderA = tempDir.resolve("folderA");
+        Files.createDirectories(folderA);
+        Files.createFile(folderA.resolve("settings.gradle"));
+        Files.createFile(folderA.resolve("build.gradle"));
+
+        importer.setWorkspaceBounds(List.of(folderA));
+
+        Assertions.assertEquals(folderA, importer.getGradleRoot(folderA),
+                "Project at workspace root should resolve to itself");
+    }
+
+    @Test
+    void testSetWorkspaceBoundsEmptyListAllowsUnboundedSearch() throws IOException {
+        // Empty bounds = no restriction
+        Path parent = tempDir.resolve("parent");
+        Path child = parent.resolve("child");
+        Files.createDirectories(child);
+        Files.createFile(parent.resolve("settings.gradle"));
+        Files.createFile(child.resolve("build.gradle"));
+
+        importer.setWorkspaceBounds(List.of());
+
+        // Should walk all the way up to parent (no bound)
+        Assertions.assertEquals(parent, importer.getGradleRoot(child),
+                "Empty bounds should allow unbounded Gradle root search");
+    }
+
+    @Test
+    void testSetWorkspaceBoundsNullListAllowsUnboundedSearch() throws IOException {
+        // null bounds = no restriction
+        Path parent = tempDir.resolve("parent");
+        Path child = parent.resolve("child");
+        Files.createDirectories(child);
+        Files.createFile(parent.resolve("settings.gradle"));
+        Files.createFile(child.resolve("build.gradle"));
+
+        importer.setWorkspaceBounds(null);
+
+        Assertions.assertEquals(parent, importer.getGradleRoot(child),
+                "Null bounds should allow unbounded Gradle root search");
+    }
+
+    @Test
+    void testSetWorkspaceBoundsBackwardCompatWithSingleBound() throws IOException {
+        // setWorkspaceBound(single) should still work via deprecation bridge
+        Path root = tempDir.resolve("workspace");
+        Path sub = root.resolve("sub");
+        Files.createDirectories(sub);
+        Files.createFile(root.resolve("settings.gradle"));
+        Files.createFile(sub.resolve("build.gradle"));
+
+        // Use the deprecated single-path method
+        importer.setWorkspaceBound(root);
+
+        Assertions.assertEquals(root, importer.getGradleRoot(sub),
+                "Deprecated single-bound method should still work");
     }
 }

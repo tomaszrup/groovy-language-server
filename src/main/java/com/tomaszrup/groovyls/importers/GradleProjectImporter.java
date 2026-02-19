@@ -69,11 +69,13 @@ public class GradleProjectImporter implements ProjectImporter {
     }
 
     /**
-     * Optional upper bound for {@link #findGradleRoot(Path)} so that the
-     * search stops at the workspace root instead of walking all the way to
-     * the filesystem root.  Set via {@link #setWorkspaceBound(Path)}.
+     * Optional upper bounds for {@link #findGradleRoot(Path)} so that the
+     * search stops at a workspace root instead of walking all the way to
+     * the filesystem root.  Set via {@link #setWorkspaceBounds(List)}.
+     * In a multi-root workspace each folder becomes a separate bound so
+     * that each project resolves its Gradle root within its own workspace folder.
      */
-    private final AtomicReference<Path> workspaceBound = new AtomicReference<>();
+    private final AtomicReference<List<Path>> workspaceBounds = new AtomicReference<>(Collections.emptyList());
 
     /**
      * Tracks Gradle roots that have already been validated for wrapper
@@ -90,12 +92,13 @@ public class GradleProjectImporter implements ProjectImporter {
     private final GradleClasspathOutputParser parser = new GradleClasspathOutputParser(detectedGroovyVersionByProject);
 
     /**
-     * Sets an upper bound for the Gradle-root search.  When set,
-     * {@link #findGradleRoot(Path)} will not walk above this directory.
+     * Sets upper bounds for the Gradle-root search from multiple workspace
+     * folders.  {@link #findGradleRoot(Path)} will not walk above the
+     * nearest ancestor bound for a given project directory.
      */
     @Override
-    public void setWorkspaceBound(Path bound) {
-        this.workspaceBound.set(bound);
+    public void setWorkspaceBounds(List<Path> bounds) {
+        this.workspaceBounds.set(bounds != null ? new ArrayList<>(bounds) : Collections.emptyList());
     }
 
     @Override
@@ -559,7 +562,7 @@ public class GradleProjectImporter implements ProjectImporter {
     private Path findGradleRoot(Path projectDir) {
         Path dir = projectDir;
         Path lastSettingsDir = null;
-        Path bound = workspaceBound.get();
+        Path bound = findNearestBound(projectDir);
         while (dir != null) {
             if (Files.isRegularFile(dir.resolve("settings.gradle"))
                     || Files.isRegularFile(dir.resolve("settings.gradle.kts"))) {
@@ -572,6 +575,36 @@ public class GradleProjectImporter implements ProjectImporter {
             dir = dir.getParent();
         }
         return lastSettingsDir != null ? lastSettingsDir : projectDir;
+    }
+
+    /**
+     * Find the workspace bound that is the nearest ancestor of (or equal to)
+     * the given path.  In a multi-root workspace different projects may fall
+     * under different workspace folders; this ensures each project's Gradle
+     * root search is bounded by its own workspace folder.
+     *
+     * @return the nearest ancestor bound, or {@code null} if none applies
+     */
+    private Path findNearestBound(Path projectDir) {
+        List<Path> bounds = workspaceBounds.get();
+        if (bounds == null || bounds.isEmpty()) {
+            return null;
+        }
+        Path normalizedProject = projectDir.toAbsolutePath().normalize();
+        Path nearest = null;
+        int nearestDepth = -1;
+        for (Path bound : bounds) {
+            Path normalizedBound = bound.toAbsolutePath().normalize();
+            if (normalizedProject.startsWith(normalizedBound)) {
+                // This bound is an ancestor — pick the deepest (most specific) one
+                int depth = normalizedBound.getNameCount();
+                if (depth > nearestDepth) {
+                    nearestDepth = depth;
+                    nearest = normalizedBound;
+                }
+            }
+        }
+        return nearest;
     }
 
     private void addDiscoveredClassDirs(List<String> classpath, Path projectRoot) {

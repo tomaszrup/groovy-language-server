@@ -130,6 +130,10 @@ class ProjectImporterDefaultMethodsTests {
 		ProjectImporter importer = new StubImporter();
 
 		Assertions.assertDoesNotThrow(() -> importer.setWorkspaceBound(Paths.get("/workspace")));
+		Assertions.assertDoesNotThrow(() -> importer.setWorkspaceBounds(
+				Arrays.asList(Paths.get("/workspace/a"), Paths.get("/workspace/b"))));
+		Assertions.assertDoesNotThrow(() -> importer.setWorkspaceBounds(null));
+		Assertions.assertDoesNotThrow(() -> importer.setWorkspaceBounds(Collections.emptyList()));
 		Assertions.assertDoesNotThrow(() -> importer.applySettings(new JsonObject()));
 		Assertions.assertDoesNotThrow(() -> importer.downloadSourceJarsAsync(Paths.get("/workspace/a")));
 	}

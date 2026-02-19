@@ -229,7 +229,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
 
         applyInitializationOptions(params.getInitializationOptions());
         groovyServices.getScopeManager().setScopeEvictionTTLSeconds(scopeEvictionTTLSeconds);
-        setWorkspaceBoundOnImporters(workspaceUriString);
+        setWorkspaceBoundsOnImporters(workspaceFolders);
 
         ServerCapabilities serverCapabilities = createServerCapabilities();
         scheduleInitialImport(workspaceFolders);
@@ -294,13 +294,20 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         }
     }
 
-    private void setWorkspaceBoundOnImporters(String workspaceUriString) {
-        if (workspaceUriString == null) {
+    private void setWorkspaceBoundsOnImporters(List<WorkspaceFolder> workspaceFolders) {
+        if (workspaceFolders == null || workspaceFolders.isEmpty()) {
             return;
         }
-        Path wsRoot = Paths.get(URI.create(workspaceUriString));
+        List<Path> bounds = new ArrayList<>();
+        for (WorkspaceFolder folder : workspaceFolders) {
+            try {
+                bounds.add(Paths.get(URI.create(folder.getUri())));
+            } catch (Exception e) {
+                logger.warn("Ignoring invalid workspace folder URI: {}", folder.getUri());
+            }
+        }
         for (ProjectImporter importer : importers) {
-            importer.setWorkspaceBound(wsRoot);
+            importer.setWorkspaceBounds(bounds);
         }
     }
 

@@ -21,6 +21,7 @@ package com.tomaszrup.groovyls.importers;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -145,8 +146,27 @@ public interface ProjectImporter {
      * (e.g. Gradle multi-project builds).
      *
      * @param workspaceBound the workspace root path
+     * @deprecated Use {@link #setWorkspaceBounds(List)} for multi-root workspace support.
      */
+    @Deprecated
     default void setWorkspaceBound(Path workspaceBound) {
+        if (workspaceBound != null) {
+            setWorkspaceBounds(Collections.singletonList(workspaceBound));
+        } else {
+            setWorkspaceBounds(Collections.emptyList());
+        }
+    }
+
+    /**
+     * Set upper bounds for build-tool root searches so they stop at the
+     * nearest workspace root instead of walking to the filesystem root.
+     * In a multi-root workspace each folder becomes a separate bound.
+     * Only meaningful for build tools with hierarchical project structures
+     * (e.g. Gradle multi-project builds).
+     *
+     * @param workspaceBounds the workspace root paths (one per workspace folder)
+     */
+    default void setWorkspaceBounds(List<Path> workspaceBounds) {
         // No-op by default — only Gradle needs this
     }
 
