@@ -59,6 +59,8 @@ public class GradleProjectImporter implements ProjectImporter {
     private static final String TASK_TEST_CLASSES = "testClasses";
     private static final String INIT_SCRIPT_EXTENSION = ".gradle";
     private static final String INIT_SCRIPT_ARGUMENT = "--init-script";
+    private static final String BUILD_GRADLE = "build.gradle";
+    private static final String BUILD_GRADLE_KTS = "build.gradle.kts";
 
     private static final class GradleImportException extends RuntimeException {
         GradleImportException(String message, Throwable cause) {
@@ -99,8 +101,8 @@ public class GradleProjectImporter implements ProjectImporter {
     @Override
     public boolean claimsProject(Path projectRoot) {
         return projectRoot != null
-                && (projectRoot.resolve("build.gradle").toFile().exists()
-                    || projectRoot.resolve("build.gradle.kts").toFile().exists());
+                && (projectRoot.resolve(BUILD_GRADLE).toFile().exists()
+                    || projectRoot.resolve(BUILD_GRADLE_KTS).toFile().exists());
     }
 
     @Override
@@ -406,21 +408,32 @@ public class GradleProjectImporter implements ProjectImporter {
     @Override
     public boolean isProjectFile(String filePath) {
         return filePath != null
-                && (filePath.endsWith("build.gradle") || filePath.endsWith("build.gradle.kts"));
+                && (filePath.endsWith(BUILD_GRADLE) || filePath.endsWith(BUILD_GRADLE_KTS));
     }
 
     /**
      * Compile Java/Kotlin sources for all given projects, grouped by Gradle
      * root so that a single {@code classes testClasses} invocation covers all
      * subprojects under the same root build.
+     *
+     * <p>If a Gradle root already has compiled output directories that are
+     * newer than the corresponding build files, the expensive Gradle daemon
+     * invocation is skipped for that root.</p>
      */
     @Override
     public void compileSources(List<Path> projectRoots) {
         Map<Path, List<Path>> grouped = groupByGradleRoot(projectRoots);
         for (Map.Entry<Path, List<Path>> entry : grouped.entrySet()) {
             Path gradleRoot = entry.getKey();
+            List<Path> subprojects = entry.getValue();
+            if (allSubprojectsHaveFreshOutput(subprojects)) {
+                logger.info("Skipping source compilation for Gradle root {} " +
+                        "— all {} subproject(s) already have up-to-date output",
+                        gradleRoot, subprojects.size());
+                continue;
+            }
             logger.info("Compiling sources for Gradle root {} ({} subproject(s))",
-                    gradleRoot, entry.getValue().size());
+                    gradleRoot, subprojects.size());
             validateGradleWrapper(gradleRoot);
             GradleConnector connector = GradleConnector.newConnector()
                     .forProjectDirectory(gradleRoot.toFile());
@@ -431,6 +444,66 @@ public class GradleProjectImporter implements ProjectImporter {
                         gradleRoot, e.getMessage(), e);
             }
         }
+    }
+
+    /**
+     * Returns {@code true} if every subproject under the given Gradle root
+     * already has at least one compiled-output directory (e.g.
+     * {@code build/classes/java/main}) whose last-modified time is newer than
+     * the project's build file.  This is a cheap heuristic to avoid launching
+     * a Gradle daemon when everything is already compiled.
+     */
+    private boolean allSubprojectsHaveFreshOutput(List<Path> subprojects) {
+        for (Path subproject : subprojects) {
+            if (!hasCompiledOutputNewerThanBuildFile(subproject)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean hasCompiledOutputNewerThanBuildFile(Path projectRoot) {
+        try {
+            long buildFileTime = getBuildFileLastModified(projectRoot);
+            if (buildFileTime <= 0) {
+                return false; // no build file found — cannot determine freshness
+            }
+            // Check common Gradle output directories
+            String[] outputDirs = {
+                "build/classes/java/main",
+                "build/classes/groovy/main",
+                "build/classes/kotlin/main"
+            };
+            for (String dir : outputDirs) {
+                Path outputPath = projectRoot.resolve(dir);
+                if (Files.isDirectory(outputPath)) {
+                    long outputTime = Files.getLastModifiedTime(outputPath).toMillis();
+                    if (outputTime >= buildFileTime) {
+                        return true;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.debug("Could not check compiled output freshness for {}: {}",
+                    projectRoot, e.getMessage());
+        }
+        return false;
+    }
+
+    private long getBuildFileLastModified(Path projectRoot) {
+        try {
+            Path buildGradle = projectRoot.resolve(BUILD_GRADLE);
+            if (Files.isRegularFile(buildGradle)) {
+                return Files.getLastModifiedTime(buildGradle).toMillis();
+            }
+            Path buildGradleKts = projectRoot.resolve(BUILD_GRADLE_KTS);
+            if (Files.isRegularFile(buildGradleKts)) {
+                return Files.getLastModifiedTime(buildGradleKts).toMillis();
+            }
+        } catch (Exception e) {
+            logger.debug("Could not read build file for {}: {}", projectRoot, e.getMessage());
+        }
+        return 0;
     }
 
     // ---- private helpers ----

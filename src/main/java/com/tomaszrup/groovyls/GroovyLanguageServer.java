@@ -415,7 +415,30 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                 sendStatusUpdate(STATUS_IMPORTING, unresolvedCount + " project(s) will resolve classpath on first file open");
             }
 
-            compileDiscoveredProjectSources(allDiscoveredRoots, discoveredByImporter);
+            // Only run Gradle/Maven source compilation for projects that were NOT
+            // loaded from the classpath cache.  For a fully-cached workspace this
+            // skips the expensive `gradle classes testClasses` invocation entirely,
+            // avoiding a multi-minute 100 % CPU spike on startup.
+            if (!newUncachedRoots.isEmpty()) {
+                Map<ProjectImporter, List<Path>> uncachedByImporter = filterByImporter(
+                        newUncachedRoots, discoveredByImporter);
+                compileDiscoveredProjectSources(newUncachedRoots, uncachedByImporter);
+            } else if (unresolvedCount > 0) {
+                // Cache existed but some projects still lack a resolved classpath
+                // (e.g. cache was partial).  Compile only the unresolved roots.
+                List<Path> unresolvedRoots = allDiscoveredRoots.stream()
+                        .filter(root -> !cachedClasspathResult.projectResolvedStates
+                                .getOrDefault(root, false))
+                        .collect(Collectors.toList());
+                if (!unresolvedRoots.isEmpty()) {
+                    Map<ProjectImporter, List<Path>> unresolvedByImporter = filterByImporter(
+                            unresolvedRoots, discoveredByImporter);
+                    compileDiscoveredProjectSources(unresolvedRoots, unresolvedByImporter);
+                }
+            } else {
+                logger.info("All {} project(s) fully cached — skipping source compilation",
+                        allDiscoveredRoots.size());
+            }
             installResolutionCoordinator(workspaceRoot, allDiscoveredRoots);
 
             long totalElapsed = System.currentTimeMillis() - totalStart;
@@ -501,14 +524,40 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
 
         assignRootsToImporters(allDiscoveredRoots, importerMapLocal, discoveredByImporter, claimedRoots, null);
 
-        List<Path> freshRoots = discoverRootsForFolders(folders, "Error discovering new projects in {}: {}");
-        assignRootsToImporters(freshRoots, importerMapLocal, discoveredByImporter, claimedRoots, newUncachedRoots);
-        if (!newUncachedRoots.isEmpty()) {
-            String detectedMsg = "Detected " + newUncachedRoots.size() + " new project(s) not in cache: " + newUncachedRoots;
-            logProgress(detectedMsg);
-            sendStatusUpdate(STATUS_IMPORTING, detectedMsg);
-            allDiscoveredRoots.addAll(newUncachedRoots);
-        }
+        // Defer the full filesystem walk to detect new (not-yet-cached) projects.
+        // This avoids blocking the import pipeline with an expensive directory
+        // traversal on large workspaces.  New projects will be picked up shortly
+        // after startup instead of during the critical path.
+        final List<Path> allRootsRef = allDiscoveredRoots;
+        final List<WorkspaceFolder> foldersRef = folders;
+        executorPools.getSchedulingPool().schedule(() -> {
+            try {
+                List<Path> freshRoots = discoverRootsForFolders(
+                        foldersRef, "Error discovering new projects in {}: {}");
+                List<Path> localNew = new ArrayList<>();
+                assignRootsToImporters(freshRoots, importerMapLocal, discoveredByImporter,
+                        claimedRoots, localNew);
+                if (!localNew.isEmpty()) {
+                    String detectedMsg = "Detected " + localNew.size()
+                            + " new project(s) not in cache: " + localNew;
+                    logger.info(detectedMsg);
+                    sendStatusUpdate(STATUS_IMPORTING, detectedMsg);
+                    synchronized (allRootsRef) {
+                        allRootsRef.addAll(localNew);
+                    }
+                    newUncachedRoots.addAll(localNew);
+                    // Register newly discovered scopes and trigger resolution
+                    registerDiscoveredScopes(localNew, discoveredByImporter, importerMapLocal);
+                    ClasspathResolutionCoordinator coord = resolutionCoordinator.get();
+                    if (coord != null) {
+                        coord.setAllDiscoveredRoots(allRootsRef);
+                    }
+                }
+            } catch (Exception e) {
+                logger.warn("Deferred new-project discovery failed: {}", e.getMessage(), e);
+            }
+        }, 10, java.util.concurrent.TimeUnit.SECONDS);
+
         return allDiscoveredRoots;
     }
 
@@ -695,6 +744,26 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                 compileSourcesSafely(importer, roots);
             }
         }
+    }
+
+    /**
+     * Build a sub-map of {@code discoveredByImporter} containing only entries
+     * whose roots intersect with the given {@code targetRoots}.
+     */
+    private static Map<ProjectImporter, List<Path>> filterByImporter(
+            List<Path> targetRoots,
+            Map<ProjectImporter, List<Path>> discoveredByImporter) {
+        Set<Path> targetSet = new HashSet<>(targetRoots);
+        Map<ProjectImporter, List<Path>> filtered = new LinkedHashMap<>();
+        for (Map.Entry<ProjectImporter, List<Path>> entry : discoveredByImporter.entrySet()) {
+            List<Path> matching = entry.getValue().stream()
+                    .filter(targetSet::contains)
+                    .collect(Collectors.toList());
+            if (!matching.isEmpty()) {
+                filtered.put(entry.getKey(), matching);
+            }
+        }
+        return filtered;
     }
 
     private void installResolutionCoordinator(Path workspaceRoot, List<Path> allDiscoveredRoots) {

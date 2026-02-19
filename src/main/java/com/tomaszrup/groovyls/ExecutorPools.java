@@ -106,8 +106,10 @@ public class ExecutorPools {
         });
         this.schedulingPool = new MdcScheduledExecutorService(rawSchedulingPool);
 
+        // Cap the import pool at 4 threads to limit Gradle daemon parallelism
+        // and reduce CPU pressure during classpath resolution.
         ExecutorService rawImportPool = Executors.newFixedThreadPool(
-                Math.max(2, Runtime.getRuntime().availableProcessors()), r -> {
+                Math.max(2, Math.min(4, Runtime.getRuntime().availableProcessors())), r -> {
                     Thread t = new Thread(r, "groovyls-import");
                     t.setDaemon(true);
                     return t;
