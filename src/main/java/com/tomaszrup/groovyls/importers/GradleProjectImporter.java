@@ -456,6 +456,7 @@ public class GradleProjectImporter implements ProjectImporter {
         try {
             connection.newBuild()
                     .forTasks(tasks)
+                    .setJvmArguments(getProxyJvmArgs())
                     .setStandardOutput(parser.newLogOutputStream())
                     .setStandardError(parser.newLogOutputStream())
                     .run();
@@ -571,6 +572,31 @@ public class GradleProjectImporter implements ProjectImporter {
 
     // ---- private helpers ----
 
+    /** Proxy-related system property names forwarded to the Gradle daemon. */
+    private static final String[] PROXY_PROPERTIES = {
+            "http.proxyHost", "http.proxyPort", "http.proxyUser", "http.proxyPassword",
+            "http.nonProxyHosts",
+            "https.proxyHost", "https.proxyPort", "https.proxyUser", "https.proxyPassword",
+    };
+
+    /**
+     * Collect any proxy-related JVM system properties that are set in this
+     * process and return them as {@code -D} flags suitable for
+     * {@link org.gradle.tooling.BuildLauncher#setJvmArguments(List)}.
+     * This ensures that the Gradle daemon started by the Tooling API
+     * inherits the same proxy configuration as the language server JVM.
+     */
+    private static List<String> getProxyJvmArgs() {
+        List<String> proxyArgs = new ArrayList<>();
+        for (String prop : PROXY_PROPERTIES) {
+            String val = System.getProperty(prop);
+            if (val != null && !val.isEmpty()) {
+                proxyArgs.add("-D" + prop + "=" + val);
+            }
+        }
+        return proxyArgs;
+    }
+
     /**
      * Run compile tasks on the given connection. Tries {@code classes testClasses}
      * first, falling back to just {@code classes}.
@@ -579,6 +605,7 @@ public class GradleProjectImporter implements ProjectImporter {
         try {
             connection.newBuild()
                     .forTasks(TASK_CLASSES, TASK_TEST_CLASSES)
+                    .setJvmArguments(getProxyJvmArgs())
                     .setStandardOutput(parser.newLogOutputStream())
                     .setStandardError(parser.newLogOutputStream())
                     .run();
@@ -587,6 +614,7 @@ public class GradleProjectImporter implements ProjectImporter {
             try {
                 connection.newBuild()
                         .forTasks(TASK_CLASSES)
+                        .setJvmArguments(getProxyJvmArgs())
                         .setStandardOutput(parser.newLogOutputStream())
                         .setStandardError(parser.newLogOutputStream())
                         .run();
@@ -737,6 +765,7 @@ public class GradleProjectImporter implements ProjectImporter {
             connection.newBuild()
                     .forTasks("_groovyLSDownloadSources")
                     .withArguments(args)
+                    .setJvmArguments(getProxyJvmArgs())
                     .setStandardOutput(parser.newLogOutputStream())
                     .setStandardError(parser.newLogOutputStream())
                     .run();
@@ -849,6 +878,7 @@ public class GradleProjectImporter implements ProjectImporter {
                 connection.newBuild()
                         .forTasks("_groovyLSResolveClasspath")
                         .withArguments(args)
+                        .setJvmArguments(getProxyJvmArgs())
                         .setStandardOutput(baos)
                         .setStandardError(parser.newLogOutputStream())
                         .run();
@@ -990,6 +1020,7 @@ public class GradleProjectImporter implements ProjectImporter {
                 connection.newBuild()
                         .forTasks("_groovyLSResolveSingleClasspath")
                         .withArguments(args)
+                        .setJvmArguments(getProxyJvmArgs())
                         .setStandardOutput(baos)
                         .setStandardError(parser.newLogOutputStream())
                         .run();

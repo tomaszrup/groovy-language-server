@@ -563,6 +563,84 @@ function startLanguageServer() {
             );
           }
 
+          // Forward proxy settings to the JVM so the Gradle Tooling API
+          // can download distributions and dependencies through corporate
+          // proxies. Reads VS Code's http.proxy setting first, then falls
+          // back to standard environment variables.
+          const httpProxySetting = vscode.workspace
+            .getConfiguration("http")
+            .get<string>("proxy");
+          if (httpProxySetting) {
+            try {
+              const proxyUrl = new URL(httpProxySetting);
+              args.unshift(
+                `-Dhttp.proxyHost=${proxyUrl.hostname}`,
+                `-Dhttps.proxyHost=${proxyUrl.hostname}`
+              );
+              if (proxyUrl.port) {
+                args.unshift(
+                  `-Dhttp.proxyPort=${proxyUrl.port}`,
+                  `-Dhttps.proxyPort=${proxyUrl.port}`
+                );
+              }
+              if (proxyUrl.username) {
+                args.unshift(
+                  `-Dhttp.proxyUser=${proxyUrl.username}`,
+                  `-Dhttps.proxyUser=${proxyUrl.username}`
+                );
+              }
+              if (proxyUrl.password) {
+                args.unshift(
+                  `-Dhttp.proxyPassword=${proxyUrl.password}`,
+                  `-Dhttps.proxyPassword=${proxyUrl.password}`
+                );
+              }
+              outputChannel?.appendLine(
+                `Forwarding VS Code http.proxy to JVM: ${proxyUrl.hostname}:${proxyUrl.port || "(default)"}`
+              );
+            } catch {
+              outputChannel?.appendLine(
+                `Could not parse http.proxy setting: ${httpProxySetting}`
+              );
+            }
+          } else {
+            // Fall back to environment variables
+            for (const [envVar, sysProp] of [
+              ["HTTP_PROXY", "http"],
+              ["HTTPS_PROXY", "https"],
+            ] as const) {
+              const val =
+                process.env[envVar] || process.env[envVar.toLowerCase()];
+              if (val) {
+                try {
+                  const proxyUrl = new URL(val);
+                  args.unshift(`-D${sysProp}.proxyHost=${proxyUrl.hostname}`);
+                  if (proxyUrl.port) {
+                    args.unshift(`-D${sysProp}.proxyPort=${proxyUrl.port}`);
+                  }
+                  if (proxyUrl.username) {
+                    args.unshift(`-D${sysProp}.proxyUser=${proxyUrl.username}`);
+                  }
+                  if (proxyUrl.password) {
+                    args.unshift(
+                      `-D${sysProp}.proxyPassword=${proxyUrl.password}`
+                    );
+                  }
+                } catch {
+                  /* ignore invalid URL */
+                }
+              }
+            }
+          }
+          const noProxy =
+            process.env["NO_PROXY"] || process.env["no_proxy"];
+          if (noProxy) {
+            // Java expects pipe-separated, env vars use commas
+            args.unshift(
+              `-Dhttp.nonProxyHosts=${noProxy.replace(/,/g, "|")}`
+            );
+          }
+
           //uncomment to allow a debugger to attach to the language server
           //args.unshift("-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=5005,quiet=y");
           let executable: Executable = {
